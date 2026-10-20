@@ -1,0 +1,350 @@
+diff --git a/src/core/exception_handler_switch.cpp b/src/core/exception_handler_switch.cpp
+--- a/src/core/exception_handler_switch.cpp
++++ b/src/core/exception_handler_switch.cpp
+@@ -87,6 +87,7 @@
+ #include "guest_memory_switch.h"
+ #include "resume_ctx.h"
+ #include "rex_decode.h"
++#include "switch_exception_probe.h"
+ 
+ extern "C" void RexSwitchPerfCount(unsigned id);
+ 
+@@ -137,7 +138,8 @@
+  * linked binary), with one extra branch at the start: if the frame's pc is RexResumeTrap, the
+  * exception is the resume from resume_ctx.h, not a fault. Then x0-x8, lr, sp, pc and pstate are
+  * copied into the frame from the dump x8 points to, and it returns with svcReturnFromException
+- * without touching x9-x29 or NEON, which already hold their values.
++ * without touching x9-x29. NEON and floating-point control/status are restored
++ * from the copy immediately before the final return.
+  *
+  * The rest is libnx's: bail out if a debugger is attached (unless __nx_exception_ignoredebug), copy
+  * the frame and the live registers to __nx_exceptiondump, and return from the kernel to
+@@ -227,8 +229,13 @@
+         "    mov  x5, x2\n"
+         "    str  w0,  [x2], #4\n"
+         "    str  w7,  [x2], #4\n"
+-        "    str  wzr, [x2], #4\n"
+-        "    str  wzr, [x2], #4\n"
++        // Use the remaining padding words for the interrupted FP state.
++        // Reading these in the C++ handler is too late: its calculations and
++        // calls can already have changed FPSR or the guest rounding mode.
++        "    mrs  x3, fpcr\n"
++        "    str  w3, [x2], #4\n"
++        "    mrs  x3, fpsr\n"
++        "    str  w3, [x2], #4\n"
+         "    ldp  x3, x4, [x1]\n"
+         "    str  x5, [x1], #16\n"
+         "    stp  x3, x4, [x2], #16\n"
+@@ -327,6 +334,28 @@
+         "    str  x3, [x1, #88]\n"
+         "    ldr  w3, [x2, #800]\n"
+         "    str  w3, [x1, #96]\n"
++        // No ordinary function call may run between these loads and the SVC.
++        "    add  x3, x2, #288\n"
++        "    ldp q0, q1, [x3, #0]\n"
++        "    ldp q2, q3, [x3, #32]\n"
++        "    ldp q4, q5, [x3, #64]\n"
++        "    ldp q6, q7, [x3, #96]\n"
++        "    ldp q8, q9, [x3, #128]\n"
++        "    ldp q10, q11, [x3, #160]\n"
++        "    ldp q12, q13, [x3, #192]\n"
++        "    ldp q14, q15, [x3, #224]\n"
++        "    ldp q16, q17, [x3, #256]\n"
++        "    ldp q18, q19, [x3, #288]\n"
++        "    ldp q20, q21, [x3, #320]\n"
++        "    ldp q22, q23, [x3, #352]\n"
++        "    ldp q24, q25, [x3, #384]\n"
++        "    ldp q26, q27, [x3, #416]\n"
++        "    ldp q28, q29, [x3, #448]\n"
++        "    ldp q30, q31, [x3, #480]\n"
++        "    ldr  w3, [x2, #8]\n"
++        "    msr  fpcr, x3\n"
++        "    ldr  w3, [x2, #12]\n"
++        "    msr  fpsr, x3\n"
+         "    mov  w0, wzr\n"
+         "    b    .Lrex_exc_end\n"
+         ".Lrex_exc_abort:\n"
+@@ -363,6 +392,17 @@
+ 
+ namespace {
+ 
++// One record per thread, with no TLS allocation and no file writes in the hot
++// path. A process-wide first-two limit only captured a healthy loading thread
++// and omitted the worker that actually crashed. Atomics also permit reporting
++// a record safely if another thread is interrupted during an update.
++struct ImageReadTrace {
++  std::atomic<uint64_t> tid{0}, pc{0}, context{0}, r8{0}, r9{0};
++  std::atomic<uint64_t> before_lo{0}, before_hi{0}, after_lo{0}, after_hi{0};
++  std::atomic<unsigned> count{0};
++};
++ImageReadTrace image_reads[64];
++
+ struct CrashBuf {
+   char data[16384];
+   size_t len = 0;
+@@ -389,6 +429,35 @@
+   }
+   return out->type != MemType_Unmapped && (out->perm & Perm_R) &&
+          addr + bytes <= out->addr + out->size;
++}
++
++void RecordImageRead(const ThreadExceptionDump* ctx, bool after) {
++  u64 tid = 0;
++  if (R_FAILED(svcGetThreadId(&tid, CUR_THREAD_HANDLE)) || !tid) return;
++  for (auto& record : image_reads) {
++    uint64_t owner = 0;
++    if (!record.tid.compare_exchange_strong(owner, tid) && owner != tid) continue;
++    uint64_t vector[2];
++    std::memcpy(vector, &ctx->fpu_gprs[31], sizeof(vector));
++    if (after) {
++      record.after_lo = vector[0];
++      record.after_hi = vector[1];
++    } else {
++      record.pc = ctx->pc.x;
++      record.context = ctx->cpu_gprs[19].x;
++      record.before_lo = vector[0];
++      record.before_hi = vector[1];
++      MemoryInfo mi;
++      if (ctx->cpu_gprs[20].x == reinterpret_cast<uint64_t>(RexGmBase()) &&
++          QueryReadable(ctx->cpu_gprs[19].x, 80, &mi)) {
++        const auto* regs = reinterpret_cast<const uint64_t*>(ctx->cpu_gprs[19].x);
++        record.r8 = regs[8];
++        record.r9 = regs[9];
++      }
++      ++record.count;
++    }
++    return;
++  }
+ }
+ 
+ /*
+@@ -515,6 +584,17 @@
+   // Frame chain: the ELF keeps x29 as the frame pointer (the Atmosphere report of
+   // the first abort walked it completely). More reliable than the scan below,
+   // which remains as a fallback for when the chain breaks.
++  for (const auto& record : image_reads) {
++    if (record.tid.load() != tid || !record.count.load()) continue;
++    Append(b, "last image read on this thread: count=%u pc=image+0x%" PRIx64
++              " context=0x%016" PRIx64 " r8=0x%016" PRIx64 " r9=0x%016" PRIx64 "\n",
++           record.count.load(), record.pc.load() - base, record.context.load(),
++           record.r8.load(), record.r9.load());
++    Append(b, "q31 before=%016" PRIx64 ":%016" PRIx64
++              " after=%016" PRIx64 ":%016" PRIx64 " (high:low)\n",
++           record.before_hi.load(), record.before_lo.load(),
++           record.after_hi.load(), record.after_lo.load());
++  }
+   Append(b, "cadena de marcos:\n");
+   uint64_t frame = ctx ? ctx->fp.x : stack;
+   for (int i = 0; i < 40 && (frame & 7) == 0 && QueryReadable(frame, 16, &mi); ++i) {
+@@ -580,18 +660,13 @@
+   if (!ini || !fin || static_cast<uint8_t*>(fin) != static_cast<uint8_t*>(ini) + total - 1) {
+     return false;
+   }
+-  // The reproducible Project8 null-pointer crash has a q31 value live over
+-  // this image read. Log the saved state on both sides of emulation to tell
+-  // entry/resume corruption apart from a bad guest argument. Bound the writes
+-  // because this read also occurs during normal rendering.
+-  static std::atomic<unsigned> diagnostic_reads{0};
++  // Keep the latest sample for each thread without synchronous SD writes.
+   const auto guest_base = reinterpret_cast<uint64_t>(RexGmBase());
+   const bool trace = guest_base && insn == 0xB956BC24u &&
+-                     acc.address == guest_base + 0x8201D6BCull &&
+-                     diagnostic_reads.fetch_add(1, std::memory_order_relaxed) < 2;
+-  if (trace) RexSwitchCrashLog("diagnostic image read BEFORE emulation", ctx, ctx->sp.x, ctx->pc.x);
++                     acc.address == guest_base + 0x8201D6BCull;
++  if (trace) RecordImageRead(ctx, false);
+   RexEmulateAccess(ctx, &acc, ini);
+-  if (trace) RexSwitchCrashLog("diagnostic image read AFTER emulation", ctx, ctx->sp.x, ctx->pc.x);
++  if (trace) RecordImageRead(ctx, true);
+   ctx->pc.x += 4;
+   return true;
+ }
+@@ -606,12 +681,9 @@
+   tc.pc = ctx->pc.x;
+   tc.pstate = ctx->pstate;
+ 
+-  // The Horizon dump has no FPSR or FPCR. They are thread registers and the
+-  // handler runs on the same thread, so they are read live.
+-  uint64_t fpsr = 0, fpcr = 0;
+-  __asm__ volatile("mrs %0, fpsr\n mrs %1, fpcr" : "=r"(fpsr), "=r"(fpcr));
+-  tc.fpsr = static_cast<uint32_t>(fpsr);
+-  tc.fpcr = static_cast<uint32_t>(fpcr);
++  // The exception entry stores FPCR/FPSR in the unused dump padding.
++  std::memcpy(&tc.fpcr, reinterpret_cast<const uint8_t*>(ctx) + 8, sizeof(uint32_t));
++  std::memcpy(&tc.fpsr, reinterpret_cast<const uint8_t*>(ctx) + 12, sizeof(uint32_t));
+ 
+   for (int i = 0; i < 32; ++i) {
+     std::memcpy(&tc.v[i], &ctx->fpu_gprs[i], sizeof(vec128_t));
+@@ -693,6 +765,15 @@
+ 
+ [[noreturn]] void HandleSwitchException(ThreadExceptionDump* ctx) {
+   const uint64_t pc = ctx->pc.x;
++  if (pc == reinterpret_cast<uint64_t>(RexSwitchExceptionProbeTrap)) {
++    // Force a scheduling opportunity and deliberately disturb FP state in
++    // the handler. The interrupted values must come from the saved dump.
++    svcSleepThread(1);
++    __asm__ volatile("movi v0.2d, #0\n movi v31.2d, #0\n msr fpcr, xzr\n msr fpsr, xzr"
++                     ::: "v0", "v31", "memory");
++    ctx->pc.x += 4;
++    RexResumeFromException(ctx);
++  }
+   const uint64_t far = ctx->far.x;
+   const uint32_t esr = ctx->esr;
+   const uint32_t ec = esr >> kEsrEcShift;
+@@ -857,6 +938,10 @@
+ }  // namespace
+ 
+ void ExceptionHandler::Install(Handler fn, void* data) {
++  static std::atomic<bool> tested{false};
++  if (!tested.exchange(true) && !RexSwitchCheckExceptionRegisters()) {
++    diagAbortWithResult(MAKERESULT(Module_Libnx, 102));
++  }
+   // There is nothing to install in the system: __libnx_exception_handler exists
+   // once linked. This only records the handler.
+   for (size_t i = 0; i < kMaxHandlerCount; ++i) {
+diff --git a/src/core/resume_ctx.h b/src/core/resume_ctx.h
+--- a/src/core/resume_ctx.h
++++ b/src/core/resume_ctx.h
+@@ -27,12 +27,12 @@
+  *   1. The dump is copied to the stack of the faulting thread, below its sp,
+  *      where nothing overwrites it. The global libnx dump could be overwritten
+  *      by a fault in another thread.
+- *   2. NEON, x9-x28 and fp are loaded from that copy.
++ *   2. x9-x28 and fp are loaded from that copy.
+  *   3. An exception is raised on purpose (the udf in RexResumeTrap), with x8
+  *      pointing to the copy.
+  *   4. The exception entry (exception_handler_switch.cpp) recognizes the trap
+  *      address, writes x0-x8, lr, sp, pc and pstate from the copy into the
+- *      frame, and calls svcReturnFromException without touching anything else.
++ *      frame, then restores NEON, FPCR and FPSR immediately before returning.
+  *
+  * It costs one extra exception per resume, and in exchange not a single bit is
+  * lost: every register gets back the value of the corrected dump.
+@@ -96,24 +96,8 @@
+     "    cmp  x11, x12\n"
+     "    b.lo 1b\n"
+     "    mov  x8,  x9\n"
+-    /* 2. full NEON: the faulting access may have been floating point */
+-    "    add  x1,  x8, #288\n"
+-    "    ldp  q0,  q1,  [x1, #0]\n"
+-    "    ldp  q2,  q3,  [x1, #32]\n"
+-    "    ldp  q4,  q5,  [x1, #64]\n"
+-    "    ldp  q6,  q7,  [x1, #96]\n"
+-    "    ldp  q8,  q9,  [x1, #128]\n"
+-    "    ldp  q10, q11, [x1, #160]\n"
+-    "    ldp  q12, q13, [x1, #192]\n"
+-    "    ldp  q14, q15, [x1, #224]\n"
+-    "    ldp  q16, q17, [x1, #256]\n"
+-    "    ldp  q18, q19, [x1, #288]\n"
+-    "    ldp  q20, q21, [x1, #320]\n"
+-    "    ldp  q22, q23, [x1, #352]\n"
+-    "    ldp  q24, q25, [x1, #384]\n"
+-    "    ldp  q26, q27, [x1, #416]\n"
+-    "    ldp  q28, q29, [x1, #448]\n"
+-    "    ldp  q30, q31, [x1, #480]\n"
++    // Restore SIMD in the resume exception entry, after the trap, so the
++    // corrected vectors do not have to survive another exception delivery.
+     /* x9-x28 and fp, including x16, x17 and x18 */
+     "    ldp  x9,  x10, [x8, #88]\n"
+     "    ldp  x11, x12, [x8, #104]\n"
+diff --git a/src/core/switch_exception_probe.h b/src/core/switch_exception_probe.h
+new file mode 100644
+--- /dev/null
++++ b/src/core/switch_exception_probe.h
+@@ -0,0 +1,96 @@
++// Startup regression probe for the Horizon exception boundary. It uses a
++// deliberate undefined instruction, so no game memory or content is needed.
++#pragma once
++
++extern "C" void RexSwitchExceptionProbe(const void* expected, void* actual);
++extern "C" const char RexSwitchExceptionProbeTrap[];
++
++__asm__(
++    ".text\n"
++    ".balign 4\n"
++    ".global RexSwitchExceptionProbe\n"
++    ".type RexSwitchExceptionProbe, %function\n"
++    "RexSwitchExceptionProbe:\n"
++    "sub sp, sp, #144\n"
++    "stp q8, q9, [sp, #0]\n"
++    "stp q10, q11, [sp, #32]\n"
++    "stp q12, q13, [sp, #64]\n"
++    "stp q14, q15, [sp, #96]\n"
++    "mrs x2, fpcr\n"
++    "mrs x3, fpsr\n"
++    "stp x2, x3, [sp, #128]\n"
++    "add x4, x0, #512\nldp x2, x3, [x4]\n"
++    "msr fpcr, x2\n"
++    "msr fpsr, x3\n"
++    "ldp q0, q1, [x0, #0]\n"
++    "ldp q2, q3, [x0, #32]\n"
++    "ldp q4, q5, [x0, #64]\n"
++    "ldp q6, q7, [x0, #96]\n"
++    "ldp q8, q9, [x0, #128]\n"
++    "ldp q10, q11, [x0, #160]\n"
++    "ldp q12, q13, [x0, #192]\n"
++    "ldp q14, q15, [x0, #224]\n"
++    "ldp q16, q17, [x0, #256]\n"
++    "ldp q18, q19, [x0, #288]\n"
++    "ldp q20, q21, [x0, #320]\n"
++    "ldp q22, q23, [x0, #352]\n"
++    "ldp q24, q25, [x0, #384]\n"
++    "ldp q26, q27, [x0, #416]\n"
++    "ldp q28, q29, [x0, #448]\n"
++    "ldp q30, q31, [x0, #480]\n"
++    ".global RexSwitchExceptionProbeTrap\n"
++    "RexSwitchExceptionProbeTrap:\n"
++    "udf #0x5052\n"
++    "stp q0, q1, [x1, #0]\n"
++    "stp q2, q3, [x1, #32]\n"
++    "stp q4, q5, [x1, #64]\n"
++    "stp q6, q7, [x1, #96]\n"
++    "stp q8, q9, [x1, #128]\n"
++    "stp q10, q11, [x1, #160]\n"
++    "stp q12, q13, [x1, #192]\n"
++    "stp q14, q15, [x1, #224]\n"
++    "stp q16, q17, [x1, #256]\n"
++    "stp q18, q19, [x1, #288]\n"
++    "stp q20, q21, [x1, #320]\n"
++    "stp q22, q23, [x1, #352]\n"
++    "stp q24, q25, [x1, #384]\n"
++    "stp q26, q27, [x1, #416]\n"
++    "stp q28, q29, [x1, #448]\n"
++    "stp q30, q31, [x1, #480]\n"
++    "mrs x2, fpcr\n"
++    "mrs x3, fpsr\n"
++    "add x4, x1, #512\nstp x2, x3, [x4]\n"
++    "ldp x2, x3, [sp, #128]\n"
++    "msr fpcr, x2\n"
++    "msr fpsr, x3\n"
++    "ldp q8, q9, [sp, #0]\n"
++    "ldp q10, q11, [sp, #32]\n"
++    "ldp q12, q13, [sp, #64]\n"
++    "ldp q14, q15, [sp, #96]\n"
++    "add sp, sp, #144\n"
++    "ret\n"
++    ".size RexSwitchExceptionProbe, .-RexSwitchExceptionProbe\n"
++ );
++
++static bool RexSwitchCheckExceptionRegisters() {
++  // Assembly writes raw bits; the NaN payloads and upper halves matter too.
++  alignas(16) uint64_t expected[66];
++  alignas(16) uint64_t actual[66]{};
++  for (unsigned i = 0; i < 64; ++i) expected[i] = 0x7FF1234589ABC000ull + i;
++  expected[64] = 0x00400000; // round toward positive infinity
++  expected[65] = 1;          // accrued invalid-operation flag
++  for (unsigned trial = 0; trial < 16; ++trial) {
++    RexSwitchExceptionProbe(expected, actual);
++    for (unsigned i = 0; i < 66; ++i) {
++      if (actual[i] != expected[i]) {
++        std::fprintf(stderr, "[exception-probe] FAIL trial=%u word=%u expected=%016" PRIx64
++                             " actual=%016" PRIx64 "\n", trial, i, expected[i], actual[i]);
++        std::fflush(stderr);
++        return false;
++      }
++    }
++  }
++  std::fprintf(stderr, "[exception-probe] PASS: 32 vectors, FPCR and FPSR across 16 scheduled exceptions\n");
++  std::fflush(stderr);
++  return true;
++}

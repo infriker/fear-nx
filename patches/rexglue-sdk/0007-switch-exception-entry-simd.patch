@@ -1,0 +1,85 @@
+diff --git a/src/core/exception_handler_switch.cpp b/src/core/exception_handler_switch.cpp
+index d48c620..c021440 100644
+--- a/src/core/exception_handler_switch.cpp
++++ b/src/core/exception_handler_switch.cpp
+@@ -124,6 +124,8 @@ extern "C" {
+ alignas(16) uint8_t g_rex_exc_pilas[REX_EXC_RANURAS][REX_EXC_PILA];
+ alignas(16) uint8_t g_rex_exc_volcados[REX_EXC_RANURAS][REX_EXC_VOLCADO];
+ alignas(16) uint32_t g_rex_exc_ocupadas[REX_EXC_RANURAS];
++/* q0-q31, then FPCR and FPSR, saved around the entry's debugger query. */
++alignas(16) uint8_t g_rex_exc_entry_simd[528];
+ }
+ 
+ static_assert(sizeof(ThreadExceptionDump) <= REX_EXC_VOLCADO,
+@@ -156,6 +158,42 @@ __asm__(".text\n"
+         "    add  x3, x3, :lo12:RexResumeTrap\n"
+         "    cmp  x2, x3\n"
+         "    b.eq .Lrex_exc_resume\n"
++        /*
++         * SIMD and FP state first. The svcGetInfo call below clobbered q31 on the
++         * console before the dump below captured it: a counter around it fired 34
++         * times in one session, and a worker then resumed with a pointer that
++         * had passed through q31 read back as zero, and crashed while loading.
++         * Nothing may run between the fault and the dump that can change them.
++         *
++         * They go to a static buffer, not the stack. The stack here has room for
++         * the few words libnx pushes and little more: a first version that saved
++         * these 528 bytes below sp overwrote the kernel's exception frame, and the
++         * return then jumped into data (Atmosphere 2168-0002, pc next to the user
++         * exception area). One buffer is enough because the kernel lets a single
++         * thread at a time into this entry.
++         */
++        "    adrp x2, g_rex_exc_entry_simd\n"
++        "    add  x2, x2, :lo12:g_rex_exc_entry_simd\n"
++        "    stp  q0, q1, [x2, #0]\n"
++        "    stp  q2, q3, [x2, #32]\n"
++        "    stp  q4, q5, [x2, #64]\n"
++        "    stp  q6, q7, [x2, #96]\n"
++        "    stp  q8, q9, [x2, #128]\n"
++        "    stp  q10, q11, [x2, #160]\n"
++        "    stp  q12, q13, [x2, #192]\n"
++        "    stp  q14, q15, [x2, #224]\n"
++        "    stp  q16, q17, [x2, #256]\n"
++        "    stp  q18, q19, [x2, #288]\n"
++        "    stp  q20, q21, [x2, #320]\n"
++        "    stp  q22, q23, [x2, #352]\n"
++        "    stp  q24, q25, [x2, #384]\n"
++        "    stp  q26, q27, [x2, #416]\n"
++        "    stp  q28, q29, [x2, #448]\n"
++        "    stp  q30, q31, [x2, #480]\n"
++        "    mrs  x3, fpcr\n"
++        "    str  x3, [x2, #512]\n"
++        "    mrs  x3, fpsr\n"
++        "    str  x3, [x2, #520]\n"
+         /* debugger? svcGetInfo(InfoType_DebuggerAttached) preserving x9-x21 */
+         "    stp  x9,  x10, [sp, #-16]!\n"
+         "    stp  x11, x12, [sp, #-16]!\n"
+@@ -181,6 +219,28 @@ __asm__(".text\n"
+         "    ldp  x13, x14, [sp], #16\n"
+         "    ldp  x11, x12, [sp], #16\n"
+         "    ldp  x9,  x10, [sp], #16\n"
++        "    adrp x4, g_rex_exc_entry_simd\n"
++        "    add  x4, x4, :lo12:g_rex_exc_entry_simd\n"
++        "    ldp  q0, q1, [x4, #0]\n"
++        "    ldp  q2, q3, [x4, #32]\n"
++        "    ldp  q4, q5, [x4, #64]\n"
++        "    ldp  q6, q7, [x4, #96]\n"
++        "    ldp  q8, q9, [x4, #128]\n"
++        "    ldp  q10, q11, [x4, #160]\n"
++        "    ldp  q12, q13, [x4, #192]\n"
++        "    ldp  q14, q15, [x4, #224]\n"
++        "    ldp  q16, q17, [x4, #256]\n"
++        "    ldp  q18, q19, [x4, #288]\n"
++        "    ldp  q20, q21, [x4, #320]\n"
++        "    ldp  q22, q23, [x4, #352]\n"
++        "    ldp  q24, q25, [x4, #384]\n"
++        "    ldp  q26, q27, [x4, #416]\n"
++        "    ldp  q28, q29, [x4, #448]\n"
++        "    ldp  q30, q31, [x4, #480]\n"
++        "    ldr  x2, [x4, #512]\n"
++        "    msr  fpcr, x2\n"
++        "    ldr  x2, [x4, #520]\n"
++        "    msr  fpsr, x2\n"
+         "    cbnz w6, .Lrex_exc_abort\n"
+         "    adrp x6, __nx_exception_ignoredebug\n"
+         "    ldr  w5, [x6, :lo12:__nx_exception_ignoredebug]\n"

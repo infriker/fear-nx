@@ -1,0 +1,703 @@
+diff --git a/cmake/rexglue_switch.cmake b/cmake/rexglue_switch.cmake
+index 946e8bf..ca11eda 100644
+--- a/cmake/rexglue_switch.cmake
++++ b/cmake/rexglue_switch.cmake
+@@ -28,7 +28,15 @@ else()
+         message(FATAL_ERROR "Set REXGLUE_SWITCH_NVK_SDK or REXGLUE_SWITCH_NVK_SOURCE")
+     endif()
+     target_link_directories(rexglue_switch_nvk INTERFACE "${REXGLUE_SWITCH_NVK_SDK}/lib")
+-    target_link_libraries(rexglue_switch_nvk INTERFACE vulkan expat zstd z nx vulkan expat zstd z nx stdc++ m)
++    # mesa-switch's Docker build (build-switch.sh) leaves the Rust standard
++    # library in libnak_rs.a instead of merging it into libvulkan.a as the
++    # MSYS2 unified SDK does; without it the NAK objects cannot resolve core.
++    set(_nak_rs "")
++    if(EXISTS "${REXGLUE_SWITCH_NVK_SDK}/lib/libnak_rs.a")
++        set(_nak_rs nak_rs)
++    endif()
++    target_link_libraries(rexglue_switch_nvk INTERFACE vulkan ${_nak_rs} expat zstd z nx
++                          vulkan ${_nak_rs} expat zstd z nx stdc++ m)
+ endif()
+ 
+ # Startup objects every title needs, built here, in the SDK's scope, where C is
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index ff6c013..e886e32 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -79,6 +79,16 @@ class SharedMemory {
+   bool RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count);
+   bool RequestRange(uint32_t start, uint32_t length);
+ 
++  // Page validation by content hash instead of write watching
++  // (gpu_page_hash_validation). Valid pages in the range that are due for a
++  // check are hashed; a changed page is invalidated and its watches fire, as a
++  // CPU write fault would have done. Pages that stay unchanged are checked less
++  // often, down to once every 32 frames.
++  bool hash_validation() const { return hash_validation_; }
++  void HashValidateRange(uint32_t start, uint32_t length);
++  // Advances the frame counter the hash checks are scheduled against.
++  void OnFrameBoundary() { ++frame_epoch_; }
++
+   // Native residency path. Uploads `size` bytes from `host_src` into the buffer
+   // at `guest_offset`, bypassing the page validity bookkeeping entirely: no
+   // page is marked valid, no write watch is armed, MakeRangeValid and with it
+@@ -258,6 +268,15 @@ class SharedMemory {
+   std::vector<uint64_t> system_page_flags_valid_;
+   // Subset of valid pages containing data written by the GPU.
+   std::vector<uint64_t> system_page_flags_valid_and_gpu_written_;
++
++  // gpu_page_hash_validation state, one entry per page; touched only by the
++  // command processor thread.
++  bool hash_validation_ = false;
++  uint32_t frame_epoch_ = 1;
++  std::vector<uint64_t> page_hash_;
++  std::vector<uint32_t> page_checked_epoch_;
++  std::vector<uint8_t> page_stable_;
++  std::vector<uint32_t> hash_changed_pages_;
+   uint32_t num_system_page_flags_ = 0;
+ 
+   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
+diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+index 7dfd3f0..0efe0a9 100644
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
+ #include <cstdint>
+ #include <memory>
+ #include <mutex>
+@@ -527,6 +528,12 @@ class Memory {
+   // would have done. See the .cpp for the trade-off.
+   bool SwitchUnwatchHotReadPage(const void* host_address);
+   void SwitchCheckUnwatchedPages();
++  // Whether a physical page was switched to hash checking; watching it again
++  // would only bring the read faults back (PhysicalHeap::EnableAccessCallbacks).
++  bool SwitchIsHashCheckedPage(uint32_t physical_address) const {
++    const uint32_t page = (physical_address & 0x1FFFFFFF) >> 12;
++    return (switch_hash_checked_[page >> 6].load(std::memory_order_relaxed) >> (page & 63)) & 1;
++  }
+ #endif
+ 
+   // Allocates virtual memory from the 'system' heap.
+@@ -652,6 +659,8 @@ class Memory {
+   };
+   std::mutex switch_unwatched_mutex_;
+   std::vector<SwitchUnwatchedPage> switch_unwatched_pages_;
++  // One bit per 4 KB page of the 512 MB physical range.
++  std::atomic<uint64_t> switch_hash_checked_[0x20000000 / 0x1000 / 64] = {};
+ #endif
+ };
+ 
+diff --git a/src/core/exception_handler_switch.cpp b/src/core/exception_handler_switch.cpp
+index c021440..34aed23 100644
+--- a/src/core/exception_handler_switch.cpp
++++ b/src/core/exception_handler_switch.cpp
+@@ -69,6 +69,7 @@
+  */
+ 
+ #include <rex/platform.h>
++#include <malloc.h>
+ 
+ #if REX_PLATFORM_SWITCH
+ 
+@@ -823,6 +824,214 @@ bool IsHotRead(uint64_t far) {
+   return true;
+ }
+ 
++/*
++ * Resuming without a system call
++ *
++ * The usual resume ends in svcReturnFromException, and a system call follows
++ * the AArch64 calling convention: registers the convention treats as
++ * caller-saved, most of the vector registers among them, need not survive it.
++ * When the thread is preempted inside the call, they come back changed. The
++ * same happened to svcGetInfo at the entry (measured: q31 changed 34 times in one
++ * session). With three busy cores and 100,000 resumes a second that is rare per
++ * resume but frequent overall, and a guest pointer that the compiler happened to
++ * carry in q31 came back as zero: the loading-screen crash in sub_823BA7D8.
++ *
++ * So each thread resumes through a stub of its own, in executable memory close
++ * enough to the image for a direct branch. The stub loads every register from
++ * literals stored inside itself, which needs no base register, and ends with a
++ * B to the faulting instruction. Only data changes per resume, plus that one
++ * branch word. The trap path remains the fallback.
++ */
++// One page per stub, so a stub's permissions can be changed without touching
++// another thread's (the fallback mode below does exactly that).
++constexpr size_t kStubSize = 0x1000;
++constexpr size_t kStubCount = 256;
++constexpr size_t kStubRegion = kStubSize * kStubCount;  // 1 MB
++constexpr uint32_t kLitQ = 0x400;     // q0-q31, 512 bytes
++constexpr uint32_t kLitX = 0x600;     // x0-x30, 248 bytes
++constexpr uint32_t kLitSp = 0x6F8;
++constexpr uint32_t kLitFpcr = 0x700;
++constexpr uint32_t kLitFpsr = 0x708;
++constexpr uint32_t kLitNzcv = 0x710;
++constexpr uint32_t kBranchIndex = 71;  // instruction index of the final B
++
++uint8_t* g_stub_rw = nullptr;  // writable view, when one could be mapped
++uint64_t g_stub_rx = 0;        // executable alias near the image
++// 0 = no stubs (trap resume), 1 = separate writable view, 2 = no view: each
++// resume makes its own stub page writable, writes it, and makes it executable
++// again. Two system calls, but before the stub loads any register.
++int g_stub_mode = 0;
++std::atomic<uint32_t> g_stub_next{0};
++thread_local int32_t t_stub = -1;
++
++uint32_t LdrLiteral(uint32_t base_op, uint32_t insn_off, uint32_t lit_off, uint32_t rt) {
++  const int32_t imm19 = static_cast<int32_t>(lit_off - insn_off) / 4;
++  return base_op | ((static_cast<uint32_t>(imm19) & 0x7FFFF) << 5) | rt;
++}
++
++void WriteStubCode(uint32_t* code) {
++  uint32_t n = 0;
++  auto off = [&] { return n * 4; };
++  for (uint32_t q = 0; q < 32; ++q) {  // LDR Qt, literal
++    code[n] = LdrLiteral(0x9C000000u, off(), kLitQ + q * 16, q);
++    ++n;
++  }
++  code[n] = LdrLiteral(0x58000000u, off(), kLitFpcr, 0); ++n;  // ldr x0, fpcr
++  code[n++] = 0xD51B4400u;                                     // msr fpcr, x0
++  code[n] = LdrLiteral(0x58000000u, off(), kLitFpsr, 0); ++n;  // ldr x0, fpsr
++  code[n++] = 0xD51B4420u;                                     // msr fpsr, x0
++  code[n] = LdrLiteral(0x58000000u, off(), kLitNzcv, 0); ++n;  // ldr x0, nzcv
++  code[n++] = 0xD51B4200u;                                     // msr nzcv, x0
++  code[n] = LdrLiteral(0x58000000u, off(), kLitSp, 0); ++n;    // ldr x0, sp
++  code[n++] = 0x9100001Fu;                                     // mov sp, x0
++  for (uint32_t x = 0; x < 31; ++x) {
++    code[n] = LdrLiteral(0x58000000u, off(), kLitX + x * 8, x);
++    ++n;
++  }
++  code[n++] = 0xD503201Fu;  // placeholder for the B, patched per resume
++  static_assert(kBranchIndex == 32 + 8 + 31, "stub layout");
++}
++
++/* Maps the stub region: a code alias within branch range of the image, plus,
++ * when possible, a writable view of the same memory. Done once, before the
++ * first exception. Every step's result goes to rex_stderr.log: the first
++ * console run of this code found a code alias but no usable stubs. */
++bool CreateResumeStubs() {
++  const uint64_t base = reinterpret_cast<uint64_t>(&_start);
++  const Handle self = envGetOwnProcessHandle();
++  void* backing = memalign(0x1000, kStubRegion);
++  if (!backing) {
++    std::fprintf(stderr, "[resume-stub] no memory for stubs\n");
++    return false;
++  }
++  std::memset(backing, 0, kStubRegion);
++  for (size_t i = 0; i < kStubCount; ++i) {
++    WriteStubCode(reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(backing) + i * kStubSize));
++  }
++  armDCacheFlush(backing, kStubRegion);
++  const uint64_t window = reinterpret_cast<uint64_t>(RexGmBase());
++  const uint64_t window_end = window + RexGmSize();
++  u32 page_info = 0;
++  Result map_rc = 0;
++  uint64_t rx = 0;
++  virtmemLock();
++  // Upward from past the loaded image, in 2 MB steps, staying inside the
++  // +-128 MB reach of a B from anywhere in the image.
++  for (uint64_t probe = (base + 0x4000000 + 0x1FFFFF) & ~uint64_t(0x1FFFFF);
++       probe + kStubRegion < base + 0x7000000; probe += 0x200000) {
++    if (window && probe + kStubRegion > window && probe < window_end) {
++      continue;
++    }
++    MemoryInfo q{};
++    if (R_FAILED(svcQueryMemory(&q, &page_info, probe)) || q.type != MemType_Unmapped ||
++        q.addr + q.size < probe + kStubRegion) {
++      continue;
++    }
++    map_rc = svcMapProcessCodeMemory(self, probe, reinterpret_cast<u64>(backing), kStubRegion);
++    if (R_SUCCEEDED(map_rc)) {
++      rx = probe;
++      break;
++    }
++  }
++  Result perm_rc = rx ? svcSetProcessMemoryPermission(self, rx, kStubRegion, Perm_Rx) : 0;
++  Result view_rc = 0;
++  void* rw = nullptr;
++  if (rx && R_SUCCEEDED(perm_rc)) {
++    rw = virtmemFindAslr(kStubRegion, 0x1000);
++    view_rc = rw ? svcMapProcessMemory(rw, self, reinterpret_cast<u64>(backing), kStubRegion)
++                 : MAKERESULT(Module_Libnx, LibnxError_OutOfMemory);
++    if (R_FAILED(view_rc)) {
++      rw = nullptr;
++    }
++  }
++  virtmemUnlock();
++  std::fprintf(stderr,
++               "[resume-stub] image 0x%" PRIx64 " alias 0x%" PRIx64 " map 0x%X perm 0x%X view 0x%X\n",
++               base, rx, unsigned(map_rc), unsigned(perm_rc), unsigned(view_rc));
++  if (!rx || R_FAILED(perm_rc)) {
++    std::fprintf(stderr, "[resume-stub] unavailable: trap resume only\n");
++    return false;
++  }
++  armICacheInvalidate(reinterpret_cast<void*>(rx), kStubRegion);
++  g_stub_rx = rx;
++  g_stub_rw = static_cast<uint8_t*>(rw);
++  g_stub_mode = rw ? 1 : 2;
++  std::fprintf(stderr, "[resume-stub] mode %d: %zu stubs\n", g_stub_mode, kStubCount);
++  return true;
++}
++
++[[noreturn]] void RexResumeViaStub(ThreadExceptionDump* ctx) {
++  if (g_stub_mode == 0) {
++    RexResumeFromException(ctx);
++  }
++  if (t_stub < 0) {
++    const uint32_t i = g_stub_next.fetch_add(1, std::memory_order_relaxed);
++    if (i >= kStubCount) {
++      RexResumeFromException(ctx);
++    }
++    t_stub = static_cast<int32_t>(i);
++  }
++  const uint64_t rx = g_stub_rx + uint64_t(t_stub) * kStubSize;
++  if (g_stub_mode == 2 &&
++      R_FAILED(svcSetProcessMemoryPermission(envGetOwnProcessHandle(), rx, kStubSize, Perm_Rw))) {
++    RexResumeFromException(ctx);
++  }
++  uint8_t* rw = g_stub_mode == 1 ? g_stub_rw + size_t(t_stub) * kStubSize
++                                 : reinterpret_cast<uint8_t*>(rx);
++  const uint64_t branch_at = rx + kBranchIndex * 4;
++  const int64_t delta = static_cast<int64_t>(ctx->pc.x) - static_cast<int64_t>(branch_at);
++  if (delta < -(int64_t(1) << 27) || delta >= (int64_t(1) << 27)) {
++    RexResumeFromException(ctx);
++  }
++  std::memcpy(rw + kLitQ, &ctx->fpu_gprs[0], 512);
++  uint64_t* x = reinterpret_cast<uint64_t*>(rw + kLitX);
++  for (int i = 0; i < 29; ++i) {
++    x[i] = ctx->cpu_gprs[i].x;
++  }
++  x[29] = ctx->fp.x;
++  x[30] = ctx->lr.x;
++  const uint8_t* dump = reinterpret_cast<const uint8_t*>(ctx);
++  uint32_t fpcr = 0, fpsr = 0, slot = 0;
++  std::memcpy(&slot, dump + 4, 4);
++  std::memcpy(&fpcr, dump + 8, 4);   // saved at the entry (see the dump fill)
++  std::memcpy(&fpsr, dump + 12, 4);
++  *reinterpret_cast<uint64_t*>(rw + kLitSp) = ctx->sp.x;
++  *reinterpret_cast<uint64_t*>(rw + kLitFpcr) = fpcr;
++  *reinterpret_cast<uint64_t*>(rw + kLitFpsr) = fpsr;
++  *reinterpret_cast<uint64_t*>(rw + kLitNzcv) = uint64_t(ctx->pstate) & 0xF0000000u;
++  uint32_t* branch_rw = reinterpret_cast<uint32_t*>(rw + kBranchIndex * 4);
++  *branch_rw = 0x14000000u | (static_cast<uint32_t>(delta >> 2) & 0x03FFFFFFu);
++  if (g_stub_mode == 2) {
++    // The literals were written through the executable address itself: push
++    // them out before it becomes read-only again. No register state is live yet.
++    armDCacheClean(rw, kStubSize);
++    if (R_FAILED(svcSetProcessMemoryPermission(envGetOwnProcessHandle(), rx, kStubSize,
++                                               Perm_Rx))) {
++      RexResumeFromException(ctx);
++    }
++  }
++  // The literals are data: the same physical lines through the data cache. The
++  // branch is an instruction: push it out and drop the stale copy.
++  __asm__ volatile(
++      "dc cvau, %0\n"
++      "dsb ish\n"
++      "ic ivau, %1\n"
++      "dsb ish\n"
++      "isb\n"
++      :: "r"(branch_rw), "r"(branch_at) : "memory");
++  uint32_t* slot_word = &g_rex_exc_ocupadas[slot & (REX_EXC_RANURAS - 1)];
++  // Leave the exception slot's stack before releasing the slot: another thread
++  // may take it the moment it is free. Just below the thread's own sp is unused.
++  const uint64_t new_sp = (ctx->sp.x - 0x400) & ~uint64_t(0xF);
++  __asm__ volatile(
++      "mov sp, %0\n"
++      "dmb ish\n"
++      "stlr wzr, [%1]\n"
++      "br %2\n"
++      :: "r"(new_sp), "r"(slot_word), "r"(rx) : "memory");
++  __builtin_unreachable();
++}
++
+ [[noreturn]] void HandleSwitchException(ThreadExceptionDump* ctx) {
+   const uint64_t pc = ctx->pc.x;
+   if (pc == reinterpret_cast<uint64_t>(RexSwitchExceptionProbeTrap)) {
+@@ -832,7 +1041,7 @@ bool IsHotRead(uint64_t far) {
+     __asm__ volatile("movi v0.2d, #0\n movi v31.2d, #0\n msr fpcr, xzr\n msr fpsr, xzr"
+                      ::: "v0", "v31", "memory");
+     ctx->pc.x += 4;
+-    RexResumeFromException(ctx);
++    RexResumeViaStub(ctx);
+   }
+   const uint64_t far = ctx->far.x;
+   const uint32_t esr = ctx->esr;
+@@ -876,20 +1085,20 @@ bool IsHotRead(uint64_t far) {
+       if (g_rex_switch_unwatch_hot_read && IsHotRead(far)) {
+         if (g_rex_switch_unwatch_hot_read(far)) {
+           RexSwitchPerfCount(33);  // now mapped: the retried read runs natively
+-          RexResumeFromException(ctx);
++          RexResumeViaStub(ctx);
+         }
+         RexSwitchPerfCount(34);  // could not unwatch (list full, or not a plain watch)
+       }
+       if (EmulateViaShadow(ctx)) {
+         RexSwitchPerfCount(1);
+-        RexResumeFromException(ctx);
++        RexResumeViaStub(ctx);
+       }
+     }
+ 
+     /* (2) Committed, but not yet mapped in this view. */
+     if (RexGmFaultIn(far)) {
+       RexSwitchPerfCount(18);
+-      RexResumeFromException(ctx);
++      RexResumeViaStub(ctx);
+     }
+ 
+     /*
+@@ -908,7 +1117,7 @@ bool IsHotRead(uint64_t far) {
+       if (RexGmWindowToOffset(far, &offset) && offset >= kFisicaIni && offset < kFisicaFin) {
+         if (RexGmCommit(offset & ~(kTrozo - 1), kTrozo, REX_GM_WRITE) && RexGmFaultIn(far)) {
+           RexSwitchPerfCount(17);
+-          RexResumeFromException(ctx);
++          RexResumeViaStub(ctx);
+         }
+       }
+     }
+@@ -969,20 +1178,20 @@ bool IsHotRead(uint64_t far) {
+         if (!reintentable) {
+           if (EmulateViaShadow(ctx)) {
+             RexSwitchPerfCount(3);
+-            RexResumeFromException(ctx);
++            RexResumeViaStub(ctx);
+           }
+           break;  // ni reintentable ni emulable: sigue a SEH y a fatal
+         }
+       }
+       RexSwitchPerfCount(2);
+-      RexResumeFromException(ctx);
++      RexResumeViaStub(ctx);
+     }
+   }
+ 
+   // --- 3. SEH ----------------------------------------------------------------
+   if (RexSwitchSehHandleFault(ctx)) {
+     RexSwitchPerfCount(4);
+-    RexResumeFromException(ctx);
++    RexResumeViaStub(ctx);
+   }
+ 
+   // --- 4. fatal --------------------------------------------------------------
+@@ -999,8 +1208,16 @@ bool IsHotRead(uint64_t far) {
+ 
+ void ExceptionHandler::Install(Handler fn, void* data) {
+   static std::atomic<bool> tested{false};
+-  if (!tested.exchange(true) && !RexSwitchCheckExceptionRegisters()) {
+-    diagAbortWithResult(MAKERESULT(Module_Libnx, 102));
++  if (!tested.exchange(true)) {
++    // The probe exercises whichever resume path is active. If the stubs break it,
++    // fall back to the trap resume instead of refusing to start, and say so.
++    if (CreateResumeStubs() && !RexSwitchCheckExceptionRegisters()) {
++      std::fprintf(stderr, "[resume-stub] probe failed with stubs: trap resume only\n");
++      g_stub_mode = 0;
++    }
++    if (g_stub_mode == 0 && !RexSwitchCheckExceptionRegisters()) {
++      diagAbortWithResult(MAKERESULT(Module_Libnx, 102));
++    }
+   }
+   // There is nothing to install in the system: __libnx_exception_handler exists
+   // once linked. This only records the handler.
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index e4653ab..5e3c390 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -382,6 +382,17 @@ uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_
+ bool TextureCache::PrepareTextureLoad(Texture& texture, PendingTextureLoad& pending_load_out,
+                                       PendingSharedMemoryRange* pending_ranges_out,
+                                       size_t& pending_range_count_out) {
++  if (shared_memory().hash_validation()) {
++    // Without write watches nothing marks a texture outdated on its own: check
++    // its memory here, and a change fires its watch as a fault would have.
++    const TextureKey key = texture.key();
++    if (texture.GetGuestBaseSize()) {
++      shared_memory().HashValidateRange(key.base_page << 12, texture.GetGuestBaseSize());
++    }
++    if (texture.GetGuestMipsSize()) {
++      shared_memory().HashValidateRange(key.mip_page << 12, texture.GetGuestMipsSize());
++    }
++  }
+   uint32_t outdated_mask = texture.outdated_mask();
+   if (!outdated_mask) {
+     return false;
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index 171fb82..d28fbef 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -17,11 +17,20 @@
+ #include <rex/assert.h>
+ #include <rex/bit.h>
+ #include <rex/dbg.h>
++#include <rex/cvar.h>
+ #include <rex/graphics/shared_memory.h>
++#include <rex/hash.h>
+ #include <rex/math.h>
+ #include <rex/memory.h>
+ #include <rex/perf/counter.h>
+ 
++REXCVAR_DEFINE_BOOL(gpu_page_hash_validation, false, "GPU",
++                    "Validate uploaded guest memory by content hash once per frame instead of "
++                    "write-watching it. On Switch a watched page cannot be read-only, so every "
++                    "CPU read of it faults; this removes those faults. A CPU write is then "
++                    "noticed at the next check, up to one frame later, instead of at once.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace rex::graphics {
+ 
+ SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
+@@ -37,6 +46,14 @@ void SharedMemory::InitializeCommon() {
+   system_page_flags_valid_.assign(num_system_page_flags_, 0);
+   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+   page_write_seq_.assign(size_t(kBufferSize >> page_size_log2_), 0);
++  hash_validation_ = REXCVAR_GET(gpu_page_hash_validation);
++  if (hash_validation_) {
++    const size_t pages = size_t(kBufferSize >> page_size_log2_);
++    page_hash_.assign(pages, 0);
++    page_checked_epoch_.assign(pages, 0);
++    page_stable_.assign(pages, 0);
++    hash_changed_pages_.reserve(1024);
++  }
+   upload_seq_ = 0;
+ 
+   memory_invalidation_callback_handle_ =
+@@ -331,6 +348,18 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
+     }
+   }
+ 
++  if (hash_validation_) {
++    // No watch: the pages are checked by content instead (HashValidateRange).
++    const uint32_t page_bytes = uint32_t(1) << page_size_log2_;
++    for (uint32_t page = valid_page_first; page <= valid_page_last; ++page) {
++      page_hash_[page] =
++          XXH3_64bits(memory().TranslatePhysical(page << page_size_log2_), page_bytes);
++      page_checked_epoch_[page] = frame_epoch_;
++      page_stable_[page] = 0;
++    }
++    return;
++  }
++
+   if (memory_invalidation_callback_handle_) {
+     // Measurement oracle, NOT a feature. Skipping the re-arm leaves guest pages
+     // writable, so writes stop invalidating and the GPU renders stale geometry -
+@@ -399,6 +428,52 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
+   watch_range_first_free_ = range;
+ }
+ 
++void SharedMemory::HashValidateRange(uint32_t start, uint32_t length) {
++  if (!hash_validation_ || !length || start >= kBufferSize) {
++    return;
++  }
++  length = std::min(length, kBufferSize - start);
++  const uint32_t page_first = start >> page_size_log2_;
++  const uint32_t page_last = (start + length - 1) >> page_size_log2_;
++  const uint32_t page_bytes = uint32_t(1) << page_size_log2_;
++  hash_changed_pages_.clear();
++  // Hashed without the global lock: reading guest memory needs none, and the
++  // guest threads contend for it. A write racing the read is caught next check.
++  for (uint32_t page = page_first; page <= page_last; ++page) {
++    if (!((system_page_flags_valid_[page >> 6] >> (page & 63)) & 1)) {
++      continue;  // invalid pages are uploaded, and hashed, anyway
++    }
++    const uint32_t interval = uint32_t(1) << std::min<uint32_t>(page_stable_[page], 5);
++    if (frame_epoch_ - page_checked_epoch_[page] < interval) {
++      continue;
++    }
++    page_checked_epoch_[page] = frame_epoch_;
++    const uint64_t hash =
++        XXH3_64bits(memory().TranslatePhysical(page << page_size_log2_), page_bytes);
++    if (hash == page_hash_[page]) {
++      if (page_stable_[page] < 5) {
++        ++page_stable_[page];
++      }
++      continue;
++    }
++    page_hash_[page] = hash;
++    page_stable_[page] = 0;
++    hash_changed_pages_.push_back(page);
++  }
++  if (hash_changed_pages_.empty()) {
++    return;
++  }
++  // What a CPU write fault on a watched page would have done: the page is no
++  // longer valid on the GPU side, and everything watching it is told.
++  auto global_lock = global_critical_region_.Acquire();
++  for (uint32_t page : hash_changed_pages_) {
++    const uint64_t bit = ~(uint64_t(1) << (page & 63));
++    system_page_flags_valid_[page >> 6] &= bit;
++    system_page_flags_valid_and_gpu_written_[page >> 6] &= bit;
++    FireWatches(page, page, false);
++  }
++}
++
+ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, size_t count) {
+   if (ranges == nullptr || !count) {
+     return true;
+@@ -449,6 +524,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     if (!EnsureHostGpuMemoryAllocated(range.first, range.second)) {
+       return false;
+     }
++    HashValidateRange(range.first, range.second);
+   }
+ 
+   upload_ranges_.clear();
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 13cf6cc..b829b6d 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -2414,6 +2414,10 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
+   ++draw_census_swap_ordinal_;
++  draw_census::MaybeAutoRequest(draw_census_swap_ordinal_);
++  if (shared_memory_) {
++    shared_memory_->OnFrameBoundary();
++  }
+ #if REX_PLATFORM_SWITCH
+   RexSwitchPerfCount(0);
+   // Once per frame: pages the fault handler stopped watching because they were
+diff --git a/src/graphics/vulkan/draw_census.cc b/src/graphics/vulkan/draw_census.cc
+index de73ce6..904b761 100644
+--- a/src/graphics/vulkan/draw_census.cc
++++ b/src/graphics/vulkan/draw_census.cc
+@@ -88,8 +88,20 @@ REXCVAR_DEFINE_COMMAND(gpu_census_capture, RequestCapture, "GPU/Vulkan",
+ REXCVAR_DEFINE_COMMAND(gpu_census_status, LogStatus, "GPU/Vulkan",
+                        "Log draw census request and completion counters");
+ 
++REXCVAR_DEFINE_INT32(gpu_census_auto_swap, 0, "GPU/Vulkan",
++                     "Request one census capture when the guest reaches this swap; 0 = off. "
++                     "For consoles with no debug console to issue gpu_census_capture.");
++
+ bool HasPendingRequest() { return g_requests_pending.load(std::memory_order_acquire) != 0; }
+ 
++void MaybeAutoRequest(uint64_t guest_swap_ordinal) {
++  const int32_t at = REXCVAR_GET(gpu_census_auto_swap);
++  if (at > 0 && guest_swap_ordinal == uint64_t(at)) {
++    RequestCapture();
++    REXGPU_INFO("draw-census: automatic capture requested at swap {}", guest_swap_ordinal);
++  }
++}
++
+ bool Recorder::Append(const void* data, size_t size, bool reserve_trailer) {
+   const size_t trailer_reserve = reserve_trailer ? sizeof(TrailerRecord) : 0;
+   if (size > max_buffer_bytes_ || buffer_.size() > max_buffer_bytes_ - size ||
+diff --git a/src/graphics/vulkan/draw_census.h b/src/graphics/vulkan/draw_census.h
+index 52676c1..af40d18 100644
+--- a/src/graphics/vulkan/draw_census.h
++++ b/src/graphics/vulkan/draw_census.h
+@@ -244,6 +244,8 @@ static_assert(sizeof(TrailerRecord) == 80);
+ // normal-path boundary hook; it is one relaxed load at IssueSwap and false
+ // until a capture command is issued.
+ bool HasPendingRequest();
++// Requests a capture when gpu_census_auto_swap equals this swap ordinal.
++void MaybeAutoRequest(uint64_t guest_swap_ordinal);
+ 
+ class Recorder {
+  public:
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index b994c81..4e5caa5 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -59,9 +59,11 @@ namespace rex::memory {
+ 
+ #if REX_PLATFORM_SWITCH
+ namespace {
+-// Bounded so the per-frame check stays cheap: hashing 1,024 pages of 4 KB is
+-// about a millisecond on the GPU thread. Beyond it, reads stay emulated.
+-constexpr size_t kSwitchMaxUnwatchedPages = 1024;
++// Bounded so the per-frame check stays affordable: 4,096 pages are 16 MB to hash
++// on the GPU thread each frame, a few milliseconds. One decoded video frame and
++// its references needed more than the first limit of 1,024. Beyond it, reads stay
++// emulated.
++constexpr size_t kSwitchMaxUnwatchedPages = 4096;
+ Memory* g_switch_memory = nullptr;
+ }  // namespace
+ #endif
+@@ -2206,7 +2208,15 @@ void PhysicalHeap::EnableAccessCallbacks(uint32_t physical_address, uint32_t len
+     // callbacks - because real access violations are needed there. And don't
+     // enable invalidation notifications for read-only pages for the same
+     // reason.
+-    if (current_page_access != rex::memory::PageAccess::kNoAccess) {
++#if REX_PLATFORM_SWITCH
++    // A page switched to hash checking stays mapped: watching it again is exactly
++    // what brought its read faults back (see Memory::SwitchUnwatchHotReadPage).
++    const bool hash_checked = memory_->SwitchIsHashCheckedPage(
++        GetPhysicalAddress(heap_base_ + (i * system_page_size_ - host_address_offset())));
++#else
++    constexpr bool hash_checked = false;
++#endif
++    if (current_page_access != rex::memory::PageAccess::kNoAccess && !hash_checked) {
+       // TODO(Triang3l): Enable data providers.
+       if (enable_invalidation_notifications) {
+         if (current_page_access != rex::memory::PageAccess::kReadOnly &&
+@@ -2491,27 +2501,27 @@ bool Memory::SwitchUnwatchHotReadPage(const void* host_address) {
+   if (!lock.owns_lock()) {
+     return false;
+   }
+-  auto existing =
+-      std::find_if(switch_unwatched_pages_.begin(), switch_unwatched_pages_.end(),
+-                   [&](const SwitchUnwatchedPage& p) { return p.virtual_page == virtual_page; });
+-  if (existing == switch_unwatched_pages_.end() &&
+-      switch_unwatched_pages_.size() >= kSwitchMaxUnwatchedPages) {
++  const uint32_t physical_page = physical_heap->GetPhysicalAddress(virtual_page) & ~uint32_t(0xFFF);
++  const bool known = SwitchIsHashCheckedPage(physical_page);
++  if (!known && switch_unwatched_pages_.size() >= kSwitchMaxUnwatchedPages) {
+     return false;
+   }
++  // Another view of an already hash-checked page, or a watch set before it
++  // switched: only this view needs unmapping undone.
+   if (!physical_heap->SwitchUnwatchKeepingGpuCopy(virtual_page)) {
+     return false;
+   }
++  if (known) {
++    return true;
++  }
+   // Through the view that faulted: it was just mapped read/write, and watching it
+   // again needs the global lock held here, so this read cannot fault. The raw
+   // physical window might not be mapped yet, and a fault here would nest inside
+   // the fault handler.
+-  const uint32_t physical_page = physical_heap->GetPhysicalAddress(virtual_page);
+   const uint64_t hash = XXH3_64bits(TranslateVirtual(virtual_page), 0x1000);
+-  if (existing != switch_unwatched_pages_.end()) {
+-    existing->hash = hash;  // watched again since; start over from its contents now
+-  } else {
+-    switch_unwatched_pages_.push_back({virtual_page, physical_page, hash});
+-  }
++  switch_unwatched_pages_.push_back({virtual_page, physical_page, hash});
++  const uint32_t page = (physical_page & 0x1FFFFFFF) >> 12;
++  switch_hash_checked_[page >> 6].fetch_or(uint64_t(1) << (page & 63), std::memory_order_relaxed);
+   return true;
+ }
+ 
+@@ -2526,20 +2536,21 @@ void Memory::SwitchCheckUnwatchedPages() {
+       // unwatch path on this thread. At worst this window faults once to be mapped,
+       // which does not touch this list.
+       const uint64_t hash = XXH3_64bits(TranslatePhysical(pages[i].physical_page), 0x1000);
+-      if (hash == pages[i].hash) {
+-        ++i;
+-        continue;
++      if (hash != pages[i].hash) {
++        // Kept: the page stays hash-checked. Dropping it here meant the GPU
++        // watched it again on its next upload, and its reads faulted again, some
++        // 500 pages a second in the menu.
++        pages[i].hash = hash;
++        changed.push_back(pages[i].physical_page);
+       }
+-      changed.push_back(pages[i].physical_page);
+-      pages[i] = pages.back();
+-      pages.pop_back();
++      ++i;
+     }
+   }
+   if (changed.empty()) {
+     return;
+   }
+   // The same notification a CPU write to a watched page sends. The GPU side then
+-  // re-uploads and watches the page again the next time it uses it.
++  // re-uploads the page the next time it uses it; it does not watch it again.
+   auto global_lock = global_critical_region_.Acquire();
+   for (uint32_t physical_page : changed) {
+     for (auto* callback : physical_memory_invalidation_callbacks_) {

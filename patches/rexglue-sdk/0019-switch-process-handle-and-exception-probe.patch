@@ -1,0 +1,409 @@
+diff --git a/src/core/exception_handler_switch.cpp b/src/core/exception_handler_switch.cpp
+index 09acd05..6f8bfd1 100644
+--- a/src/core/exception_handler_switch.cpp
++++ b/src/core/exception_handler_switch.cpp
+@@ -892,7 +892,11 @@ void WriteStubCode(uint32_t* code) {
+  * console run of this code found a code alias but no usable stubs. */
+ bool CreateResumeStubs() {
+   const uint64_t base = reinterpret_cast<uint64_t>(&_start);
+-  const Handle self = envGetOwnProcessHandle();
++  const Handle self = static_cast<Handle>(RexGmProcessHandle());
++  if (self == INVALID_HANDLE) {
++    std::fprintf(stderr, "[resume-stub] no valid process handle; trap resume only\n");
++    return false;
++  }
+   void* backing = memalign(0x1000, kStubRegion);
+   if (!backing) {
+     std::fprintf(stderr, "[resume-stub] no memory for stubs\n");
+@@ -967,7 +971,7 @@ bool CreateResumeStubs() {
+   }
+   const uint64_t rx = g_stub_rx + uint64_t(t_stub) * kStubSize;
+   if (g_stub_mode == 2 &&
+-      R_FAILED(svcSetProcessMemoryPermission(envGetOwnProcessHandle(), rx, kStubSize, Perm_Rw))) {
++      R_FAILED(svcSetProcessMemoryPermission(static_cast<Handle>(RexGmProcessHandle()), rx, kStubSize, Perm_Rw))) {
+     RexResumeFromException(ctx);
+   }
+   uint8_t* rw = g_stub_mode == 1 ? g_stub_rw + size_t(t_stub) * kStubSize
+@@ -999,7 +1003,7 @@ bool CreateResumeStubs() {
+     // The literals were written through the executable address itself: push
+     // them out before it becomes read-only again. No register state is live yet.
+     armDCacheClean(rw, kStubSize);
+-    if (R_FAILED(svcSetProcessMemoryPermission(envGetOwnProcessHandle(), rx, kStubSize,
++    if (R_FAILED(svcSetProcessMemoryPermission(static_cast<Handle>(RexGmProcessHandle()), rx, kStubSize,
+                                                Perm_Rx))) {
+       RexResumeFromException(ctx);
+     }
+@@ -1249,6 +1253,9 @@ void ExceptionHandler::Uninstall(Handler fn, void* data) {
+  * in. If it is ever split out, it has to go directly into the executable, like runtime_switch.cpp.
+  */
+ extern "C" void __libnx_exception_handler(ThreadExceptionDump* ctx) {
++  if (ctx->pc.x == reinterpret_cast<uint64_t>(RexSwitchExceptionProbeTrap)) {
++    g_rex_switch_probe_handler_hits.fetch_add(1, std::memory_order_relaxed);
++  }
+   rex::arch::HandleSwitchException(ctx);
+ }
+ 
+diff --git a/src/core/guest_memory_switch.cpp b/src/core/guest_memory_switch.cpp
+index 52f9bcf..435e97f 100644
+--- a/src/core/guest_memory_switch.cpp
++++ b/src/core/guest_memory_switch.cpp
+@@ -125,7 +125,271 @@ State& S() {
+     return s;
+ }
+ 
+-Handle Proc() { return envGetOwnProcessHandle(); }
++constexpr Handle kInvalidProcessHandle = INVALID_HANDLE;
++
++struct ProcessHandleTransfer {
++    Handle server_session = INVALID_HANDLE;
++    Handle copied_process = INVALID_HANDLE;
++    Result receive_result = 0;
++    bool received_one = false;
++};
++
++std::atomic<Handle> g_process_handle{kInvalidProcessHandle};
++std::mutex g_process_handle_mutex;
++bool g_process_handle_attempted = false;
++ProcessHandleTransfer g_process_handle_transfer;
++Thread g_process_handle_receiver{};
++
++bool IsCurrentProcessHandle(Handle handle, uint64_t current_pid) {
++    if (handle == INVALID_HANDLE || handle == CUR_PROCESS_HANDLE) return false;
++    uint64_t handle_pid = 0;
++    return R_SUCCEEDED(svcGetProcessId(&handle_pid, handle)) && handle_pid == current_pid;
++}
++
++void ReceiveProcessHandle(void* arg) {
++    auto* transfer = static_cast<ProcessHandleTransfer*>(arg);
++    void* tls = armGetTls();
++    hipcMakeRequestInline(tls);
++
++    s32 index = 0;
++    transfer->receive_result = svcReplyAndReceive(
++        &index, &transfer->server_session, 1, INVALID_HANDLE, UINT64_MAX);
++    if (R_SUCCEEDED(transfer->receive_result)) {
++        HipcParsedRequest request = hipcParseRequest(tls);
++        if (request.meta.num_copy_handles == 1) {
++            transfer->copied_process = request.data.copy_handles[0];
++            transfer->received_one = true;
++        } else {
++            for (u32 i = 0; i < request.meta.num_copy_handles; ++i) {
++                Handle extra = request.data.copy_handles[i];
++                if (extra != INVALID_HANDLE) {
++                    Result close_result = svcCloseHandle(extra);
++                    if (R_FAILED(close_result)) {
++                        std::fprintf(stderr,
++                                     "[process-handle] close unexpected copy handle failed: 0x%08X\n",
++                                     unsigned(close_result));
++                    }
++                }
++            }
++        }
++    }
++
++    if (transfer->server_session != INVALID_HANDLE) {
++        Result close_result = svcCloseHandle(transfer->server_session);
++        if (R_FAILED(close_result)) {
++            std::fprintf(stderr,
++                         "[process-handle] close server session failed: 0x%08X\n",
++                         unsigned(close_result));
++        }
++        transfer->server_session = INVALID_HANDLE;
++    }
++}
++
++Handle AcquireProcessHandle() {
++    uint64_t current_pid = 0;
++    Result result = svcGetProcessId(&current_pid, CUR_PROCESS_HANDLE);
++    if (R_FAILED(result)) {
++        std::fprintf(stderr,
++                     "[process-handle] current PID query failed: 0x%08X\n",
++                     unsigned(result));
++        return kInvalidProcessHandle;
++    }
++
++    const Handle loader_handle = envGetOwnProcessHandle();
++    if (loader_handle != INVALID_HANDLE &&
++        IsCurrentProcessHandle(loader_handle, current_pid)) {
++        std::fprintf(stderr, "[process-handle] loader process handle validated\n");
++        return loader_handle;
++    }
++
++    std::fprintf(stderr,
++                 "[process-handle] loader handle unavailable or invalid; requesting self handle over loopback HIPC\n");
++
++    Handle server_session = INVALID_HANDLE;
++    Handle client_session = INVALID_HANDLE;
++    result = svcCreateSession(&server_session, &client_session, 0, 0);
++    if (R_FAILED(result)) {
++        std::fprintf(stderr,
++                     "[process-handle] create session failed: 0x%08X\n",
++                     unsigned(result));
++        if (client_session != INVALID_HANDLE) {
++            Result close_result = svcCloseHandle(client_session);
++            if (R_FAILED(close_result)) {
++                std::fprintf(stderr, "[process-handle] close partial client session failed: 0x%08X\n",
++                             unsigned(close_result));
++            }
++        }
++        if (server_session != INVALID_HANDLE) {
++            Result close_result = svcCloseHandle(server_session);
++            if (R_FAILED(close_result)) {
++                std::fprintf(stderr, "[process-handle] close partial server session failed: 0x%08X\n",
++                             unsigned(close_result));
++            }
++        }
++        return kInvalidProcessHandle;
++    }
++    if (server_session == INVALID_HANDLE || client_session == INVALID_HANDLE) {
++        std::fprintf(stderr, "[process-handle] create session returned invalid endpoint(s)\n");
++        if (client_session != INVALID_HANDLE) {
++            Result close_result = svcCloseHandle(client_session);
++            if (R_FAILED(close_result)) {
++                std::fprintf(stderr, "[process-handle] close client session failed: 0x%08X\n",
++                             unsigned(close_result));
++            }
++        }
++        if (server_session != INVALID_HANDLE) {
++            Result close_result = svcCloseHandle(server_session);
++            if (R_FAILED(close_result)) {
++                std::fprintf(stderr, "[process-handle] close server session failed: 0x%08X\n",
++                             unsigned(close_result));
++            }
++        }
++        return kInvalidProcessHandle;
++    }
++
++    g_process_handle_transfer = {};
++    g_process_handle_transfer.server_session = server_session;
++    g_process_handle_transfer.copied_process = INVALID_HANDLE;
++
++    result = threadCreate(&g_process_handle_receiver, &ReceiveProcessHandle,
++                          &g_process_handle_transfer, nullptr, 0x1000, 0x2C, -2);
++    if (R_FAILED(result)) {
++        std::fprintf(stderr,
++                     "[process-handle] create receiver thread failed: 0x%08X\n",
++                     unsigned(result));
++        Result close_client = svcCloseHandle(client_session);
++        if (R_FAILED(close_client)) {
++            std::fprintf(stderr, "[process-handle] close client session failed: 0x%08X\n",
++                         unsigned(close_client));
++        }
++        Result close_server = svcCloseHandle(server_session);
++        if (R_FAILED(close_server)) {
++            std::fprintf(stderr, "[process-handle] close server session failed: 0x%08X\n",
++                         unsigned(close_server));
++        }
++        g_process_handle_transfer.server_session = INVALID_HANDLE;
++        return kInvalidProcessHandle;
++    }
++
++    result = threadStart(&g_process_handle_receiver);
++    if (R_FAILED(result)) {
++        std::fprintf(stderr,
++                     "[process-handle] start receiver thread failed: 0x%08X\n",
++                     unsigned(result));
++        Result thread_close = threadClose(&g_process_handle_receiver);
++        if (R_FAILED(thread_close)) {
++            std::fprintf(stderr, "[process-handle] close unstarted receiver thread failed: 0x%08X\n",
++                         unsigned(thread_close));
++        }
++        Result close_client = svcCloseHandle(client_session);
++        if (R_FAILED(close_client)) {
++            std::fprintf(stderr, "[process-handle] close client session failed: 0x%08X\n",
++                         unsigned(close_client));
++        }
++        Result close_server = svcCloseHandle(server_session);
++        if (R_FAILED(close_server)) {
++            std::fprintf(stderr, "[process-handle] close server session failed: 0x%08X\n",
++                         unsigned(close_server));
++        }
++        g_process_handle_transfer.server_session = INVALID_HANDLE;
++        return kInvalidProcessHandle;
++    }
++
++    HipcMetadata request_meta{};
++    request_meta.num_copy_handles = 1;
++    HipcRequest request = hipcMakeRequest(armGetTls(), request_meta);
++    request.copy_handles[0] = CUR_PROCESS_HANDLE;
++    const Result send_result = svcSendSyncRequest(client_session);
++    const Result expected_session_closed = KERNELRESULT(ConnectionClosed);
++    if (R_FAILED(send_result) && send_result != expected_session_closed) {
++        std::fprintf(stderr,
++                     "[process-handle] send loopback request failed: 0x%08X\n",
++                     unsigned(send_result));
++    }
++    Result close_result = svcCloseHandle(client_session);
++    if (R_FAILED(close_result)) {
++        std::fprintf(stderr,
++                     "[process-handle] close client session failed: 0x%08X\n",
++                     unsigned(close_result));
++    }
++
++    const Result wait_result = threadWaitForExit(&g_process_handle_receiver);
++    if (R_FAILED(wait_result)) {
++        // Keep the static transfer state and thread object alive if an unexpected
++        // wait error leaves the receiver running; process exit reclaims its handles.
++        std::fprintf(stderr,
++                     "[process-handle] wait for receiver thread failed: 0x%08X\n",
++                     unsigned(wait_result));
++        return kInvalidProcessHandle;
++    }
++    Result thread_close = threadClose(&g_process_handle_receiver);
++    if (R_FAILED(thread_close)) {
++        std::fprintf(stderr, "[process-handle] close receiver thread failed: 0x%08X\n",
++                     unsigned(thread_close));
++    }
++
++    if (R_FAILED(g_process_handle_transfer.receive_result) ||
++        !g_process_handle_transfer.received_one) {
++        std::fprintf(stderr,
++                     "[process-handle] loopback receive failed: send=0x%08X receive=0x%08X handles=%u\n",
++                     unsigned(send_result),
++                     unsigned(g_process_handle_transfer.receive_result),
++                     g_process_handle_transfer.received_one ? 1u : 0u);
++        if (g_process_handle_transfer.copied_process != INVALID_HANDLE) {
++            Result close_process = svcCloseHandle(g_process_handle_transfer.copied_process);
++            if (R_FAILED(close_process)) {
++                std::fprintf(stderr,
++                             "[process-handle] close rejected process handle failed: 0x%08X\n",
++                             unsigned(close_process));
++            }
++            g_process_handle_transfer.copied_process = INVALID_HANDLE;
++        }
++        return kInvalidProcessHandle;
++    }
++
++    const Handle process_handle = g_process_handle_transfer.copied_process;
++    if (!IsCurrentProcessHandle(process_handle, current_pid)) {
++        std::fprintf(stderr,
++                     "[process-handle] copied handle did not identify this process\n");
++        Result close_process = svcCloseHandle(process_handle);
++        if (R_FAILED(close_process)) {
++            std::fprintf(stderr,
++                         "[process-handle] close invalid process handle failed: 0x%08X\n",
++                         unsigned(close_process));
++        }
++        g_process_handle_transfer.copied_process = INVALID_HANDLE;
++        return kInvalidProcessHandle;
++    }
++
++    // The receiver intentionally closes the server endpoint without replying.
++    // Horizon reports that successful one-way handle transfer as SessionClosed.
++    // Accept only that exact kernel result, and only after receive-count and PID
++    // validation above; every other send failure rejects and closes the handle.
++    if (R_FAILED(send_result) && send_result != expected_session_closed) {
++        std::fprintf(stderr,
++                     "[process-handle] unexpected loopback send failure: 0x%08X\n",
++                     unsigned(send_result));
++        Result close_process = svcCloseHandle(process_handle);
++        if (R_FAILED(close_process)) {
++            std::fprintf(stderr,
++                         "[process-handle] close rejected process handle failed: 0x%08X\n",
++                         unsigned(close_process));
++        }
++        g_process_handle_transfer.copied_process = INVALID_HANDLE;
++        return kInvalidProcessHandle;
++    }
++    if (send_result == expected_session_closed) {
++        std::fprintf(stderr,
++                     "[process-handle] loopback HIPC transfer complete (expected session close)\n");
++    } else {
++        std::fprintf(stderr, "[process-handle] loopback HIPC self handle acquired\n");
++    }
++    return process_handle;
++}
++
++Handle Proc() {
++    return static_cast<Handle>(RexGmProcessHandle());
++}
+ 
+ bool Intersect(size_t a, size_t al, size_t b, size_t bl, size_t* lo, size_t* hi) {
+     const size_t l = a > b ? a : b;
+@@ -376,7 +640,27 @@ void ReleaseChunk(const Chunk& c) {
+ 
+ extern "C" {
+ 
++uint32_t RexGmProcessHandle(void) {
++    Handle cached = g_process_handle.load(std::memory_order_acquire);
++    if (cached != kInvalidProcessHandle) return cached;
++
++    std::lock_guard<std::mutex> lock(g_process_handle_mutex);
++    cached = g_process_handle.load(std::memory_order_relaxed);
++    if (cached != kInvalidProcessHandle) return cached;
++    if (g_process_handle_attempted) return kInvalidProcessHandle;
++    g_process_handle_attempted = true;
++
++    cached = AcquireProcessHandle();
++    if (cached != kInvalidProcessHandle) {
++        g_process_handle.store(cached, std::memory_order_release);
++    }
++    return cached;
++}
+ uint8_t* RexGmInit(size_t size) {
++    if (RexGmProcessHandle() == INVALID_HANDLE) {
++        std::fprintf(stderr, "[guest-memory] valid process handle unavailable; refusing mappings\n");
++        return nullptr;
++    }
+     State& s = S();
+     std::lock_guard<std::mutex> lock(s.mutex);
+     if (s.base) return s.base;
+diff --git a/src/core/guest_memory_switch.h b/src/core/guest_memory_switch.h
+index c265f43..1442fbd 100644
+--- a/src/core/guest_memory_switch.h
++++ b/src/core/guest_memory_switch.h
+@@ -68,6 +68,14 @@ typedef enum {
+     REX_GM_WRITE = (1 << 0) | (1 << 1),  /* lectura + escritura */
+ } RexGmAccess;
+ 
++/*
++ * Returns a validated real handle for this process. The environment-provided
++ * handle is preferred; if absent, a real self handle is acquired once through
++ * a local HIPC copy-handle request. INVALID_HANDLE is returned on failure.
++ * The cached handle is process-owned for the remainder of the app lifetime.
++ */
++uint32_t RexGmProcessHandle(void);
++
+ /* Reserves the window. size is usually 0x120000000. Returns the base or NULL. */
+ uint8_t* RexGmInit(size_t size);
+ 
+diff --git a/src/core/switch_exception_probe.h b/src/core/switch_exception_probe.h
+index a980181..dd2b8df 100644
+--- a/src/core/switch_exception_probe.h
++++ b/src/core/switch_exception_probe.h
+@@ -2,9 +2,15 @@
+ // deliberate undefined instruction, so no game memory or content is needed.
+ #pragma once
+ 
++#include <atomic>
++#include <cstdint>
++
+ extern "C" void RexSwitchExceptionProbe(const void* expected, void* actual);
+ extern "C" const char RexSwitchExceptionProbeTrap[];
+ 
++static std::atomic<uint32_t> g_rex_switch_probe_handler_hits{0};
++static_assert(std::atomic<uint32_t>::is_always_lock_free,
++              "The exception probe counter must be lock-free");
+ __asm__(
+     ".text\n"
+     ".balign 4\n"
+@@ -80,7 +86,19 @@ static bool RexSwitchCheckExceptionRegisters() {
+   expected[64] = 0x00400000; // round toward positive infinity
+   expected[65] = 1;          // accrued invalid-operation flag
+   for (unsigned trial = 0; trial < 16; ++trial) {
++    const uint32_t hits_before =
++        g_rex_switch_probe_handler_hits.load(std::memory_order_relaxed);
+     RexSwitchExceptionProbe(expected, actual);
++    const uint32_t hits_after =
++        g_rex_switch_probe_handler_hits.load(std::memory_order_relaxed);
++    const uint32_t delivered = hits_after - hits_before;
++    if (delivered != 1) {
++      std::fprintf(stderr,
++                   "[exception-probe] FAIL trial=%u expected one exception-handler entry, got=%u total=%u\n",
++                   trial, delivered, hits_after);
++      std::fflush(stderr);
++      return false;
++    }
+     for (unsigned i = 0; i < 66; ++i) {
+       if (actual[i] != expected[i]) {
+         std::fprintf(stderr, "[exception-probe] FAIL trial=%u word=%u expected=%016" PRIx64

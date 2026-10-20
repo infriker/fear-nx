@@ -1,0 +1,98 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 629e3c7..9c91427 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -168,7 +168,13 @@ if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+     list(GET CMAKE_OSX_ARCHITECTURES 0 REX_TARGET_PROCESSOR)
+ endif()
+ 
+-if(WIN32)
++if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    if(NOT REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64|arm64")
++        message(FATAL_ERROR "Nintendo Switch requires AArch64")
++    endif()
++    set(REX_PLATFORM "switch-arm64")
++    add_compile_definitions(REX_PLATFORM_SWITCH=1)
++elseif(WIN32)
+     if(REX_TARGET_PROCESSOR MATCHES "AMD64|x86_64")
+         set(REX_PLATFORM "win-amd64")
+     elseif(REX_TARGET_PROCESSOR MATCHES "aarch64|ARM64|arm64")
+@@ -199,6 +205,19 @@ else()
+     message(FATAL_ERROR "Unsupported platform. ReXGlue supports Windows, Linux, and macOS only.")
+ endif()
+ 
++# A platform definition must not accidentally select desktop fallback sources.
++# Runtime enablement waits for the standalone Horizon memory and Vulkan probes.
++if(CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
++    option(REXGLUE_SWITCH_PLATFORM_PROBE_ONLY "Build only the Horizon platform contract" OFF)
++    if(NOT REXGLUE_SWITCH_PLATFORM_PROBE_ONLY)
++        message(FATAL_ERROR "Switch runtime is not implemented; validate memory and Vulkan first. Use REXGLUE_SWITCH_PLATFORM_PROBE_ONLY for the platform contract.")
++    endif()
++    add_executable(rexglue-switch-platform-probe tests/switch/platform.cpp)
++    target_include_directories(rexglue-switch-platform-probe PRIVATE include)
++    nx_create_nro(rexglue-switch-platform-probe)
++    return()
++endif()
++
+ # Build config as compile definition (multi-config generators don't know config at configure time)
+ add_compile_definitions(REXGLUE_BUILD_CONFIG="$<CONFIG>")
+ 
+diff --git a/include/rex/platform.h b/include/rex/platform.h
+index e90418d..e30335c 100644
+--- a/include/rex/platform.h
++++ b/include/rex/platform.h
+@@ -28,7 +28,9 @@
+ #include <TargetConditionals.h>
+ #endif
+ 
+-#if defined(TARGET_OS_MAC) && TARGET_OS_MAC
++#if defined(__SWITCH__)
++#define REX_PLATFORM_SWITCH 1
++#elif defined(TARGET_OS_MAC) && TARGET_OS_MAC
+ #define REX_PLATFORM_MAC 1
+ #elif defined(WIN32) || defined(_WIN32)
+ #define REX_PLATFORM_WIN32 1
+@@ -44,6 +46,9 @@
+ 
+ // Ensure all platform macros are always defined (0 when inactive)
+ // so they can be used in static_assert and regular expressions.
++#ifndef REX_PLATFORM_SWITCH
++#define REX_PLATFORM_SWITCH 0
++#endif
+ #ifndef REX_PLATFORM_MAC
+ #define REX_PLATFORM_MAC 0
+ #endif
+@@ -97,6 +102,14 @@
+ #include <bit>
+ #include <cstdint>
+ 
++#if REX_PLATFORM_SWITCH
++static_assert(sizeof(void*) == 8, "Horizon requires 64-bit pointers");
++static_assert(std::endian::native == std::endian::little, "Horizon requires little endian");
++#if !REX_ARCH_ARM64
++#error Horizon requires AArch64
++#endif
++#endif
++
+ //=============================================================================
+ // Compiler Polyfills
+ //=============================================================================
+diff --git a/tests/switch/platform.cpp b/tests/switch/platform.cpp
+new file mode 100644
+index 0000000..036ca70
+--- /dev/null
++++ b/tests/switch/platform.cpp
+@@ -0,0 +1,13 @@
++#include <rex/platform.h>
++#include <switch.h>
++#include <cstdio>
++static_assert(REX_PLATFORM_SWITCH && REX_ARCH_ARM64);
++static_assert(!REX_PLATFORM_LINUX && !REX_PLATFORM_MAC && !REX_PLATFORM_WIN32);
++static_assert(sizeof(void*) == 8 && std::endian::native == std::endian::little);
++static_assert(std::byteswap(uint32_t{0x12345678}) == 0x78563412);
++int main() {
++  consoleInit(nullptr);
++  std::printf("ReXGlue platform header: C++23 / Horizon / ARM64 / LE64\n");
++  for (unsigned frame = 0; frame < 300 && appletMainLoop(); ++frame) consoleUpdate(nullptr);
++  consoleExit(nullptr);
++}

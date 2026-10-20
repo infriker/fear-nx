@@ -1,0 +1,1424 @@
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index cf009c3..2a510c7 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -627,6 +627,9 @@ class TextureCache {
+   // so need to recheck if textures aren't outdated, disregarding whether fetch
+   // constants have been changed.
+   std::atomic<bool> texture_became_outdated_{false};
++  // With gpu_page_hash_validation, the frame whose first request last reset
++  // the bindings (see RequestTextures).
++  uint32_t hash_validation_bindings_epoch_ = 0;
+ 
+   std::array<TextureBinding, xenos::kTextureFetchConstantCount> texture_bindings_;
+   // Bit vector with bits reset on fetch constant writes to avoid parsing fetch
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index e886e32..4e9133b 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -88,6 +88,7 @@ class SharedMemory {
+   void HashValidateRange(uint32_t start, uint32_t length);
+   // Advances the frame counter the hash checks are scheduled against.
+   void OnFrameBoundary() { ++frame_epoch_; }
++  uint32_t frame_epoch() const { return frame_epoch_; }
+ 
+   // Native residency path. Uploads `size` bytes from `host_src` into the buffer
+   // at `guest_offset`, bypassing the page validity bookkeeping entirely: no
+@@ -273,6 +274,7 @@ class SharedMemory {
+   // command processor thread.
+   bool hash_validation_ = false;
+   uint32_t frame_epoch_ = 1;
++  bool hash_backoff_ = true;
+   std::vector<uint64_t> page_hash_;
+   std::vector<uint32_t> page_checked_epoch_;
+   std::vector<uint8_t> page_stable_;
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 772c203..0e97704 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -149,6 +149,22 @@ class VulkanCommandProcessor : public CommandProcessor {
+   bool CompileGlslToSpirv(VkShaderStageFlagBits stage, std::string_view source,
+                           std::vector<uint32_t>& spirv_out, std::string& error_out) const;
+ 
++  // Per-operation GPU timing, with gpu_timestamp_queries on: an operation
++  // recorded between GpuOpBegin and GpuOpEnd has its GPU time summed into its
++  // kind, on one frame in kGpuOpSampleEvery so the extra timestamps do not
++  // slow every frame. Outside sampled frames both calls do nothing.
++  enum class GpuOp : uint8_t {
++    kTransferDraw,
++    kStencilBitDraw,
++    kRenderTargetDump,
++    kResolveCopy,
++    kTransferCopy,
++    kRenderTargetDumpMultisampled,
++    kCount,
++  };
++  void GpuOpBegin();
++  void GpuOpEnd(GpuOp op);
++
+   // Returns the deferred drawing command list for the currently open
+   // submission.
+   DeferredCommandBuffer& deferred_command_buffer() {
+@@ -778,7 +794,14 @@ class VulkanCommandProcessor : public CommandProcessor {
+   //
+   // Read back without VK_QUERY_RESULT_WAIT_BIT: a stall here would change the
+   // thing being measured, so a slot that is not ready yet is simply skipped.
+-  static constexpr uint32_t kTimestampQueriesPerFrame = 2;
++  // Two for the frame, then a begin/end pair per timed operation.
++  static constexpr uint32_t kGpuOpMaxPerFrame = 255;
++  static constexpr uint32_t kGpuOpSampleEvery = 4;
++  static constexpr uint32_t kTimestampQueriesPerFrame = 2 + 2 * kGpuOpMaxPerFrame;
++  bool gpu_op_frame_sampled_ = false;
++  uint32_t gpu_op_count_ = 0;
++  uint32_t gpu_op_slot_count_[kMaxFramesInFlight] = {};
++  GpuOp gpu_op_kind_[kMaxFramesInFlight][kGpuOpMaxPerFrame] = {};
+   VkQueryPool timestamp_query_pool_ = VK_NULL_HANDLE;
+   bool timestamp_queries_available_ = false;
+   double timestamp_period_ns_ = 0.0;
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index fe9ac62..c9ca07a 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -181,6 +181,21 @@ class DeferredCommandBuffer {
+                 sizeof(VkBufferCopy) * region_count);
+   }
+ 
++  VkImageCopy* CmdCopyImageEmplace(VkImage src_image, VkImageLayout src_image_layout,
++                                   VkImage dst_image, VkImageLayout dst_image_layout,
++                                   uint32_t region_count) {
++    const size_t header_size = rex::align(sizeof(ArgsVkCopyImage), alignof(VkImageCopy));
++    uint8_t* args_ptr = reinterpret_cast<uint8_t*>(
++        WriteCommand(Command::kVkCopyImage, header_size + sizeof(VkImageCopy) * region_count));
++    auto& args = *reinterpret_cast<ArgsVkCopyImage*>(args_ptr);
++    args.src_image = src_image;
++    args.src_image_layout = src_image_layout;
++    args.dst_image = dst_image;
++    args.dst_image_layout = dst_image_layout;
++    args.region_count = region_count;
++    return reinterpret_cast<VkImageCopy*>(args_ptr + header_size);
++  }
++
+   void CmdVkBeginQuery(VkQueryPool query_pool, uint32_t query, VkQueryControlFlags flags) {
+     auto& args = *reinterpret_cast<ArgsVkBeginQuery*>(
+         WriteCommand(Command::kVkBeginQuery, sizeof(ArgsVkBeginQuery)));
+@@ -372,6 +387,7 @@ class DeferredCommandBuffer {
+     kVkClearColorImage,
+     kVkCopyBuffer,
+     kVkCopyBufferToImage,
++    kVkCopyImage,
+     kVkCopyQueryPoolResults,
+     kVkDispatch,
+     kVkDraw,
+@@ -485,6 +501,16 @@ class DeferredCommandBuffer {
+     static_assert(alignof(VkBufferCopy) <= alignof(uintmax_t));
+   };
+ 
++  struct ArgsVkCopyImage {
++    VkImage src_image;
++    VkImageLayout src_image_layout;
++    VkImage dst_image;
++    VkImageLayout dst_image_layout;
++    uint32_t region_count;
++    // Followed by aligned VkImageCopy[].
++    static_assert(alignof(VkImageCopy) <= alignof(uintmax_t));
++  };
++
+   struct ArgsVkCopyBufferToImage {
+     VkBuffer src_buffer;
+     VkImage dst_image;
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index 34f7033..b844564 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -109,6 +109,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+                VulkanTextureCache& texture_cache, uint32_t& written_address_out,
+                uint32_t& written_length_out);
+ 
++  // Set by the command processor before Update: whether the draw's pixel
++  // shader may discard samples or samples textures (an image, whose rectangle
++  // need not cover the scissor), which rules the draw out as a full overwrite.
++  void SetDrawPixelShaderMayKill(bool may_kill) { draw_pixel_shader_may_kill_ = may_kill; }
++
+   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
+   // Binding information for the last successful update.
+@@ -673,7 +678,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   // need to be dumped). Using 8x16 since that's 128 - the minimum required
+   // group size on Vulkan, and the maximum number of lanes in a subgroup on
+   // Vulkan.
+-  static constexpr uint32_t kDumpSamplesPerGroupX = 8;
++  // Each invocation dumps kDumpSamplesPerInvocation horizontally adjacent
++  // samples. It divides every tile width (80 or 40 samples, and the 40-sample
++  // halves the depth column swap works on), so an invocation never crosses a
++  // tile or a half. 10 per invocation (4x16 groups) produced stale resolves
++  // on the Switch - videos cycled through their first frames - so it stays 5.
++  static constexpr uint32_t kDumpSamplesPerInvocation = 5;
++  static constexpr uint32_t kDumpSamplesPerGroupX = 8 * kDumpSamplesPerInvocation;
+   static constexpr uint32_t kDumpSamplesPerGroupY = 16;
+ 
+   union DumpPitches {
+@@ -800,6 +811,19 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+       const uint64_t* render_target_resolve_clear_values = nullptr,
+       const Transfer::Rectangle* resolve_clear_rectangle = nullptr);
+ 
++  // Performs the depth-to-depth transfers into dest_rt that are a plain move
++  // of samples (same format and sample count, no separate host depth) as
++  // image copies, and returns the rest in remaining_out for the shader path.
++  void CopyDepthTransfers(VulkanRenderTarget& dest_rt, const std::vector<Transfer>& transfers,
++                          std::vector<Transfer>& remaining_out);
++
++  // The render targets (bit 0 depth, 1 + i color i) that the current draw
++  // replaces entirely inside rect_out, so the previous EDRAM contents there
++  // never need to be transferred into them.
++  uint32_t GetDrawOverwrittenRenderTargets(reg::RB_DEPTHCONTROL normalized_depth_control,
++                                           uint32_t normalized_color_mask,
++                                           Transfer::Rectangle& rect_out) const;
++
+   VkPipeline GetDumpPipeline(DumpPipelineKey key);
+   VkPipeline GetDirectResolvePipeline(DirectResolvePipelineKey key);
+   bool TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
+@@ -862,6 +886,10 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+ 
+   // Temporary storage for PerformTransfersAndResolveClears.
+   std::vector<TransferInvocation> current_transfer_invocations_;
++  std::vector<Transfer> copy_remaining_transfers_;
++  std::vector<Transfer> cutout_remaining_transfers_;
++  std::vector<Transfer> same_kind_transfers_;
++  std::vector<VkImageCopy> copy_transfer_regions_;
+ 
+   // Temporary storage for DumpRenderTargets.
+   std::vector<ResolveCopyDumpRectangle> dump_rectangles_;
+@@ -870,6 +898,24 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   uint64_t direct_resolve_attempt_count_ = 0;
+   uint64_t direct_resolve_success_count_ = 0;
+   uint64_t direct_resolve_fallback_count_ = 0;
++  // Stencil bits that anything may have set since startup: what the stencil
++  // operations of draws can write through their write masks, the stencil of
++  // depth clears, and all bits
++  // once a color render target has been reinterpreted as stencil. Without
++  // VK_EXT_shader_stencil_export a depth transfer rewrites stencil with one
++  // full-surface draw per bit after clearing it to 0; a bit outside this mask
++  // is 0 in every source, so its draw can be left out
++  // (gpu_stencil_transfer_used_bits). Only the command processor thread
++  // touches it.
++  uint32_t stencil_bits_written_ = 0;
++  bool draw_pixel_shader_may_kill_ = true;
++  // While PerformTransfersAndResolveClears runs for a draw: which render
++  // targets it overwrites, and where (see GetDrawOverwrittenRenderTargets).
++  uint32_t draw_overwritten_render_targets_ = 0;
++  // While PerformTransfersAndResolveClears runs for a draw: whether that draw
++  // writes depth without testing it and without stencil.
++  bool draw_writes_depth_blindly_ = false;
++  Transfer::Rectangle draw_overwritten_rect_ = {};
+ 
+   // For pixel (fragment) shader interlock.
+ 
+diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
+index c4461f4..3f0177f 100644
+--- a/include/rex/ui/vulkan/functions/device_1_0.inc
++++ b/include/rex/ui/vulkan/functions/device_1_0.inc
+@@ -14,6 +14,7 @@ XE_UI_VULKAN_FUNCTION(vkCmdClearAttachments)
+ XE_UI_VULKAN_FUNCTION(vkCmdClearColorImage)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyBuffer)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyBufferToImage)
++XE_UI_VULKAN_FUNCTION(vkCmdCopyImage)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyImageToBuffer)
+ XE_UI_VULKAN_FUNCTION(vkCmdCopyQueryPoolResults)
+ XE_UI_VULKAN_FUNCTION(vkCmdDispatch)
+diff --git a/src/core/guest_memory_switch.cpp b/src/core/guest_memory_switch.cpp
+index 34cd4ed..52f9bcf 100644
+--- a/src/core/guest_memory_switch.cpp
++++ b/src/core/guest_memory_switch.cpp
+@@ -101,6 +101,12 @@ struct State {
+      * the window, whether it is committed or not.
+      */
+     std::map<size_t, RexGmAccess> protection;
++    /*
++     * Pages the guest made read-only but that stay mapped (RexGmSetReadOnlyMapped).
++     * `protection` keeps meaning "unmapped on purpose", so every mapping path is
++     * unchanged; only the queries report these pages as read-only.
++     */
++    std::set<size_t> readonly_logical;
+     /*
+      * Which (view index, chunk offset) pairs are mapped. A chunk is not mapped into
+      * all five views when it is committed: it enters each view the first time it is
+@@ -154,6 +160,26 @@ RexGmAccess AccessOf(State& s, size_t page_off) {
+     return it == s.protection.end() ? REX_GM_WRITE : it->second;
+ }
+ 
++/*
++ * Read-only guest pages kept mapped
++ *
++ * Horizon cannot make these pages read-only, so a read-only guest page was
++ * unmapped and every read of it became an emulated fault. Project 8's video
++ * decoder reads read-only tables: about 200,000 emulated reads a second, most of
++ * a core, with GPU write watching already off. With this on, such pages stay
++ * mapped read/write and only the bookkeeping says read-only. A guest write to
++ * one then succeeds instead of faulting; on the console it would have been a
++ * game bug. It must stay off while pages are write-watched, because watching
++ * relies on read-only pages faulting on write.
++ */
++bool g_ro_mapped = false;
++
++RexGmAccess ReportedAccessOf(const State& s, size_t page_off) {
++    auto it = s.protection.find(page_off);
++    if (it != s.protection.end()) return it->second;
++    return s.readonly_logical.count(page_off) ? REX_GM_READ : REX_GM_WRITE;
++}
++
+ /* Is there committed backing behind this window address? */
+ bool IsCommittedWindowAddress(State& s, uint64_t addr) {
+     const View* v = ViewFor(s, addr);
+@@ -381,6 +407,7 @@ void RexGmShutdown(void) {
+     s.chunks.clear();
+     s.views.clear();
+     s.protection.clear();
++    s.readonly_logical.clear();
+     s.committed = 0;
+     s.mapped = 0;
+ 
+@@ -613,9 +640,15 @@ bool RexGmProtect(uint8_t* address, size_t length, RexGmAccess access, RexGmAcce
+     const size_t begin = AlignDown(static_cast<size_t>(addr - wbase), kPageSize);
+     const size_t end   = AlignUp(static_cast<size_t>(addr - wbase) + length, kPageSize);
+ 
+-    if (out_old) *out_old = AccessOf(s, begin);
++    if (out_old) *out_old = ReportedAccessOf(s, begin);
+ 
+-    const bool debe_estar = (access == REX_GM_WRITE);
++    const bool ro_mapped = g_ro_mapped && access == REX_GM_READ;
++    for (size_t p = begin; p < end; p += kPageSize) {
++        if (ro_mapped) s.readonly_logical.insert(p);
++        else s.readonly_logical.erase(p);
++    }
++    // A read-only page kept mapped is handled like a writable one from here on.
++    const bool debe_estar = (access == REX_GM_WRITE) || ro_mapped;
+ 
+     /*
+      * Fast path, and the common one: asking for full access on a range that has no
+@@ -707,7 +740,7 @@ bool RexGmQueryProtect(uint8_t* address, size_t* length, RexGmAccess* out_access
+         return true;
+     }
+ 
+-    const RexGmAccess a = AccessOf(s, begin);
++    const RexGmAccess a = ReportedAccessOf(s, begin);
+     if (out_access) *out_access = a;
+ 
+     /*
+@@ -719,7 +752,7 @@ bool RexGmQueryProtect(uint8_t* address, size_t* length, RexGmAccess* out_access
+ 
+     size_t p = begin;
+     const size_t tope = begin + maximo;
+-    while (p < tope && AccessOf(s, p) == a && IsCommittedWindowAddress(s, wbase + p))
++    while (p < tope && ReportedAccessOf(s, p) == a && IsCommittedWindowAddress(s, wbase + p))
+         p += kPageSize;
+     if (length) *length = p - begin;
+     return true;
+@@ -744,3 +777,11 @@ void* RexGmShadowFor(uint64_t window_address) {
+ }  // extern "C"
+ 
+ #endif /* __SWITCH__ */
++
++#if defined(__SWITCH__)
++extern "C" void RexGmSetReadOnlyMapped(bool enabled) {
++    State& s = S();
++    std::lock_guard<std::mutex> lock(s.mutex);
++    g_ro_mapped = enabled;
++}
++#endif
+diff --git a/src/core/guest_memory_switch.h b/src/core/guest_memory_switch.h
+index 84386ff..c265f43 100644
+--- a/src/core/guest_memory_switch.h
++++ b/src/core/guest_memory_switch.h
+@@ -186,6 +186,10 @@ int RexGmModoProteccion(void);
+  */
+ uint32_t RexGmLastResult(void);
+ 
++/* Keep guest read-only pages mapped, reporting them read-only only in queries.
++ * Only valid while no page is write-watched (see guest_memory_switch.cpp). */
++void RexGmSetReadOnlyMapped(bool enabled);
++
+ #define REX_GM_ERR_NOMEM    0xFFFF0001u  /* memalign of the backing store failed */
+ #define REX_GM_ERR_NOCODEVA 0xFFFF0002u  /* no free space left in the code region */
+ 
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 5e3c390..8e06f69 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -482,6 +482,15 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+     // is rechecked in this draw and in subsequent ones to reload the new data
+     // if needed.
+     ResetTextureBindings();
++  } else if (shared_memory().hash_validation() &&
++             shared_memory().frame_epoch() != hash_validation_bindings_epoch_) {
++    // Without write watches, a binding whose fetch constant stays the same is
++    // never looked at again, so its memory is never hashed, and nothing can
++    // mark it outdated: videos and streamed images kept their first frames.
++    // Rechecking every binding once per frame gets each bound texture its
++    // hash check, which reloads it only if its memory changed.
++    hash_validation_bindings_epoch_ = shared_memory().frame_epoch();
++    ResetTextureBindings();
+   }
+ 
+   // Update the texture keys and the textures.
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index d28fbef..4fe1457 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -18,6 +18,7 @@
+ #include <rex/bit.h>
+ #include <rex/dbg.h>
+ #include <rex/cvar.h>
++#include <rex/platform.h>
+ #include <rex/graphics/shared_memory.h>
+ #include <rex/hash.h>
+ #include <rex/math.h>
+@@ -31,6 +32,17 @@ REXCVAR_DEFINE_BOOL(gpu_page_hash_validation, false, "GPU",
+                     "noticed at the next check, up to one frame later, instead of at once.")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DEFINE_BOOL(gpu_page_hash_backoff, true, "GPU",
++                    "With gpu_page_hash_validation, check pages that keep their contents less "
++                    "often, down to once every 32 frames")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++#if REX_PLATFORM_SWITCH
++extern "C" void RexGmSetReadOnlyMapped(bool enabled);
++extern "C" void RexSwitchPerfCount(unsigned id);
++extern "C" void RexSwitchPerfAdd(unsigned id, uint64_t value);
++#endif
++
+ namespace rex::graphics {
+ 
+ SharedMemory::SharedMemory(memory::Memory& memory) : memory_(memory) {
+@@ -47,7 +59,13 @@ void SharedMemory::InitializeCommon() {
+   system_page_flags_valid_and_gpu_written_.assign(num_system_page_flags_, 0);
+   page_write_seq_.assign(size_t(kBufferSize >> page_size_log2_), 0);
+   hash_validation_ = REXCVAR_GET(gpu_page_hash_validation);
++  hash_backoff_ = REXCVAR_GET(gpu_page_hash_backoff);
+   if (hash_validation_) {
++#if REX_PLATFORM_SWITCH
++    // No page is write-watched now, so guest read-only pages can stay mapped
++    // instead of turning every read of them into an emulated fault.
++    RexGmSetReadOnlyMapped(true);
++#endif
+     const size_t pages = size_t(kBufferSize >> page_size_log2_);
+     page_hash_.assign(pages, 0);
+     page_checked_epoch_.assign(pages, 0);
+@@ -440,13 +458,24 @@ void SharedMemory::HashValidateRange(uint32_t start, uint32_t length) {
+   // Hashed without the global lock: reading guest memory needs none, and the
+   // guest threads contend for it. A write racing the read is caught next check.
+   for (uint32_t page = page_first; page <= page_last; ++page) {
+-    if (!((system_page_flags_valid_[page >> 6] >> (page & 63)) & 1)) {
+-      continue;  // invalid pages are uploaded, and hashed, anyway
+-    }
+-    const uint32_t interval = uint32_t(1) << std::min<uint32_t>(page_stable_[page], 5);
++    // Invalid pages are hashed too. clear_memory_page_state (on by default)
++    // drops the valid bit of every CPU-uploaded page at the end of each frame
++    // without firing watches; skipping those pages meant nothing was hashed
++    // after the first frame, and a texture whose memory the CPU rewrote (video
++    // frames, streamed images) never learned it was outdated. page_hash_ still
++    // holds the contents last uploaded, which is what the texture was built
++    // from.
++    const uint32_t interval =
++        hash_backoff_ ? uint32_t(1) << std::min<uint32_t>(page_stable_[page], 5) : 1;
+     if (frame_epoch_ - page_checked_epoch_[page] < interval) {
++#if REX_PLATFORM_SWITCH
++      RexSwitchPerfCount(58);
++#endif
+       continue;
+     }
++#if REX_PLATFORM_SWITCH
++    RexSwitchPerfCount(57);
++#endif
+     page_checked_epoch_[page] = frame_epoch_;
+     const uint64_t hash =
+         XXH3_64bits(memory().TranslatePhysical(page << page_size_log2_), page_bytes);
+@@ -459,6 +488,9 @@ void SharedMemory::HashValidateRange(uint32_t start, uint32_t length) {
+     page_hash_[page] = hash;
+     page_stable_[page] = 0;
+     hash_changed_pages_.push_back(page);
++#if REX_PLATFORM_SWITCH
++    RexSwitchPerfCount(59);
++#endif
+   }
+   if (hash_changed_pages_.empty()) {
+     return;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index b829b6d..192bf92 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -96,6 +96,7 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+ // Counters and A/B skips of the Switch profiler (switch_perf.cpp).
+ extern "C" void RexSwitchPerfCount(unsigned id);
+ extern "C" void RexSwitchPerfAdd(unsigned id, uint64_t value);
++extern "C" void RexSwitchPerfMax(unsigned id, uint64_t value);
+ extern "C" bool RexSwitchPerfSkip(unsigned bit);
+ #endif
+ 
+@@ -4235,6 +4236,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ 
+   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
+   // Set up the render targets - this may perform dispatches and draws.
++  // A shader that samples textures draws an image, not a clear, even as one
++  // rectangle: the rectangle may be smaller than the scissor.
++  render_target_cache_->SetDrawPixelShaderMayKill(
++      pixel_shader &&
++      (pixel_shader->kills_pixels() || !pixel_shader->texture_bindings().empty() ||
++       pixel_shader->uses_texture_fetch_instruction_results()));
+   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                     normalized_color_mask, *vertex_shader)) {
+     return draw_fail("render_target_update");
+@@ -5846,16 +5853,43 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+         if (!slot_frame || slot_frame > frame_completed_) {
+           continue;
+         }
++        // Only the queries this frame wrote: the rest of the slot was not
++        // reset, and one unavailable query fails the whole read.
++        const uint32_t op_count = gpu_op_slot_count_[slot];
++        const uint32_t query_count = 2 + 2 * op_count;
+         uint64_t stamps[kTimestampQueriesPerFrame] = {};
+         if (ts_dfn.vkGetQueryPoolResults(
+                 ts_device->device(), timestamp_query_pool_,
+-                slot * kTimestampQueriesPerFrame, kTimestampQueriesPerFrame, sizeof(stamps),
++                slot * kTimestampQueriesPerFrame, query_count, sizeof(uint64_t) * query_count,
+                 stamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
+           if (stamps[1] > stamps[0]) {
+             const double ns = double(stamps[1] - stamps[0]) * timestamp_period_ns_;
+             rex::perf::SetCounter(rex::perf::CounterId::kGpuFrameUs, int64_t(ns / 1000.0));
++#if REX_PLATFORM_SWITCH
++            if (op_count) {
++              uint64_t op_ns[size_t(GpuOp::kCount)] = {};
++              for (uint32_t i = 0; i < op_count; ++i) {
++                const uint64_t begin = stamps[2 + 2 * i], end = stamps[3 + 2 * i];
++                if (end > begin) {
++                  const uint64_t one_ns = uint64_t(double(end - begin) * timestamp_period_ns_);
++                  op_ns[size_t(gpu_op_kind_[slot][i])] += one_ns;
++                  // The shortest single operation of each kind: if even that
++                  // takes milliseconds, the cost is per operation, not per
++                  // sample.
++                  RexSwitchPerfMax(50 + unsigned(gpu_op_kind_[slot][i]),
++                                   UINT64_C(1000000000000) - one_ns);
++                }
++              }
++              RexSwitchPerfCount(38);
++              RexSwitchPerfAdd(39, uint64_t(ns));
++              for (size_t k = 0; k < size_t(GpuOp::kCount); ++k) {
++                RexSwitchPerfAdd(40 + unsigned(k), op_ns[k]);
++              }
++            }
++#endif
+           }
+           timestamp_slot_frame_[slot] = 0;
++          gpu_op_slot_count_[slot] = 0;
+         }
+       }
+     }
+@@ -5866,8 +5900,13 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+       // Reset both of the slot's queries inside the command buffer, so the
+       // reset is ordered against the GPU's own execution rather than against
+       // the host, and cannot race a still-in-flight frame reading them.
+-      deferred_command_buffer_.CmdVkResetQueryPool(timestamp_query_pool_, first,
+-                                                   kTimestampQueriesPerFrame);
++      // Resetting queries is not free, so the operation pairs are reset only
++      // on the frames that use them.
++      gpu_op_frame_sampled_ = (frame_current_ % kGpuOpSampleEvery) == 0;
++      gpu_op_count_ = 0;
++      gpu_op_slot_count_[slot] = 0;
++      deferred_command_buffer_.CmdVkResetQueryPool(
++          timestamp_query_pool_, first, gpu_op_frame_sampled_ ? kTimestampQueriesPerFrame : 2);
+       deferred_command_buffer_.CmdVkWriteTimestamp(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                                    timestamp_query_pool_, first);
+       timestamp_slot_frame_[slot] = frame_current_;
+@@ -6007,6 +6046,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+     deferred_command_buffer_.CmdVkWriteTimestamp(
+         VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_query_pool_,
+         slot * kTimestampQueriesPerFrame + 1);
++    gpu_op_slot_count_[slot] = gpu_op_count_;
++    gpu_op_frame_sampled_ = false;
+   }
+ 
+   if (is_closing_frame) {
+@@ -7674,4 +7715,27 @@ void VulkanCommandProcessor::StoreAdjacentTextureDescriptorSet(
+   entry.valid = true;
+ }
+ 
++void VulkanCommandProcessor::GpuOpBegin() {
++  if (!gpu_op_frame_sampled_ || gpu_op_count_ >= kGpuOpMaxPerFrame) {
++    return;
++  }
++  // Bottom of pipe: when everything before the operation has finished, so the
++  // pair measures the operation itself rather than the queue ahead of it.
++  const uint32_t slot = uint32_t(frame_current_ % kMaxFramesInFlight);
++  deferred_command_buffer_.CmdVkWriteTimestamp(
++      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_query_pool_,
++      slot * kTimestampQueriesPerFrame + 2 + 2 * gpu_op_count_);
++}
++
++void VulkanCommandProcessor::GpuOpEnd(GpuOp op) {
++  if (!gpu_op_frame_sampled_ || gpu_op_count_ >= kGpuOpMaxPerFrame) {
++    return;
++  }
++  const uint32_t slot = uint32_t(frame_current_ % kMaxFramesInFlight);
++  deferred_command_buffer_.CmdVkWriteTimestamp(
++      VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_query_pool_,
++      slot * kTimestampQueriesPerFrame + 3 + 2 * gpu_op_count_);
++  gpu_op_kind_[slot][gpu_op_count_++] = op;
++}
++
+ }  // namespace rex::graphics::vulkan
+diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
+index ad60ade..105e1b6 100644
+--- a/src/graphics/vulkan/deferred_command_buffer.cpp
++++ b/src/graphics/vulkan/deferred_command_buffer.cpp
+@@ -156,6 +156,15 @@ void DeferredCommandBuffer::Execute(VkCommandBuffer command_buffer) {
+                 rex::align(sizeof(ArgsVkCopyBufferToImage), alignof(VkBufferImageCopy))));
+       } break;
+ 
++      case Command::kVkCopyImage: {
++        auto& args = *reinterpret_cast<const ArgsVkCopyImage*>(stream);
++        dfn.vkCmdCopyImage(command_buffer, args.src_image, args.src_image_layout, args.dst_image,
++                           args.dst_image_layout, args.region_count,
++                           reinterpret_cast<const VkImageCopy*>(
++                               reinterpret_cast<const uint8_t*>(stream) +
++                               rex::align(sizeof(ArgsVkCopyImage), alignof(VkImageCopy))));
++      } break;
++
+       case Command::kVkCopyQueryPoolResults: {
+         auto& args = *reinterpret_cast<const ArgsVkCopyQueryPoolResults*>(stream);
+         dfn.vkCmdCopyQueryPoolResults(command_buffer, args.query_pool, args.first_query,
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 01c7042..190203b 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -34,6 +34,7 @@
+ #include <rex/graphics/vulkan/render_target_cache.h>
+ #include <rex/graphics/xenos.h>
+ #include <rex/logging.h>
++#include <unordered_set>
+ #include <rex/math.h>
+ #include <rex/ui/vulkan/util.h>
+ 
+@@ -41,6 +42,26 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+                       "Vulkan render target implementation path")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DEFINE_BOOL(gpu_skip_color_depth_transfers, false, "GPU/Vulkan",
++                    "Do not reinterpret color render target contents as depth for draws that "
++                    "neither test depth nor use stencil; only for games known not to rely on it")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++REXCVAR_DEFINE_BOOL(gpu_skip_transfers_under_clears, false, "GPU/Vulkan",
++                    "Do not transfer previous EDRAM contents into the area a clear-like draw "
++                    "(one rectangle writing every sample unconditionally) is about to replace")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++REXCVAR_DEFINE_BOOL(gpu_depth_transfer_copy, false, "GPU/Vulkan",
++                    "Move depth and stencil between render targets of the same format and "
++                    "sample count with image copies instead of transfer draws")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
++REXCVAR_DEFINE_BOOL(gpu_stencil_transfer_used_bits, false, "GPU/Vulkan",
++                    "Without shader stencil export, transfer only the stencil bits that draws "
++                    "or clears have written, instead of all eight")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ // DEFINE_string(
+ //     render_target_path_vulkan, "",
+ //     "Render target emulation path to use on Vulkan.\n"
+@@ -1299,7 +1320,11 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+ #if REX_PLATFORM_SWITCH
+           if (!RexSwitchPerfSkip(4))
+ #endif
+-          command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
++          {
++            command_processor_.GpuOpBegin();
++            command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
++            command_processor_.GpuOpEnd(VulkanCommandProcessor::GpuOp::kResolveCopy);
++          }
+ 
+           // Invalidate textures and mark the range as scaled if needed.
+           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+@@ -1330,6 +1355,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+                                                  clear_render_targets[1], clear_transfers_[1])) {
+           uint64_t clear_values[2];
+           clear_values[0] = resolve_info.rb_depth_clear;
++          if (clear_render_targets[0]) {
++            stencil_bits_written_ |= resolve_info.rb_depth_clear & 0xFF;
++          }
+           clear_values[1] =
+               resolve_info.rb_color_clear | (uint64_t(resolve_info.rb_color_clear_lo) << 32);
+           PerformTransfersAndResolveClears(2, clear_render_targets, clear_transfers_, clear_values,
+@@ -1402,6 +1430,34 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+                                      reg::RB_DEPTHCONTROL normalized_depth_control,
+                                      uint32_t normalized_color_mask, const Shader& vertex_shader) {
++  // Before the base Update, which performs the transfers this draw needs, so
++  // they already carry the bits this draw may test.
++  if (normalized_depth_control.stencil_enable) {
++    // Keep and zero set no bits and replace sets only the reference's, so only
++    // the arithmetic operations can reach every bit of the write mask.
++    auto face_bits = [](xenos::StencilOp fail, xenos::StencilOp zpass, xenos::StencilOp zfail,
++                        reg::RB_STENCILREFMASK ref_mask) -> uint32_t {
++      uint32_t bits = 0;
++      for (xenos::StencilOp op : {fail, zpass, zfail}) {
++        if (op == xenos::StencilOp::kReplace) {
++          bits |= ref_mask.stencilref;
++        } else if (op != xenos::StencilOp::kKeep && op != xenos::StencilOp::kZero) {
++          bits |= 0xFF;
++        }
++      }
++      return bits & ref_mask.stencilwritemask;
++    };
++    stencil_bits_written_ |=
++        face_bits(normalized_depth_control.stencilfail, normalized_depth_control.stencilzpass,
++                  normalized_depth_control.stencilzfail,
++                  register_file().Get<reg::RB_STENCILREFMASK>());
++    if (normalized_depth_control.backface_enable) {
++      stencil_bits_written_ |= face_bits(
++          normalized_depth_control.stencilfail_bf, normalized_depth_control.stencilzpass_bf,
++          normalized_depth_control.stencilzfail_bf,
++          register_file().Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF));
++    }
++  }
+   if (!RenderTargetCache::Update(is_rasterization_done, normalized_depth_control,
+                                  normalized_color_mask, vertex_shader)) {
+     return false;
+@@ -1419,8 +1475,20 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+       RenderTarget* const* depth_and_color_render_targets =
+           last_update_accumulated_render_targets();
+ 
++      // Depth tested against nothing and no stencil: the draw only writes.
++      draw_writes_depth_blindly_ =
++          !normalized_depth_control.stencil_enable &&
++          (!normalized_depth_control.z_enable ||
++           normalized_depth_control.zfunc == xenos::CompareFunction::kAlways);
++      draw_overwritten_render_targets_ =
++          REXCVAR_GET(gpu_skip_transfers_under_clears)
++              ? GetDrawOverwrittenRenderTargets(normalized_depth_control, normalized_color_mask,
++                                                draw_overwritten_rect_)
++              : 0;
+       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+                                        depth_and_color_render_targets, last_update_transfers());
++      draw_overwritten_render_targets_ = 0;
++      draw_writes_depth_blindly_ = false;
+ 
+       if (depth_and_color_render_targets[0]) {
+         render_pass_key.depth_and_color_used |= 1 << 0;
+@@ -4809,13 +4877,117 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+       continue;
+     }
+ 
+-    const std::vector<Transfer>& current_transfers = render_target_transfers[i];
++    auto& dest_vulkan_rt = *static_cast<VulkanRenderTarget*>(dest_rt);
++    RenderTargetKey dest_rt_key = dest_vulkan_rt.key();
++
++    // A resolve clear cuts its rectangle out of every transfer; a clear-like
++    // draw only out of the render targets it overwrites.
++    const Transfer::Rectangle* transfer_cutout = resolve_clear_rectangle;
++    if (!transfer_cutout && ((draw_overwritten_render_targets_ >> i) & 1)) {
++      transfer_cutout = &draw_overwritten_rect_;
++    }
++    const std::vector<Transfer>* current_transfers_source = &render_target_transfers[i];
++    if (dest_rt_key.is_depth && !current_transfers_source->empty() && !transfer_cutout &&
++        REXCVAR_GET(gpu_depth_transfer_copy)) {
++      CopyDepthTransfers(dest_vulkan_rt, *current_transfers_source, copy_remaining_transfers_);
++      current_transfers_source = &copy_remaining_transfers_;
++    }
++    if (dest_rt_key.is_depth && draw_writes_depth_blindly_ &&
++        REXCVAR_GET(gpu_skip_color_depth_transfers) && !current_transfers_source->empty()) {
++      // Color samples reinterpreted as depth mean nothing to a draw that
++      // neither tests depth nor uses stencil, and Project 8 clears before any
++      // draw that does. Here it was the menu UI pass converting the
++      // post-processing buffers into its depth buffer every frame, one depth
++      // and eight stencil passes per range. Depth reinterpreted as color is
++      // left alone: skipping that made images and videos show stale frames.
++      bool any_from_color = false;
++      for (const Transfer& transfer : *current_transfers_source) {
++        if (!transfer.source->key().is_depth) {
++          any_from_color = true;
++          break;
++        }
++      }
++      if (any_from_color) {
++        same_kind_transfers_.clear();
++        for (const Transfer& transfer : *current_transfers_source) {
++          if (transfer.source->key().is_depth) {
++            same_kind_transfers_.push_back(transfer);
++          }
++#if REX_PLATFORM_SWITCH
++          else {
++            RexSwitchPerfCount(56);
++          }
++#endif
++        }
++        current_transfers_source = &same_kind_transfers_;
++      }
++    }
++    if (transfer_cutout && !resolve_clear_rectangle && !current_transfers_source->empty()) {
++      // Transfers entirely under the clear-like draw are not needed at all,
++      // and the drawing below expects at least one rectangle per transfer.
++      cutout_remaining_transfers_.clear();
++      for (const Transfer& transfer : *current_transfers_source) {
++        if (transfer.GetRectangles(dest_rt_key.base_tiles, dest_rt_key.GetPitchTiles(),
++                                   dest_rt_key.msaa_samples, dest_rt_key.Is64bpp(), nullptr,
++                                   transfer_cutout)) {
++          cutout_remaining_transfers_.push_back(transfer);
++        }
++#if REX_PLATFORM_SWITCH
++        else {
++          RexSwitchPerfCount(46);
++        }
++#endif
++      }
++      current_transfers_source = &cutout_remaining_transfers_;
++    }
++    const std::vector<Transfer>& current_transfers = *current_transfers_source;
+     if (current_transfers.empty() && !resolve_clear_needed) {
+       continue;
+     }
+-
+-    auto& dest_vulkan_rt = *static_cast<VulkanRenderTarget*>(dest_rt);
+-    RenderTargetKey dest_rt_key = dest_vulkan_rt.key();
++    // For the first depth transfers still drawn, what the clear test saw.
++    if (dest_rt_key.is_depth && !current_transfers.empty()) {
++      static uint32_t depth_transfer_reports = 0;
++      if (depth_transfer_reports < 24) {
++        ++depth_transfer_reports;
++        const RegisterFile& regs = register_file();
++        draw_util::Scissor scissor;
++        draw_util::GetScissor(regs, scissor, true);
++        REXGPU_INFO(
++            "Depth transfer drawn: resolve clear {}, overwritten mask {:x}, prim {} indices {}, "
++            "ps may kill {}, colorcontrol {:08X}, aa mask {:08X}, depthcontrol {:08X}, "
++            "stencilrefmask {:08X}, surface {:08X}, scissor {},{} {}x{}, transfers {}",
++            resolve_clear_rectangle != nullptr, draw_overwritten_render_targets_,
++            uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().prim_type),
++            uint32_t(regs.Get<reg::VGT_DRAW_INITIATOR>().num_indices),
++            draw_pixel_shader_may_kill_, regs[XE_GPU_REG_RB_COLORCONTROL],
++            regs[XE_GPU_REG_PA_SC_AA_MASK], regs[XE_GPU_REG_RB_DEPTHCONTROL],
++            regs[XE_GPU_REG_RB_STENCILREFMASK], regs[XE_GPU_REG_RB_SURFACE_INFO],
++            scissor.offset[0], scissor.offset[1], scissor.extent[0], scissor.extent[1],
++            current_transfers.size());
++      }
++    }
++    // One line per distinct source and destination pair still drawn, to see
++    // which reinterpretations a game relies on.
++    for (const Transfer& transfer : current_transfers) {
++      static std::unordered_set<uint64_t> logged_pairs;
++      const RenderTargetKey source_key = transfer.source->key();
++      const uint64_t pair = (uint64_t(source_key.key) << 32) | dest_rt_key.key;
++      if (logged_pairs.size() < 64 && logged_pairs.insert(pair).second) {
++        REXGPU_INFO(
++            "Transfer drawn: {} format {} {}x base {} pitch {} -> {} format {} {}x base {} pitch "
++            "{}, tiles {}-{}, host depth source {}",
++            source_key.is_depth ? "depth" : "color", uint32_t(source_key.resource_format),
++            1u << uint32_t(source_key.msaa_samples), uint32_t(source_key.base_tiles),
++            source_key.GetPitchTiles(), dest_rt_key.is_depth ? "depth" : "color",
++            uint32_t(dest_rt_key.resource_format), 1u << uint32_t(dest_rt_key.msaa_samples),
++            uint32_t(dest_rt_key.base_tiles), dest_rt_key.GetPitchTiles(), transfer.start_tiles,
++            transfer.end_tiles,
++            !transfer.host_depth_source                    ? "none"
++            : transfer.host_depth_source == transfer.source ? "source"
++            : transfer.host_depth_source == dest_rt        ? "destination"
++                                                            : "other");
++      }
++    }
+ 
+     // Late barriers in case there was cross-copying that prevented merging of
+     // barriers.
+@@ -4928,9 +5100,13 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+             new_transfer_shader_key.mode = source_rt_key.is_depth
+                                                ? TransferMode::kDepthToStencilBit
+                                                : TransferMode::kColorToStencilBit;
++            if (!source_rt_key.is_depth) {
++              // Color bits reinterpreted as stencil can be anything.
++              stencil_bits_written_ = 0xFF;
++            }
+             stencil_clear_rectangle_count += transfer.GetRectangles(
+                 dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
+-                nullptr, resolve_clear_rectangle);
++                nullptr, transfer_cutout);
+           } else {
+             if (dest_rt_key.is_depth) {
+               if (host_depth_source_vulkan_rt) {
+@@ -5016,7 +5192,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+           Transfer::Rectangle transfer_stencil_clear_rectangles[Transfer::kMaxRectanglesWithCutout];
+           uint32_t transfer_stencil_clear_rectangle_count = transfer.GetRectangles(
+               dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
+-              transfer_stencil_clear_rectangles, resolve_clear_rectangle);
++              transfer_stencil_clear_rectangles, transfer_cutout);
+           for (uint32_t j = 0; j < transfer_stencil_clear_rectangle_count; ++j) {
+             const Transfer::Rectangle& stencil_clear_rectangle =
+                 transfer_stencil_clear_rectangles[j];
+@@ -5064,7 +5240,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+         auto it_merged_first = it, it_merged_last = it;
+         uint32_t transfer_rectangle_count = transfer_invocation_first.transfer.GetRectangles(
+             dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
+-            nullptr, resolve_clear_rectangle);
++            nullptr, transfer_cutout);
+         for (auto it_merge = std::next(it_merged_first);
+              it_merge != current_transfer_invocations_.cend(); ++it_merge) {
+           if (!transfer_invocation_first.CanBeMergedIntoOneDraw(*it_merge)) {
+@@ -5072,7 +5248,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+           }
+           transfer_rectangle_count += it_merge->transfer.GetRectangles(
+               dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
+-              nullptr, resolve_clear_rectangle);
++              nullptr, transfer_cutout);
+           it_merged_last = it_merge;
+         }
+         assert_not_zero(transfer_rectangle_count);
+@@ -5111,7 +5287,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+           Transfer::Rectangle transfer_invocation_rectangles[Transfer::kMaxRectanglesWithCutout];
+           uint32_t transfer_invocation_rectangle_count = it_merged->transfer.GetRectangles(
+               dest_rt_key.base_tiles, dest_pitch_tiles, dest_rt_key.msaa_samples, dest_is_64bpp,
+-              transfer_invocation_rectangles, resolve_clear_rectangle);
++              transfer_invocation_rectangles, transfer_cutout);
+           assert_not_zero(transfer_invocation_rectangle_count);
+           for (uint32_t j = 0; j < transfer_invocation_rectangle_count; ++j) {
+             const Transfer::Rectangle& transfer_rectangle = transfer_invocation_rectangles[j];
+@@ -5307,10 +5483,28 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+ #if REX_PLATFORM_SWITCH
+             RexSwitchPerfCount(13);
+ #endif
++            // Stencil was cleared to 0 above, and a bit nothing has written
++            // is 0 in the source too.
++            if (transfer_is_stencil_bit && !(stencil_bits_written_ & (uint32_t(1) << k)) &&
++                REXCVAR_GET(gpu_stencil_transfer_used_bits)) {
+ #if REX_PLATFORM_SWITCH
++              RexSwitchPerfCount(36);
++#endif
++              continue;
++            }
++#if REX_PLATFORM_SWITCH
++            if (transfer_is_stencil_bit) {
++              RexSwitchPerfCount(35);
++            }
+             if (!RexSwitchPerfSkip(2))
+ #endif
+-            command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
++            {
++              command_processor_.GpuOpBegin();
++              command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
++              command_processor_.GpuOpEnd(transfer_is_stencil_bit
++                                              ? VulkanCommandProcessor::GpuOp::kStencilBitDraw
++                                              : VulkanCommandProcessor::GpuOp::kTransferDraw);
++            }
+           }
+         }
+       }
+@@ -5564,7 +5758,13 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
+   // is not eliminated when compiling the shader for AMD via RenderDoc on
+   // Windows, as of June 2022.
+   spv::Id global_invocation_id = builder.createLoad(input_global_invocation_id, spv::NoPrecision);
+-  spv::Id rectangle_sample_x = builder.createCompositeExtract(global_invocation_id, type_uint, 0);
++  // The first of the kDumpSamplesPerInvocation samples this invocation dumps.
++  // Dumping one sample per invocation left the Switch's GPU at about 4.5 ns
++  // per sample, bound by the addressing math and fetch latency of each lone
++  // sample; the samples of a run share all of the addressing.
++  spv::Id rectangle_sample_x = builder.createBinOp(
++      spv::OpIMul, type_uint, builder.createCompositeExtract(global_invocation_id, type_uint, 0),
++      builder.makeUintConstant(kDumpSamplesPerInvocation));
+   uint32_t tile_width =
+       (xenos::kEdramTileWidthSamples >> uint32_t(format_is_64bpp)) * draw_resolution_scale_x();
+   spv::Id const_tile_width = builder.makeUintConstant(tile_width);
+@@ -5663,6 +5863,18 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
+       spv::OpIAdd, type_uint,
+       builder.createBinOp(spv::OpIMul, type_uint, const_tile_height, source_tile_index_y),
+       tile_sample_y);
++  const spv::Id run_source_sample_x = source_sample_x;
++  const spv::Id run_edram_sample_address = edram_sample_address;
++  auto emit_sample = [&](uint32_t sample_in_run) {
++  spv::Id source_sample_x = run_source_sample_x;
++  spv::Id edram_sample_address = run_edram_sample_address;
++  if (sample_in_run) {
++    spv::Id const_sample_in_run = builder.makeUintConstant(sample_in_run);
++    source_sample_x =
++        builder.createBinOp(spv::OpIAdd, type_uint, source_sample_x, const_sample_in_run);
++    edram_sample_address =
++        builder.createBinOp(spv::OpIAdd, type_uint, edram_sample_address, const_sample_in_run);
++  }
+   // Get the source pixel coordinate and the sample index within the pixel.
+   spv::Id source_pixel_x = source_sample_x, source_pixel_y = source_sample_y;
+   spv::Id source_sample_id = spv::NoResult;
+@@ -5962,10 +6174,15 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
+   // Uniform.
+   builder.createStore(store_value, builder.createAccessChain(spv::StorageClassUniform, edram_buffer,
+                                                              id_vector_temp));
++  };
++  for (uint32_t sample_in_run = 0; sample_in_run < kDumpSamplesPerInvocation; ++sample_in_run) {
++    emit_sample(sample_in_run);
++  }
+ 
+   // End the main function and make it the entry point.
+   builder.leaveFunction();
+-  builder.addExecutionMode(main_function, spv::ExecutionModeLocalSize, kDumpSamplesPerGroupX,
++  builder.addExecutionMode(main_function, spv::ExecutionModeLocalSize,
++                           kDumpSamplesPerGroupX / kDumpSamplesPerInvocation,
+                            kDumpSamplesPerGroupY, 1);
+   spv::Instruction* entry_point =
+       builder.addEntryPoint(spv::ExecutionModelGLCompute, main_function, "main");
+@@ -6012,6 +6229,239 @@ VkPipeline VulkanRenderTargetCache::GetDirectResolvePipeline(DirectResolvePipeli
+   return pipeline;
+ }
+ 
++uint32_t VulkanRenderTargetCache::GetDrawOverwrittenRenderTargets(
++    reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
++    Transfer::Rectangle& rect_out) const {
++  // Direct3D on the Xbox 360 clears by drawing one screen-space rectangle
++  // over the scissor with depth and stencil forced. Binding the render targets
++  // for that draw is what makes the EDRAM change owner, so without this every
++  // pass began by converting the previous owner's samples (in this game, 8-bit
++  // color into float depth, then back) only for the clear to overwrite them.
++  // The rectangle is taken to cover the scissor, which is how Direct3D sets up
++  // its clears, and a clear's pixel shader samples no textures. Opaque images
++  // and video frames are also single rectangles, often smaller than the
++  // scissor; treating those as clears left stale content around them. Every
++  // other condition guarantees that each sample inside is written.
++  const RegisterFile& regs = register_file();
++  const auto draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
++  if (draw_initiator.prim_type != xenos::PrimitiveType::kRectangleList ||
++      draw_initiator.num_indices != 3 || draw_pixel_shader_may_kill_) {
++    return 0;
++  }
++  // Alpha test and alpha to coverage act on the pixel shader's color output,
++  // which a depth-only draw does not have (the shadow map clears here leave
++  // the alpha test enabled from earlier draws).
++  const auto color_control = regs.Get<reg::RB_COLORCONTROL>();
++  if (regs.Get<reg::RB_MODECONTROL>().edram_mode == xenos::EdramMode::kColorDepth &&
++      ((color_control.alpha_test_enable &&
++        color_control.alpha_func != xenos::CompareFunction::kAlways) ||
++       color_control.alpha_to_mask_enable)) {
++    return 0;
++  }
++  const auto msaa_samples = regs.Get<reg::RB_SURFACE_INFO>().msaa_samples;
++  const uint32_t sample_bits = (uint32_t(1) << (uint32_t(1) << uint32_t(msaa_samples))) - 1;
++  if ((regs[XE_GPU_REG_PA_SC_AA_MASK] & sample_bits) != sample_bits) {
++    return 0;
++  }
++  draw_util::Scissor scissor;
++  draw_util::GetScissor(regs, scissor, true);
++  if (!scissor.extent[0] || !scissor.extent[1]) {
++    return 0;
++  }
++  rect_out.x_pixels = scissor.offset[0];
++  rect_out.y_pixels = scissor.offset[1];
++  rect_out.width_pixels = scissor.extent[0];
++  rect_out.height_pixels = scissor.extent[1];
++  // The EDRAM pitch is the surface width rounded up to whole 80-sample tiles.
++  // A clear reaching into the last tile column has only that padding to its
++  // right, which nothing draws or resolves; transferring it would still cost a
++  // full set of transfer passes (1024 wide shadow maps on a 1040 pitch here).
++  {
++    const uint32_t tile_width_pixels =
++        xenos::kEdramTileWidthSamples >> uint32_t(msaa_samples >= xenos::MsaaSamples::k4X);
++    const uint32_t tile_height_pixels =
++        xenos::kEdramTileHeightSamples >> uint32_t(msaa_samples >= xenos::MsaaSamples::k2X);
++    const uint32_t pitch_pixels = rex::round_up(
++        uint32_t(regs.Get<reg::RB_SURFACE_INFO>().surface_pitch), tile_width_pixels);
++    const uint32_t right = rect_out.x_pixels + rect_out.width_pixels;
++    if (right < pitch_pixels && pitch_pixels - right < tile_width_pixels) {
++      rect_out.width_pixels = pitch_pixels - rect_out.x_pixels;
++    }
++    rect_out.height_pixels =
++        rex::round_up(rect_out.y_pixels + rect_out.height_pixels, tile_height_pixels) -
++        rect_out.y_pixels;
++  }
++
++  uint32_t overwritten = 0;
++  const reg::RB_DEPTHCONTROL& depth = normalized_depth_control;
++  // With both tests always passing, only the depth-pass stencil operation runs.
++  auto stencil_replaced = [](xenos::CompareFunction func, xenos::StencilOp zpass,
++                             reg::RB_STENCILREFMASK ref_mask) {
++    return func == xenos::CompareFunction::kAlways && zpass == xenos::StencilOp::kReplace &&
++           ref_mask.stencilwritemask == 0xFF;
++  };
++  if (depth.z_enable && depth.z_write_enable && depth.zfunc == xenos::CompareFunction::kAlways &&
++      depth.stencil_enable &&
++      stencil_replaced(depth.stencilfunc, depth.stencilzpass,
++                       regs.Get<reg::RB_STENCILREFMASK>()) &&
++      (!depth.backface_enable ||
++       stencil_replaced(depth.stencilfunc_bf, depth.stencilzpass_bf,
++                        regs.Get<reg::RB_STENCILREFMASK>(XE_GPU_REG_RB_STENCILREFMASK_BF)))) {
++    overwritten |= 1;
++  }
++  // A depth or stencil test could reject color samples.
++  const bool color_unconditional =
++      (!depth.z_enable || depth.zfunc == xenos::CompareFunction::kAlways) &&
++      (!depth.stencil_enable ||
++       (depth.stencilfunc == xenos::CompareFunction::kAlways &&
++        (!depth.backface_enable || depth.stencilfunc_bf == xenos::CompareFunction::kAlways)));
++  for (uint32_t i = 0; color_unconditional && i < xenos::kMaxColorRenderTargets; ++i) {
++    if (((normalized_color_mask >> (4 * i)) & 0xF) != 0xF) {
++      continue;
++    }
++    const auto blend = regs.Get<reg::RB_BLENDCONTROL>(reg::RB_BLENDCONTROL::rt_register_indices[i]);
++    if (blend.color_srcblend != xenos::BlendFactor::kOne ||
++        blend.color_destblend != xenos::BlendFactor::kZero ||
++        blend.color_comb_fcn != xenos::BlendOp::kAdd ||
++        blend.alpha_srcblend != xenos::BlendFactor::kOne ||
++        blend.alpha_destblend != xenos::BlendFactor::kZero ||
++        blend.alpha_comb_fcn != xenos::BlendOp::kAdd) {
++      continue;
++    }
++    overwritten |= uint32_t(1) << (1 + i);
++  }
++  return overwritten;
++}
++
++void VulkanRenderTargetCache::CopyDepthTransfers(VulkanRenderTarget& dest_rt,
++                                                 const std::vector<Transfer>& transfers,
++                                                 std::vector<Transfer>& remaining_out) {
++  // Without VK_EXT_shader_stencil_export a depth transfer is one draw for depth
++  // and eight more for stencil, one per bit, each running the whole EDRAM
++  // addressing shader over the range. On the Switch those stencil draws were
++  // the largest single share of GPU time in a menu frame. When both render
++  // targets store the samples in the same format and count, the transfer only
++  // moves tile runs to other coordinates, which a copy does exactly and in one
++  // pass for both aspects.
++  remaining_out.clear();
++  const RenderTargetKey dest_key = dest_rt.key();
++  const uint32_t scale_x = draw_resolution_scale_x(), scale_y = draw_resolution_scale_y();
++  const uint32_t tile_width = xenos::kEdramTileWidthSamples >>
++                              uint32_t(dest_key.msaa_samples >= xenos::MsaaSamples::k4X);
++  const uint32_t tile_height = xenos::kEdramTileHeightSamples >>
++                               uint32_t(dest_key.msaa_samples >= xenos::MsaaSamples::k2X);
++  const uint32_t dest_pitch = dest_key.GetPitchTiles();
++  const uint32_t dest_width = dest_key.GetWidth() * scale_x;
++  const uint32_t dest_height =
++      GetRenderTargetHeight(dest_key.pitch_tiles_at_32bpp, dest_key.msaa_samples) * scale_y;
++  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
++
++  for (const Transfer& transfer : transfers) {
++    auto* source_rt = static_cast<VulkanRenderTarget*>(transfer.source);
++    const RenderTargetKey source_key = source_rt->key();
++    // A separate host depth source carries more precision than the source's
++    // own samples, so those transfers stay on the shader path.
++    if (!source_key.is_depth || source_key.resource_format != dest_key.resource_format ||
++        source_key.msaa_samples != dest_key.msaa_samples ||
++        (transfer.host_depth_source && transfer.host_depth_source != transfer.source)) {
++      remaining_out.push_back(transfer);
++      continue;
++    }
++    const uint32_t source_pitch = source_key.GetPitchTiles();
++    const uint32_t source_width = source_key.GetWidth() * scale_x;
++    const uint32_t source_height =
++        GetRenderTargetHeight(source_key.pitch_tiles_at_32bpp, source_key.msaa_samples) *
++        scale_y;
++    // Tile index relative to a render target base, past the EDRAM wrap.
++    auto local = [](uint32_t tile, uint32_t base) {
++      return tile >= base ? tile - base : tile + xenos::kEdramTileCount - base;
++    };
++    copy_transfer_regions_.clear();
++    bool in_bounds = true;
++    for (uint32_t tile = transfer.start_tiles; tile < transfer.end_tiles && in_bounds;) {
++      const uint32_t dest_local = local(tile, dest_key.base_tiles);
++      const uint32_t source_local = local(tile, source_key.base_tiles);
++      const uint32_t dest_x = dest_local % dest_pitch, dest_y = dest_local / dest_pitch;
++      const uint32_t source_x = source_local % source_pitch,
++                     source_y = source_local / source_pitch;
++      uint32_t run = std::min({dest_pitch - dest_x, source_pitch - source_x,
++                               transfer.end_tiles - tile});
++      // The local index jumps back to 0 where the range crosses a base.
++      if (tile < dest_key.base_tiles) {
++        run = std::min(run, dest_key.base_tiles - tile);
++      }
++      if (tile < source_key.base_tiles) {
++        run = std::min(run, source_key.base_tiles - tile);
++      }
++      VkImageCopy region;
++      region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT;
++      region.srcSubresource.mipLevel = 0;
++      region.srcSubresource.baseArrayLayer = 0;
++      region.srcSubresource.layerCount = 1;
++      region.dstSubresource = region.srcSubresource;
++      region.srcOffset = {int32_t(source_x * tile_width * scale_x),
++                          int32_t(source_y * tile_height * scale_y), 0};
++      region.dstOffset = {int32_t(dest_x * tile_width * scale_x),
++                          int32_t(dest_y * tile_height * scale_y), 0};
++      region.extent = {run * tile_width * scale_x, tile_height * scale_y, 1};
++      if (uint32_t(region.srcOffset.x) + region.extent.width > source_width ||
++          uint32_t(region.srcOffset.y) + region.extent.height > source_height ||
++          uint32_t(region.dstOffset.x) + region.extent.width > dest_width ||
++          uint32_t(region.dstOffset.y) + region.extent.height > dest_height) {
++        in_bounds = false;
++        break;
++      }
++      // Whole rows at the same columns in both targets merge into one region.
++      if (!copy_transfer_regions_.empty()) {
++        VkImageCopy& previous = copy_transfer_regions_.back();
++        if (previous.srcOffset.x == region.srcOffset.x &&
++            previous.dstOffset.x == region.dstOffset.x &&
++            previous.extent.width == region.extent.width &&
++            previous.srcOffset.y + int32_t(previous.extent.height) == region.srcOffset.y &&
++            previous.dstOffset.y + int32_t(previous.extent.height) == region.dstOffset.y) {
++          previous.extent.height += region.extent.height;
++          tile += run;
++          continue;
++        }
++      }
++      copy_transfer_regions_.push_back(region);
++      tile += run;
++    }
++    if (!in_bounds || copy_transfer_regions_.empty()) {
++      remaining_out.push_back(transfer);
++      continue;
++    }
++
++    const VkImageSubresourceRange depth_stencil_range = ui::vulkan::util::InitializeSubresourceRange(
++        VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
++    command_processor_.PushImageMemoryBarrier(
++        source_rt->image(), depth_stencil_range, source_rt->current_stage_mask(),
++        VK_PIPELINE_STAGE_TRANSFER_BIT, source_rt->current_access_mask(),
++        VK_ACCESS_TRANSFER_READ_BIT, source_rt->current_layout(),
++        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    source_rt->SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
++                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
++    command_processor_.PushImageMemoryBarrier(
++        dest_rt.image(), depth_stencil_range, dest_rt.current_stage_mask(),
++        VK_PIPELINE_STAGE_TRANSFER_BIT, dest_rt.current_access_mask(),
++        VK_ACCESS_TRANSFER_WRITE_BIT, dest_rt.current_layout(),
++        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    dest_rt.SetUsage(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                     VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
++    command_processor_.SubmitBarriers(true);
++    command_processor_.GpuOpBegin();
++    VkImageCopy* regions = command_buffer.CmdCopyImageEmplace(
++        source_rt->image(), VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, dest_rt.image(),
++        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, uint32_t(copy_transfer_regions_.size()));
++    std::memcpy(regions, copy_transfer_regions_.data(),
++                sizeof(VkImageCopy) * copy_transfer_regions_.size());
++    command_processor_.GpuOpEnd(VulkanCommandProcessor::GpuOp::kTransferCopy);
++#if REX_PLATFORM_SWITCH
++    RexSwitchPerfCount(48);
++#endif
++  }
++}
++
+ bool VulkanRenderTargetCache::TryResolveCopyDirectly(const draw_util::ResolveInfo& resolve_info,
+                                                      draw_util::ResolveCopyShaderIndex copy_shader,
+                                                      bool draw_resolution_scaled) {
+@@ -6178,18 +6628,31 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
+       }
+       command_processor_.SubmitBarriers(true);
+ #if REX_PLATFORM_SWITCH
+-      if (!RexSwitchPerfSkip(4))
++      // EDRAM tiles dumped, to compare with the area the resolves copy.
++      RexSwitchPerfAdd(37, uint64_t(dispatch.width_tiles) * dispatch.height_tiles);
++      RexSwitchPerfCount(49);
++      if (rt_key.msaa_samples != xenos::MsaaSamples::k1X) {
++        RexSwitchPerfAdd(47, uint64_t(dispatch.width_tiles) * dispatch.height_tiles);
++      }
++      if (!RexSwitchPerfSkip(64))
+ #endif
+-      command_buffer.CmdVkDispatch(
+-          (draw_resolution_scale_x() *
+-               (xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp())) *
+-               dispatch.width_tiles +
+-           (kDumpSamplesPerGroupX - 1)) /
+-              kDumpSamplesPerGroupX,
+-          (draw_resolution_scale_y() * xenos::kEdramTileHeightSamples * dispatch.height_tiles +
+-           (kDumpSamplesPerGroupY - 1)) /
+-              kDumpSamplesPerGroupY,
+-          1);
++      {
++        command_processor_.GpuOpBegin();
++        command_buffer.CmdVkDispatch(
++            (draw_resolution_scale_x() *
++                 (xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp())) *
++                 dispatch.width_tiles +
++             (kDumpSamplesPerGroupX - 1)) /
++                kDumpSamplesPerGroupX,
++            (draw_resolution_scale_y() * xenos::kEdramTileHeightSamples * dispatch.height_tiles +
++             (kDumpSamplesPerGroupY - 1)) /
++                kDumpSamplesPerGroupY,
++            1);
++        command_processor_.GpuOpEnd(
++            rt_key.msaa_samples != xenos::MsaaSamples::k1X
++                ? VulkanCommandProcessor::GpuOp::kRenderTargetDumpMultisampled
++                : VulkanCommandProcessor::GpuOp::kRenderTargetDump);
++      }
+     }
+     MarkEdramBufferModified();
+   }
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 46ff369..e881af6 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -83,6 +83,14 @@ REXCVAR_DEFINE_BOOL(switch_allow_ram_1600, false, "Switch",
+                     "Accept a high-GPU profile that also raises the memory clock to 1600 MHz");
+ // Off by default: the transfer memory comes out of the capped newlib heap, and
+ // 32 MB was enough to make the startup filesystem index fail with bad_alloc.
++REXCVAR_DEFINE_INT32(switch_ab_lap_after_s, 0, "Switch",
++                     "Start the profiler's GPU A/B lap this many seconds after launch; 0 = only "
++                     "with L+R+ZL. The image is wrong while the lap runs, on purpose.");
++extern "C" void RexSwitchPerfScheduleAb(uint32_t seconds);
++REXCVAR_DEFINE_STRING(switch_mesa_env, "", "Switch",
++                      "Driver environment variables, NAME=value separated by ';', set before "
++                      "the Vulkan instance exists (the driver reads them with getenv). "
++                      "For A/B tests of the Mesa NVK options without rebuilding.");
+ REXCVAR_DEFINE_INT32(switch_nvmap_mb, 0, "Switch",
+                      "Transfer memory for the GPU driver's allocation tracking, in MB. libnx "
+                      "gives 8, about 4,000 GPU allocations; running out fails with 0x235C, "
+@@ -202,6 +210,24 @@ bool ReXApp::SetupEnvironment() {
+   if (REXCVAR_GET(switch_nvmap_mb) > 0) {
+     __nx_nv_transfermem_size = static_cast<u32>(REXCVAR_GET(switch_nvmap_mb)) << 20;
+   }
++  {
++    const std::string env = REXCVAR_GET(switch_mesa_env);
++    size_t start = 0;
++    while (start < env.size()) {
++      size_t end = env.find(';', start);
++      if (end == std::string::npos) end = env.size();
++      const std::string item = env.substr(start, end - start);
++      const size_t eq = item.find('=');
++      if (eq != std::string::npos && eq > 0) {
++        setenv(item.substr(0, eq).c_str(), item.substr(eq + 1).c_str(), 1);
++        std::fprintf(stderr, "[switch_mesa_env] %s\n", item.c_str());
++      }
++      start = end + 1;
++    }
++  }
++  if (REXCVAR_GET(switch_ab_lap_after_s) > 0) {
++    RexSwitchPerfScheduleAb(static_cast<uint32_t>(REXCVAR_GET(switch_ab_lap_after_s)));
++  }
+   RexSwitchApmPedirGpuMhz(REXCVAR_GET(switch_gpu_mhz));
+   RexSwitchApmPermitirRam1600(REXCVAR_GET(switch_allow_ram_1600) ? 1 : 0);
+ #endif
+diff --git a/src/ui/switch_perf.cpp b/src/ui/switch_perf.cpp
+index 1ffff27..2cae648 100644
+--- a/src/ui/switch_perf.cpp
++++ b/src/ui/switch_perf.cpp
+@@ -102,7 +102,22 @@ constexpr u64 kReportSeconds = 10;
+ constexpr u64 kStartDelayNs = 8000000000ULL;
+ constexpr size_t kMaxSamples = 1 << 15;
+ constexpr size_t kFrames = 10;
+-constexpr unsigned kCounterCount = 35;  // 33 = hot pages unwatched, 34 = unwatch refused
++constexpr unsigned kCounterCount = 60;  // 33 = hot pages unwatched, 34 = unwatch refused,
++                                        // 35 = stencil bit transfer draws, 36 = skipped,
++                                        // 37 = EDRAM tiles dumped for resolves,
++                                        // 38 = frames with GPU operation timing, 39 = their
++                                        // GPU frame ns, 40-45 = ns in transfer draws, stencil
++                                        // bit draws, 1x render target dumps, resolve copies,
++                                        // depth transfer image copies, multisampled dumps,
++                                        // 46 = transfers dropped under clear-like draws,
++                                        // 47 = EDRAM tiles dumped from multisampled targets,
++                                        // 48 = depth transfers done as image copies,
++                                        // 49 = render target dump dispatches,
++                                        // 50-55 = 1e12 minus the shortest ns of one
++                                        // operation of each GpuOp kind (max counters),
++                                        // 56 = color/depth reinterpreting transfers skipped,
++                                        // 57 = pages hashed, 58 = hash checks deferred by the
++                                        // backoff, 59 = pages found changed by their hash
+ // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
+ std::string ReportPath() {
+   return std::string(RexSwitchLogDir()) + "rex_perfil.log";
+@@ -197,11 +212,13 @@ constexpr Mode kModes[] = {
+     {0, "normal"},
+     {1, "sin dibujados"},
+     {2, "sin transferencias"},
+-    {4, "sin resolves"},
++    {4 | 64, "sin resolves"},
++    {64, "sin volcados de RT (resolves)"},
++    {4, "sin copias de resolve"},
+     {8, "sin cargas de texturas"},
+     {16, "sin efecto de presentacion"},
+     {32, "sin despacho por baldosas"},
+-    {63, "sin nada"},
++    {127, "sin nada"},
+ };
+ constexpr size_t kModeCount = sizeof(kModes) / sizeof(kModes[0]);
+ 
+@@ -223,6 +240,14 @@ constexpr size_t kModeCount = sizeof(kModes) / sizeof(kModes[0]);
+ std::atomic<bool> g_ab_activas{false};
+ std::atomic<u32> g_skip_mask{0};
+ 
++// Seconds after start at which to begin one A/B lap without the button combo;
++// 0 = never. Set from the title's configuration (switch_ab_lap_after_s).
++std::atomic<uint32_t> g_ab_auto_after_s{0};
++
++extern "C" void RexSwitchPerfScheduleAb(uint32_t seconds) {
++  g_ab_auto_after_s.store(seconds, std::memory_order_relaxed);
++}
++
+ extern "C" void RexSwitchPerfToggleAb(void) {
+   const bool nuevo = !g_ab_activas.load(std::memory_order_relaxed);
+   g_ab_activas.store(nuevo, std::memory_order_relaxed);
+@@ -539,6 +564,52 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+                  delta(9) / frames, delta(10) / frames / 921600.0, delta(11) / frames,
+                  delta(12) / frames, delta(13) / frames, delta(14) / frames,
+                  delta(15) / frames / 1048576.0, delta(16));
++    std::fprintf(f,
++                 "     hash de paginas por fotograma: %.1f comprobadas, %.1f aplazadas, %.1f "
++                 "cambiadas\n",
++                 delta(57) / frames, delta(58) / frames, delta(59) / frames);
++    std::fprintf(f,
++                 "     transferencias evitadas por un borrado: %.1f, color/profundidad: %.1f | "
++                 "transferencias de profundidad hechas como copia: %.1f | "
++                 "transferencias de stencil bit a bit: %.1f dibujados, %.1f omitidos | "
++                 "volcados para resolves: %.2f pantallas de muestras (%.2f MSAA) en %.1f "
++                 "despachos\n",
++                 delta(46) / frames, delta(56) / frames, delta(48) / frames, delta(35) / frames,
++                 delta(36) / frames,
++                 delta(37) / frames * (80.0 * 16.0) / 921600.0,
++                 delta(47) / frames * (80.0 * 16.0) / 921600.0, delta(49) / frames);
++    if (delta(38) > 0 && delta(39) > 0) {
++      // In the driver's timestamp units. nfsmw-nx measured the Switch's NVK
++      // counter running 1.627 times slower than timestampPeriod says, so the
++      // percentages are the reliable part.
++      const double n = delta(38), total = delta(39);
++      double timed = 0.0;
++      for (unsigned id = 40; id <= 45; ++id) {
++        timed += delta(id);
++      }
++      auto ms = [&](unsigned id) { return delta(id) / n / 1e6; };
++      auto pct = [&](unsigned id) { return 100.0 * delta(id) / total; };
++      {
++        // Shortest single operation of each kind in the interval.
++        double shortest[6];
++        for (unsigned k = 0; k < 6; ++k) {
++          const u64 v = g_counters[50 + k].exchange(0, std::memory_order_relaxed);
++          shortest[k] = v ? double(UINT64_C(1000000000000) - v) / 1e6 : -1.0;
++        }
++        std::fprintf(f,
++                     "     GPU, operacion mas corta (ms): transferencia %.2f | stencil %.2f | "
++                     "volcado 1x %.2f | copia de resolve %.2f | copia de profundidad %.2f | "
++                     "volcado MSAA %.2f\n",
++                     shortest[0], shortest[1], shortest[2], shortest[3], shortest[4], shortest[5]);
++      }
++      std::fprintf(f,
++                   "     GPU (%.0f fotogramas medidos): fotograma %.1f ms | transferencias %.1f ms "
++                   "(%.0f%%) | stencil bit a bit %.1f ms (%.0f%%) | volcados 1x %.1f ms (%.0f%%) | "
++                   "volcados MSAA %.1f ms (%.0f%%) | copias de resolve %.1f ms (%.0f%%) | "
++                   "profundidad copiada %.1f ms (%.0f%%) | resto %.0f%%\n",
++                   n, total / n / 1e6, ms(40), pct(40), ms(41), pct(41), ms(42), pct(42), ms(45),
++                   pct(45), ms(43), pct(43), ms(44), pct(44), 100.0 * (total - timed) / total);
++    }
+     std::fprintf(f,
+                  "     dibujados por ancho de superficie: 1600+ %.0f | 1280-1599 %.0f | "
+                  "640-1279 %.0f | 256-639 %.0f | menos de 256 %.0f\n",
+@@ -881,6 +952,15 @@ void ProfilerMain(void*) {
+     const u64 now = armGetSystemTick();
+     // Once per second, FPS and resolution for the overlay (the profile report runs every 10 s).
+     overlay.Paso(now, tick_freq, true);
++    {
++      const uint32_t after = g_ab_auto_after_s.load(std::memory_order_relaxed);
++      if (after && now - inicio >= u64(after) * tick_freq) {
++        g_ab_auto_after_s.store(0, std::memory_order_relaxed);
++        if (!g_ab_activas.load(std::memory_order_relaxed)) {
++          RexSwitchPerfToggleAb();
++        }
++      }
++    }
+     if (now - report_start >= kReportSeconds * tick_freq) {
+       Report(now - report_start, tick_freq, counters_last, kModes[mode_index].name);
+       if (g_ab_activas.load(std::memory_order_relaxed)) {
+@@ -1081,7 +1161,7 @@ void RexSwitchPerfMax(unsigned id, u64 value) {
+ 
+ /*
+  * Bits: 1 draws, 2 transfers, 4 resolves, 8 texture loads,
+- * 16 presentation effect, 32 tiled dispatch.
++ * 16 presentation effect, 32 tiled dispatch, 64 render target dumps for resolves.
+  */
+ bool RexSwitchPerfSkip(unsigned bit) {
+   return (g_skip_mask.load(std::memory_order_relaxed) & bit) != 0;

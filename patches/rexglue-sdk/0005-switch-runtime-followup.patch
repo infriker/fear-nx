@@ -1,0 +1,2678 @@
+diff --git a/cmake/rexglue_switch.cmake b/cmake/rexglue_switch.cmake
+index 0bdbe31..946e8bf 100644
+--- a/cmake/rexglue_switch.cmake
++++ b/cmake/rexglue_switch.cmake
+@@ -45,7 +45,19 @@ if(NOT TARGET rexglue_switch_startup)
+         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/runtime_switch.cpp"
+         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_elf_stubs.c"
+         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_crash_hooks.c"
+-        "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_saltynx.cpp")
++        "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_saltynx.cpp"
++        "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_perf.cpp"
++        "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_apm.cpp")
++    # switch_perf.cpp registers every thread (the profiler needs their handles)
++    # by wrapping libnx's threadCreate/threadClose, which pthread goes through.
++    # It also counts the libnx calls that cost IPC or walk memory and the time
++    # the calling threads spend inside them.
++    target_link_options(rexglue_switch_startup INTERFACE
++        "LINKER:--wrap=threadCreate,--wrap=threadClose"
++        "LINKER:--wrap=nvFenceWait,--wrap=nvGpuChannelKickoff,--wrap=nvMapCreate"
++        "LINKER:--wrap=nvAddressSpaceAllocFixed,--wrap=nvioctlNvhostAsGpu_MapBufferEx"
++        "LINKER:--wrap=armDCacheClean,--wrap=nwindowQueueBuffer,--wrap=bqDequeueBuffer"
++        "LINKER:--wrap=svcSleepThread")
+     if(REXGLUE_SWITCH_NVK_SOURCE)
+         target_sources(rexglue_switch_startup PRIVATE
+             "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_nvk_compat.c")
+diff --git a/include/rex/system/xmemory.h b/include/rex/system/xmemory.h
+index 0c39a42..7dfd3f0 100644
+--- a/include/rex/system/xmemory.h
++++ b/include/rex/system/xmemory.h
+@@ -18,6 +18,7 @@
+ #include <vector>
+ 
+ #include <rex/memory/utils.h>
++#include <rex/platform.h>
+ #include <rex/ppc/func.h>  // PPCFunc type
+ #include <rex/system/mmio_handler.h>
+ #include <rex/thread/mutex.h>
+@@ -322,6 +323,14 @@ class PhysicalHeap : public BaseHeap {
+ 
+   uint32_t GetPhysicalAddress(uint32_t address) const;
+ 
++#if REX_PLATFORM_SWITCH
++  // Stops watching one system page for writes and maps it read/write again,
++  // WITHOUT telling the invalidation callbacks. The caller takes over detecting
++  // CPU writes to it (Memory::SwitchCheckUnwatchedPages). Returns false if the
++  // page was not watched or the guest does not see it as writable.
++  bool SwitchUnwatchKeepingGpuCopy(uint32_t virtual_address);
++#endif
++
+  protected:
+   bool IsHostPageWriteWatched(uint32_t host_page_number) const override;
+ 
+@@ -510,6 +519,16 @@ class Memory {
+       std::unique_lock<std::recursive_mutex> global_lock_locked_once, uint32_t virtual_address,
+       uint32_t length, bool is_write, bool unwatch_exact_range, bool unprotect = true);
+ 
++#if REX_PLATFORM_SWITCH
++  // A watched page is unmapped on Switch, so every guest read of it is an
++  // emulated fault. These let a page that is read over and over stay mapped: the
++  // fault handler unwatches it, keeping the GPU's copy, and a hash taken then is
++  // compared once per frame; a page the CPU changed is invalidated as a CPU write
++  // would have done. See the .cpp for the trade-off.
++  bool SwitchUnwatchHotReadPage(const void* host_address);
++  void SwitchCheckUnwatchedPages();
++#endif
++
+   // Allocates virtual memory from the 'system' heap.
+   // System memory is kept separate from game memory but is still accessible
+   // using normal guest virtual addresses. Kernel structures and other internal
+@@ -624,6 +643,16 @@ class Memory {
+   rex::thread::global_critical_region global_critical_region_;
+   std::vector<std::pair<PhysicalMemoryInvalidationCallback, void*>*>
+       physical_memory_invalidation_callbacks_;
++
++#if REX_PLATFORM_SWITCH
++  struct SwitchUnwatchedPage {
++    uint32_t virtual_page;   // guest virtual address of the page, in the view that faulted
++    uint32_t physical_page;  // guest physical address of the page
++    uint64_t hash;           // contents when it was unwatched or last checked
++  };
++  std::mutex switch_unwatched_mutex_;
++  std::vector<SwitchUnwatchedPage> switch_unwatched_pages_;
++#endif
+ };
+ 
+ }  // namespace rex::memory
+diff --git a/include/rex/ui/switch_apm.h b/include/rex/ui/switch_apm.h
+new file mode 100644
+index 0000000..b09a177
+--- /dev/null
++++ b/include/rex/ui/switch_apm.h
+@@ -0,0 +1,40 @@
++/* Console performance profile (apm). See switch_apm.cpp. */
++#pragma once
++
++#include "rex/platform.h"
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/*
++ * GPU MHz to request in handheld mode: 0 = touch nothing, 384 or 460. Called before
++ * RexSwitchApmAplicar.
++ */
++void RexSwitchApmPedirGpuMhz(int mhz);
++
++/*
++ * Accept a configuration even if it raises the RAM to 1600. Off by default: if this firmware does
++ * not have the "high GPU + unchanged RAM" pair, keeping the GPU as it was is preferred. Called
++ * before RexSwitchApmAplicar.
++ */
++void RexSwitchApmPermitirRam1600(int permitir);
++
++/*
++ * Requests the profile. Does nothing if 0 was requested, if the console is docked, or if it was
++ * already called. If the configuration does not exist in this firmware, apm returns an error and
++ * changes nothing.
++ */
++void RexSwitchApmAplicar(void);
++
++/*
++ * One tick per second from the profile thread. If the memory clock went up on its own after the
++ * configuration was applied (the clock change takes time, so an immediate check read the old
++ * value), it is set back with clkrst to what the console had originally. It does nothing, and does
++ * not even open clkrst, if nothing was changed.
++ */
++void RexSwitchApmVigilar(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/src/audio/switch/switch_audio_system.cpp b/src/audio/switch/switch_audio_system.cpp
+index 9b0eb74..6a9dc8d 100644
+--- a/src/audio/switch/switch_audio_system.cpp
++++ b/src/audio/switch/switch_audio_system.cpp
+@@ -24,6 +24,8 @@
+ #include <switch.h>
+ 
+ // Passive counters: the audio thread neither writes reports nor pauses the game.
++extern "C" void RexSwitchPerfAdd(unsigned id, u64 value);
++extern "C" void RexSwitchPerfMax(unsigned id, u64 value);
+ 
+ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+ REXCVAR_DEFINE_BOOL(audio_switch_bomba, true, "Audio",
+@@ -329,17 +331,17 @@ void SwitchAudioSystem::FillAndAppend(size_t buffer_index) {
+       pcm_nonzero |= samples[i] != 0;
+     }
+   }
+-
+-
+-
++  RexSwitchPerfAdd(21, saturadas);
++  RexSwitchPerfAdd(22, pico >= 0.98f ? 1 : 0);
++  RexSwitchPerfMax(23, static_cast<u64>(std::min(pico, 100.0f) * 10000.0f));
+   output.buffers[buffer_index].data_size = kBufferBytes;
+   output.buffers[buffer_index].data_offset = 0;
+   Result rc = audoutAppendAudioOutBuffer(&output.buffers[buffer_index]);
+-
+-
++  RexSwitchPerfAdd(24, frames_mixed);
++  RexSwitchPerfAdd(25, frames_missing);
+   if (R_SUCCEEDED(rc)) {
+-
+-
++    RexSwitchPerfAdd(26, pcm_nonzero ? 1 : 0);
++    RexSwitchPerfAdd(27, 1);
+   }
+   if (R_FAILED(rc)) {
+     REXLOG_ERROR("SwitchAudioSystem: audoutAppendAudioOutBuffer failed: 0x{:08X}", rc);
+diff --git a/src/core/exception_handler_switch.cpp b/src/core/exception_handler_switch.cpp
+index 0e753d4..39a4de9 100644
+--- a/src/core/exception_handler_switch.cpp
++++ b/src/core/exception_handler_switch.cpp
+@@ -88,6 +88,16 @@
+ #include "resume_ctx.h"
+ #include "rex_decode.h"
+ 
++extern "C" void RexSwitchPerfCount(unsigned id);
++
++extern "C" {
++/*
++ * Set by guest memory (system/xmemory.cpp) once it exists: unwatches a hot page
++ * while keeping the GPU's copy. Null until then, and reads stay emulated.
++ */
++bool (*g_rex_switch_unwatch_hot_read)(uint64_t host_address) = nullptr;
++}
++
+ /* Provided by seh_switch.cpp. Returns true if it redirected execution. */
+ extern "C" bool RexSwitchSehHandleFault(ThreadExceptionDump* ctx);
+ 
+@@ -101,10 +111,11 @@ extern "C" const char* RexSwitchLogDir(void);
+  * multiplication.
+  *
+  * NFSMW never showed more than two threads inside the handler at once. Project 8, with twenty-odd
+- * guest threads faulting during a load, filled all eight; running out is survivable only because
+- * the entry then retries the fault instead of waiting. 512 KB of .bss, no space in the NRO.
++ * guest threads faulting during a load, filled all eight. Thirty-two covers every thread it runs,
++ * so the retry path in the entry (return to the faulting instruction when none is free) should
++ * stay a safety net. 2 MB of .bss, no space in the NRO.
+  */
+-#define REX_EXC_RANURAS 8
++#define REX_EXC_RANURAS 32
+ #define REX_EXC_PILA 0x10000   /* 64 KB per slot -> shift of 16 */
+ #define REX_EXC_VOLCADO 0x400  /* the dump takes 0x340 -> shift of 10 */
+ 
+@@ -116,7 +127,7 @@ alignas(16) uint32_t g_rex_exc_ocupadas[REX_EXC_RANURAS];
+ 
+ static_assert(sizeof(ThreadExceptionDump) <= REX_EXC_VOLCADO,
+               "el volcado ya no cabe en la ranura");
+-static_assert(REX_EXC_RANURAS == 8, "el ensamblador compara contra 8 a mano");
++static_assert(REX_EXC_RANURAS == 32, "the assembly compares against 32 and masks with 31 by hand");
+ 
+ /*
+  * The exception entry, replacing libnx's
+@@ -192,7 +203,7 @@ __asm__(".text\n"
+         ".Lrex_exc_siguiente:\n"
+         "    clrex\n"
+         "    add  w7, w7, #1\n"
+-        "    cmp  w7, #8\n"
++        "    cmp  w7, #32\n"
+         "    b.lo .Lrex_exc_pide\n"
+         /*
+          * All taken: return to the faulting instruction with the frame untouched, so
+@@ -295,7 +306,7 @@ __asm__(".text\n"
+          * copied dump were damaged.
+          */
+         "    ldr  w3, [x2, #4]\n"
+-        "    and  w3, w3, #7\n"
++        "    and  w3, w3, #31\n"
+         "    adrp x4, g_rex_exc_ocupadas\n"
+         "    add  x4, x4, :lo12:g_rex_exc_ocupadas\n"
+         "    add  x4, x4, x3, lsl #2\n"
+@@ -485,6 +496,20 @@ extern "C" void RexSwitchCrashLog(const char* reason, const ThreadExceptionDump*
+       Append(b, "x%-2d 0x%016" PRIx64 "%s", i, ctx->cpu_gprs[i].x, (i % 3 == 2) ? "\n" : "  ");
+     }
+     Append(b, "fp  0x%016" PRIx64 "  sp  0x%016" PRIx64 "\n", ctx->fp.x, ctx->sp.x);
++    uint64_t q31[2];
++    std::memcpy(q31, &ctx->fpu_gprs[31], sizeof(q31));
++    Append(b, "q31 low=0x%016" PRIx64 " high=0x%016" PRIx64 "\n", q31[0], q31[1]);
++    // These are candidates, not an ABI guarantee: the crashing translated
++    // function keeps PPCContext in x19 and guest memory in x20. Validate both
++    // before reading host memory, so native driver crashes remain reportable.
++    if (ctx->cpu_gprs[20].x == gm && gm &&
++        QueryReadable(ctx->cpu_gprs[19].x, 264, &mi)) {
++      const auto* regs = reinterpret_cast<const uint64_t*>(ctx->cpu_gprs[19].x);
++      Append(b, "candidate PPC context: r8=0x%016" PRIx64 " r9=0x%016" PRIx64
++                " r27=0x%016" PRIx64 " r28=0x%016" PRIx64 " lr=0x%016" PRIx64 "\n",
++             regs[8], regs[9], regs[27], regs[28], regs[32]);
++    }
++
+   }
+ 
+   // Frame chain: the ELF keeps x29 as the frame pointer (the Atmosphere report of
+@@ -555,7 +580,18 @@ bool EmulateViaShadow(ThreadExceptionDump* ctx) {
+   if (!ini || !fin || static_cast<uint8_t*>(fin) != static_cast<uint8_t*>(ini) + total - 1) {
+     return false;
+   }
++  // The reproducible Project8 null-pointer crash has a q31 value live over
++  // this image read. Log the saved state on both sides of emulation to tell
++  // entry/resume corruption apart from a bad guest argument. Bound the writes
++  // because this read also occurs during normal rendering.
++  static std::atomic<unsigned> diagnostic_reads{0};
++  const auto guest_base = reinterpret_cast<uint64_t>(RexGmBase());
++  const bool trace = guest_base && insn == 0xB956BC24u &&
++                     acc.address == guest_base + 0x8201D6BCull &&
++                     diagnostic_reads.fetch_add(1, std::memory_order_relaxed) < 2;
++  if (trace) RexSwitchCrashLog("diagnostic image read BEFORE emulation", ctx, ctx->sp.x, ctx->pc.x);
+   RexEmulateAccess(ctx, &acc, ini);
++  if (trace) RexSwitchCrashLog("diagnostic image read AFTER emulation", ctx, ctx->sp.x, ctx->pc.x);
+   ctx->pc.x += 4;
+   return true;
+ }
+@@ -610,6 +646,51 @@ void WriteBack(const Exception& ex, const HostThreadContext& tc, ThreadException
+   ctx->pstate = static_cast<u32>(tc.pstate);
+ }
+ 
++/*
++ * Hot reads of watched pages
++ *
++ * A watched page is unmapped on Switch, so every guest read of it is emulated. In
++ * Project 8's movies and menu that was 200,000 emulated reads per second, more than
++ * two cores, most of them one copy loop reading the same pages over and over.
++ *
++ * Reporting those reads as writes is what nfsmw-nx tried, and the game froze: a
++ * write invalidates the page in the GPU caches, and for a page the GPU wrote (resolve
++ * readback is off, so its CPU copy is stale) that throws away the only good copy.
++ * Instead, after enough reads the page is unwatched without invalidating anything
++ * and left mapped; guest memory hashes it and checks once per frame whether the CPU
++ * changed it (Memory::SwitchUnwatchHotReadPage and SwitchCheckUnwatchedPages).
++ */
++constexpr uint16_t kReadsBeforeUnwatch = 64;
++constexpr size_t kPhysicalPages = 0x20000000 / 0x1000;
++std::atomic<uint16_t> g_read_faults[kPhysicalPages];
++
++bool PhysicalFromWindowOffset(size_t offset, uint32_t* physical) {
++  if (offset >= 0x100000000ull && offset < 0x120000000ull) {
++    *physical = static_cast<uint32_t>(offset - 0x100000000ull);
++    return true;
++  }
++  // The 0xA0000000, 0xC0000000 and 0xE0000000 views; no 0x1000 shift with 4 KB host pages.
++  if (offset >= 0xA0000000ull && offset < 0x100000000ull) {
++    *physical = static_cast<uint32_t>(offset) & 0x1FFFFFFF;
++    return true;
++  }
++  return false;
++}
++
++bool IsHotRead(uint64_t far) {
++  size_t offset = 0;
++  uint32_t physical = 0;
++  if (!RexGmWindowToOffset(far, &offset) || !PhysicalFromWindowOffset(offset, &physical)) {
++    return false;
++  }
++  std::atomic<uint16_t>& count = g_read_faults[physical >> 12];
++  if (count.fetch_add(1, std::memory_order_relaxed) + 1 < kReadsBeforeUnwatch) {
++    return false;
++  }
++  count.store(0, std::memory_order_relaxed);
++  return true;
++}
++
+ [[noreturn]] void HandleSwitchException(ThreadExceptionDump* ctx) {
+   const uint64_t pc = ctx->pc.x;
+   const uint64_t far = ctx->far.x;
+@@ -650,14 +731,23 @@ void WriteBack(const Exception& ex, const HostThreadContext& tc, ThreadException
+      * again. It is still emulated through the shadow: see below for why treating it as a write
+      * does not work.
+      */
+-    if (!is_write && hay_permiso && acceso == REX_GM_READ && EmulateViaShadow(ctx)) {
+-
+-      RexResumeFromException(ctx);
++    if (!is_write && hay_permiso && acceso == REX_GM_READ) {
++      if (g_rex_switch_unwatch_hot_read && IsHotRead(far)) {
++        if (g_rex_switch_unwatch_hot_read(far)) {
++          RexSwitchPerfCount(33);  // now mapped: the retried read runs natively
++          RexResumeFromException(ctx);
++        }
++        RexSwitchPerfCount(34);  // could not unwatch (list full, or not a plain watch)
++      }
++      if (EmulateViaShadow(ctx)) {
++        RexSwitchPerfCount(1);
++        RexResumeFromException(ctx);
++      }
+     }
+ 
+     /* (2) Committed, but not yet mapped in this view. */
+     if (RexGmFaultIn(far)) {
+-
++      RexSwitchPerfCount(18);
+       RexResumeFromException(ctx);
+     }
+ 
+@@ -676,7 +766,7 @@ void WriteBack(const Exception& ex, const HostThreadContext& tc, ThreadException
+       size_t offset = 0;
+       if (RexGmWindowToOffset(far, &offset) && offset >= kFisicaIni && offset < kFisicaFin) {
+         if (RexGmCommit(offset & ~(kTrozo - 1), kTrozo, REX_GM_WRITE) && RexGmFaultIn(far)) {
+-
++          RexSwitchPerfCount(17);
+           RexResumeFromException(ctx);
+         }
+       }
+@@ -737,20 +827,20 @@ void WriteBack(const Exception& ex, const HostThreadContext& tc, ThreadException
+         const bool reintentable = ok && (is_write ? a == REX_GM_WRITE : a != REX_GM_NONE);
+         if (!reintentable) {
+           if (EmulateViaShadow(ctx)) {
+-
++            RexSwitchPerfCount(3);
+             RexResumeFromException(ctx);
+           }
+           break;  // ni reintentable ni emulable: sigue a SEH y a fatal
+         }
+       }
+-
++      RexSwitchPerfCount(2);
+       RexResumeFromException(ctx);
+     }
+   }
+ 
+   // --- 3. SEH ----------------------------------------------------------------
+   if (RexSwitchSehHandleFault(ctx)) {
+-
++    RexSwitchPerfCount(4);
+     RexResumeFromException(ctx);
+   }
+ 
+diff --git a/src/core/switch_libc_supplement.c b/src/core/switch_libc_supplement.c
+index 967dc7b..84c45ea 100644
+--- a/src/core/switch_libc_supplement.c
++++ b/src/core/switch_libc_supplement.c
+@@ -127,9 +127,16 @@ int creat(const char* path, mode_t mode) {
+  * to a debugger. The call is accepted and does nothing.
+  */
+ 
++/*
++ * The name is recorded for the profiler (switch_perf.cpp), which puts it in its
++ * report. Only the calling thread's own name: the SDK names each thread from
++ * inside it, and there is no direct way to go from a pthread_t to its handle.
++ */
++void RexSwitchPerfSetThreadName(u32 handle, const char* name);
++
+ int pthread_setname_np(pthread_t thread, const char* name) {
+-    (void)thread;
+-    (void)name;
++    if (pthread_equal(thread, pthread_self()))
++        RexSwitchPerfSetThreadName(threadGetCurHandle(), name);
+     return 0;
+ }
+ 
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index e5f8d7c..13cf6cc 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -91,6 +91,14 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+                     "device (falls back to render passes otherwise)")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++#include <rex/platform.h>
++#if REX_PLATFORM_SWITCH
++// Counters and A/B skips of the Switch profiler (switch_perf.cpp).
++extern "C" void RexSwitchPerfCount(unsigned id);
++extern "C" void RexSwitchPerfAdd(unsigned id, uint64_t value);
++extern "C" bool RexSwitchPerfSkip(unsigned bit);
++#endif
++
+ namespace rex::graphics::vulkan {
+ 
+ namespace {
+@@ -2406,6 +2414,12 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
+   ++draw_census_swap_ordinal_;
++#if REX_PLATFORM_SWITCH
++  RexSwitchPerfCount(0);
++  // Once per frame: pages the fault handler stopped watching because they were
++  // read over and over are checked for CPU writes (see xmemory.cpp).
++  memory_->SwitchCheckUnwatchedPages();
++#endif
+   SCOPE_profile_cpu_f("gpu");
+   vertex_buffers_in_sync_[0] = 0;
+   vertex_buffers_in_sync_[1] = 0;
+@@ -2874,6 +2888,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+           BindExternalComputePipeline(swap_apply_gamma_compute_pipeline);
+           uint32_t group_count_x = (guest_output_width + 15) / 16;
+           uint32_t group_count_y = (guest_output_height + 7) / 8;
++#if REX_PLATFORM_SWITCH
++          if (!RexSwitchPerfSkip(16))
++#endif
+           deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+ 
+           if (use_fxaa) {
+@@ -2945,6 +2962,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+             BindExternalComputePipeline(swap_post_effect == SwapPostEffect::kFxaaExtreme
+                                             ? swap_fxaa_extreme_pipeline_
+                                             : swap_fxaa_pipeline_);
++#if REX_PLATFORM_SWITCH
++            if (!RexSwitchPerfSkip(16))
++#endif
+             deferred_command_buffer_.CmdVkDispatch(group_count_x, group_count_y, 1);
+           }
+ 
+@@ -3100,6 +3120,9 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+               VK_PIPELINE_BIND_POINT_GRAPHICS, swap_apply_gamma_pipeline_layout_, 0,
+               uint32_t(swap_descriptor_sets.size()), swap_descriptor_sets.data(), 0, nullptr);
+ 
++#if REX_PLATFORM_SWITCH
++          if (!RexSwitchPerfSkip(16))
++#endif
+           deferred_command_buffer_.CmdVkDraw(3, 1, 0, 0);
+           deferred_command_buffer_.CmdVkEndRenderPass();
+ 
+@@ -4132,6 +4155,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     uint64_t sampler_overflow_await_submission =
+         texture_cache_->GetSubmissionToAwaitOnSamplerOverflow(samplers_overflowed_count);
+     assert_true(sampler_overflow_await_submission <= GetCurrentSubmission());
++#if REX_PLATFORM_SWITCH
++    RexSwitchPerfCount(19);  // hard stop: no free sampler slot without waiting for the GPU
++#endif
+     CheckSubmissionFenceAndDeviceLoss(sampler_overflow_await_submission);
+   }
+ 
+@@ -4626,6 +4652,22 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   };
+ 
+   // Draw.
++#if REX_PLATFORM_SWITCH
++  RexSwitchPerfCount(5);
++  RexSwitchPerfAdd(6, uint64_t(dynamic_scissor_.extent.width) * dynamic_scissor_.extent.height);
++  {
++    // Draws per surface width (RB_SURFACE_INFO::surface_pitch): splits the work
++    // among the game's passes by the size of their render target (1600 shadows,
++    // 1280 scene and post-processing, 640 reflection, 256 car cubemap). Counters
++    // 28..32 of switch_perf.cpp.
++    const uint32_t ancho_superficie = regs.Get<reg::RB_SURFACE_INFO>().surface_pitch;
++    RexSwitchPerfCount(ancho_superficie >= 1600   ? 28u
++                       : ancho_superficie >= 1280 ? 29u
++                       : ancho_superficie >= 640  ? 30u
++                       : ancho_superficie >= 256  ? 31u
++                                                  : 32u);
++  }
++#endif
+   if (primitive_processing_result.index_buffer_type ==
+           PrimitiveProcessor::ProcessedIndexBufferType::kNone ||
+       shader_32bit_index_dma) {
+@@ -4637,6 +4679,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     commit_census_draw();
+     PROFILE_DRAW_CALL();
+     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
++#if REX_PLATFORM_SWITCH
++    if (!RexSwitchPerfSkip(1))
++#endif
+     deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
+   } else {
+     std::pair<VkBuffer, VkDeviceSize> index_buffer;
+@@ -4671,6 +4716,9 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     commit_census_draw();
+     PROFILE_DRAW_CALL();
+     PROFILE_VERTICES(primitive_processing_result.host_draw_vertex_count);
++#if REX_PLATFORM_SWITCH
++    if (!RexSwitchPerfSkip(1))
++#endif
+     deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
+                                               0, 0, 0);
+   }
+@@ -5170,6 +5218,9 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+     deferred_command_buffer_.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                      resolve_downscale_pipeline_layout_, 0, 1,
+                                                      &descriptor_set, 0, nullptr);
++#if REX_PLATFORM_SWITCH
++    if (!RexSwitchPerfSkip(32))
++#endif
+     deferred_command_buffer_.CmdVkDispatch(tile_count, 1, 1);
+ 
+     VkBufferMemoryBarrier downscale_barrier = {};
+@@ -6078,6 +6129,9 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+     {
+       ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+           vulkan_device->AcquireQueue(vulkan_device->queue_family_graphics_compute(), 0);
++#if REX_PLATFORM_SWITCH
++      RexSwitchPerfCount(7);
++#endif
+       submit_result = dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence);
+     }
+     if (submit_result != VK_SUCCESS) {
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 306913d..c7e097a 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -60,6 +60,14 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
+                     "Render tessellation as wireframe")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++#include <rex/platform.h>
++#if REX_PLATFORM_SWITCH
++// Counters and A/B skips of the Switch profiler (switch_perf.cpp).
++extern "C" void RexSwitchPerfCount(unsigned id);
++extern "C" void RexSwitchPerfAdd(unsigned id, uint64_t value);
++extern "C" bool RexSwitchPerfSkip(unsigned bit);
++#endif
++
+ namespace rex::graphics::vulkan {
+ 
+ namespace {
+@@ -3499,6 +3507,9 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+   VkPipeline pipeline;
++#if REX_PLATFORM_SWITCH
++  RexSwitchPerfCount(16);
++#endif
+   VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
+                                                          &pipeline_create_info, nullptr, &pipeline);
+   if (create_result != VK_SUCCESS) {
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 0298f06..01c7042 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -62,6 +62,14 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+ //     "always FB because the FSI path is much slower now).",
+ //     "GPU");
+ 
++#include <rex/platform.h>
++#if REX_PLATFORM_SWITCH
++// Counters and A/B skips of the Switch profiler (switch_perf.cpp).
++extern "C" void RexSwitchPerfCount(unsigned id);
++extern "C" void RexSwitchPerfAdd(unsigned id, uint64_t value);
++extern "C" bool RexSwitchPerfSkip(unsigned bit);
++#endif
++
+ namespace rex::graphics::vulkan {
+ 
+ // Generated with `xb buildshaders`.
+@@ -1144,6 +1152,11 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+   if (!resolve_info.coordinate_info.width_div_8 || !resolve_info.height_div_8) {
+     return true;
+   }
++#if REX_PLATFORM_SWITCH
++  RexSwitchPerfCount(9);
++  RexSwitchPerfAdd(10, uint64_t(resolve_info.coordinate_info.width_div_8) * 8 *
++                           uint64_t(resolve_info.height_div_8) * 8);
++#endif
+ 
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+@@ -1283,6 +1296,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+                 sizeof(copy_shader_constants), &copy_shader_constants);
+           }
+           command_processor_.SubmitBarriers(true);
++#if REX_PLATFORM_SWITCH
++          if (!RexSwitchPerfSkip(4))
++#endif
+           command_buffer.CmdVkDispatch(copy_group_count_x, copy_group_count_y, 1);
+ 
+           // Invalidate textures and mark the range as scaled if needed.
+@@ -1342,6 +1358,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+                                             VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                             sizeof(depth_clear_constants), &depth_clear_constants);
+           command_processor_.SubmitBarriers(true);
++#if REX_PLATFORM_SWITCH
++          if (!RexSwitchPerfSkip(4))
++#endif
+           command_buffer.CmdVkDispatch(clear_group_count.first, clear_group_count.second, 1);
+         }
+         if (clear_color) {
+@@ -1362,6 +1381,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+                 sizeof(color_clear_constants), &color_clear_constants);
+           }
+           command_processor_.SubmitBarriers(true);
++#if REX_PLATFORM_SWITCH
++          if (!RexSwitchPerfSkip(4))
++#endif
+           command_buffer.CmdVkDispatch(clear_group_count.first, clear_group_count.second, 1);
+         }
+         MarkEdramBufferModified();
+@@ -4552,6 +4574,16 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+     const uint64_t* render_target_resolve_clear_values,
+     const Transfer::Rectangle* resolve_clear_rectangle) {
+   assert_true(GetPath() == Path::kHostRenderTargets);
++#if REX_PLATFORM_SWITCH
++  RexSwitchPerfCount(11);
++  if (render_target_transfers) {
++    uint64_t transfers = 0;
++    for (uint32_t i = 0; i < render_target_count; ++i) {
++      transfers += render_target_transfers[i].size();
++    }
++    RexSwitchPerfAdd(12, transfers);
++  }
++#endif
+ 
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+   uint64_t current_submission = command_processor_.GetCurrentSubmission();
+@@ -4649,6 +4681,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+             uint32_t(offsetof(HostDepthStoreConstants, rectangle)),
+             sizeof(host_depth_store_rectangle_constant), &host_depth_store_rectangle_constant);
+         command_processor_.SubmitBarriers(true);
++#if REX_PLATFORM_SWITCH
++        if (!RexSwitchPerfSkip(2))
++#endif
+         command_buffer.CmdVkDispatch(group_count_x, group_count_y, 1);
+         MarkEdramBufferModified();
+       }
+@@ -5269,6 +5304,12 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+               command_buffer.CmdVkSetStencilWriteMask(VK_STENCIL_FACE_FRONT_AND_BACK,
+                                                       transfer_stencil_bit);
+             }
++#if REX_PLATFORM_SWITCH
++            RexSwitchPerfCount(13);
++#endif
++#if REX_PLATFORM_SWITCH
++            if (!RexSwitchPerfSkip(2))
++#endif
+             command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
+           }
+         }
+@@ -6136,6 +6177,9 @@ bool VulkanRenderTargetCache::DumpRenderTargets(uint32_t dump_base, uint32_t dum
+                                           sizeof(last_offsets), &last_offsets);
+       }
+       command_processor_.SubmitBarriers(true);
++#if REX_PLATFORM_SWITCH
++      if (!RexSwitchPerfSkip(4))
++#endif
+       command_buffer.CmdVkDispatch(
+           (draw_resolution_scale_x() *
+                (xenos::kEdramTileWidthSamples >> uint32_t(rt_key.Is64bpp())) *
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index dc4f8db..be6d855 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -27,6 +27,14 @@ REXCVAR_DEFINE_BOOL(vulkan_sparse_shared_memory, true, "GPU/Vulkan",
+                     "Use sparse shared memory on Vulkan")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++#include <rex/platform.h>
++#if REX_PLATFORM_SWITCH
++// Counters and A/B skips of the Switch profiler (switch_perf.cpp).
++extern "C" void RexSwitchPerfCount(unsigned id);
++extern "C" void RexSwitchPerfAdd(unsigned id, uint64_t value);
++extern "C" bool RexSwitchPerfSkip(unsigned bit);
++#endif
++
+ namespace rex::graphics::vulkan {
+ 
+ // Staging alignment for unwatched uploads. Buffer to buffer copies have no
+@@ -279,6 +287,15 @@ bool VulkanSharedMemory::UploadRanges(
+   if (upload_page_ranges.empty()) {
+     return true;
+   }
++#if REX_PLATFORM_SWITCH
++  {
++    uint64_t pages = 0;
++    for (const auto& range : upload_page_ranges) {
++      pages += range.second;
++    }
++    RexSwitchPerfAdd(15, pages << page_size_log2());
++  }
++#endif
+   // upload_page_ranges are sorted, use them to determine the range for the
+   // ordering barrier.
+   Use(Usage::kTransferDestination,
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index 1ab2644..cd94723 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -43,6 +43,14 @@ REXCVAR_DEFINE_BOOL(gpu_texture_last_view_cache, false, "GPU/Vulkan",
+ REXCVAR_DEFINE_BOOL(gpu_texture_last_view_cache_stats, false, "GPU/Vulkan",
+                     "Log texture last-view-cache engagement counters");
+ 
++#include <rex/platform.h>
++#if REX_PLATFORM_SWITCH
++// Counters and A/B skips of the Switch profiler (switch_perf.cpp).
++extern "C" void RexSwitchPerfCount(unsigned id);
++extern "C" void RexSwitchPerfAdd(unsigned id, uint64_t value);
++extern "C" bool RexSwitchPerfSkip(unsigned bit);
++#endif
++
+ namespace rex::graphics::vulkan {
+ 
+ namespace {
+@@ -1002,6 +1010,9 @@ VkSampler VulkanTextureCache::UseSampler(SamplerParameters parameters, bool& has
+     sampler_used_first_ = &new_sampler;
+   }
+   sampler_used_last_ = &new_sampler;
++#if REX_PLATFORM_SWITCH
++  RexSwitchPerfCount(20);  // a really new sampler, not a reused one
++#endif
+   return vulkan_sampler;
+ }
+ 
+@@ -1262,6 +1273,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+                                                                bool load_mips) {
+   VulkanTexture& vulkan_texture = static_cast<VulkanTexture&>(texture);
+   TextureKey texture_key = vulkan_texture.key();
++#if REX_PLATFORM_SWITCH
++  RexSwitchPerfCount(14);
++#endif
+ 
+   // Get the pipeline.
+   const HostFormatPair& host_format_pair = GetHostFormatPair(texture_key);
+@@ -1654,6 +1668,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+                                           &load_constants.host_offset);
+       }
+       command_processor_.SubmitBarriers(true);
++#if REX_PLATFORM_SWITCH
++      if (!RexSwitchPerfSkip(8))
++#endif
+       command_buffer.CmdVkDispatch(group_count_x, group_count_y, load_constants.size_blocks[2]);
+       load_constants.guest_offset += level_array_slice_stride_bytes_scaled;
+       load_constants.host_offset += uint32_t(level_host_layout.slice_size_bytes);
+@@ -1754,6 +1771,9 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
+                                             &load_constants_float_convert.host_offset);
+         }
+         command_processor_.SubmitBarriers(true);
++#if REX_PLATFORM_SWITCH
++        if (!RexSwitchPerfSkip(8))
++#endif
+         command_buffer.CmdVkDispatch(group_count_x, group_count_y,
+                                      load_constants_float_convert.size_blocks[2]);
+         load_constants_float_convert.guest_offset += level_array_slice_stride_bytes;
+diff --git a/src/input/switch/switch_input_driver.cpp b/src/input/switch/switch_input_driver.cpp
+index efe7e22..a970012 100644
+--- a/src/input/switch/switch_input_driver.cpp
++++ b/src/input/switch/switch_input_driver.cpp
+@@ -334,10 +334,14 @@ void SwitchInputDriver::Poll(size_t index) {
+  *   L + R + Right -> settings
+  *   L + R + Down  -> log console
+  *   L + R + Left  -> achievements
++ *   L + R + ZL    -> the profiler's GPU A/B lap (for measuring, not for playing)
+  *
+  * It fires once per press, not while held: each shortcut stores its bit in
+  * slot.menu_shortcuts with the state from the previous poll.
+  */
++/* From the profiler (switch_perf.cpp): turns the GPU A/B test lap on and off. */
++extern "C" void RexSwitchPerfToggleAb(void);
++
+ void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
+   struct Atajo {
+     uint64_t boton;
+@@ -377,6 +381,20 @@ void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
+     slot.menu_shortcuts = ahora ? (slot.menu_shortcuts | bit) : (slot.menu_shortcuts & ~bit);
+   }
+ 
++  /*
++   * L+R+ZL starts the profiler's GPU A/B lap (switch_perf.cpp). It sends no key
++   * to the game: it talks directly to the profiler, which is why it is kept out
++   * of the loop above, which translates buttons into keys.
++   */
++  const uint64_t kBitAb = uint64_t(1) << 8;
++  const bool ab_ahora = modificador && (held & HidNpadButton_ZL) != 0;
++  const bool ab_antes = (slot.menu_shortcuts & kBitAb) != 0;
++  if (ab_ahora && !ab_antes) {
++    RexSwitchPerfToggleAb();
++    REXLOG_INFO("menu shortcut: GPU A/B lap");
++  }
++  slot.menu_shortcuts =
++      ab_ahora ? (slot.menu_shortcuts | kBitAb) : (slot.menu_shortcuts & ~kBitAb);
+ }
+ 
+ SwitchInputDriver::Slot* SwitchInputDriver::FindSlot(DeviceId id) {
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 3f8ce2c..b994c81 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -33,6 +33,19 @@
+ 
+ // TODO(benvanik): move xbox.h out
+ #include <rex/system/xtypes.h>
++#if REX_PLATFORM_SWITCH
++#include <rex/hash.h>
++
++// Off by default: its only hardware runs crashed early for an unrelated reason
++// and showed worse graphics, so its effect is unmeasured.
++REXCVAR_DEFINE_BOOL(switch_unwatch_hot_reads, false, "Memory",
++                    "Keep watched pages that are read over and over mapped, checking them for "
++                    "CPU writes once per frame instead of emulating every read");
++
++// Read by the Switch fault handler (core/exception_handler_switch.cpp); set once
++// guest memory exists. See Memory::SwitchUnwatchHotReadPage.
++extern "C" bool (*g_rex_switch_unwatch_hot_read)(uint64_t host_address);
++#endif
+ 
+ REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+@@ -44,6 +57,15 @@ REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allo
+ 
+ namespace rex::memory {
+ 
++#if REX_PLATFORM_SWITCH
++namespace {
++// Bounded so the per-frame check stays cheap: hashing 1,024 pages of 4 KB is
++// about a millisecond on the GPU thread. Beyond it, reads stay emulated.
++constexpr size_t kSwitchMaxUnwatchedPages = 1024;
++Memory* g_switch_memory = nullptr;
++}  // namespace
++#endif
++
+ uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_shift) {
+   return rex::round_up(value, page_size) >> page_size_shift;
+ }
+@@ -257,6 +279,15 @@ bool Memory::Initialize() {
+     return false;
+   }
+   REXSYS_DEBUG("Installed MMIO handler for physical address translation");
++#if REX_PLATFORM_SWITCH
++  switch_unwatched_pages_.reserve(kSwitchMaxUnwatchedPages);
++  g_switch_memory = this;
++  if (REXCVAR_GET(switch_unwatch_hot_reads))
++  g_rex_switch_unwatch_hot_read = [](uint64_t host_address) {
++    Memory* const memory = g_switch_memory;
++    return memory && memory->SwitchUnwatchHotReadPage(reinterpret_cast<const void*>(host_address));
++  };
++#endif
+ 
+   // ?
+   uint32_t unk_phys_alloc;
+@@ -2392,4 +2423,130 @@ uint32_t PhysicalHeap::GetPhysicalAddress(uint32_t address) const {
+   return address;
+ }
+ 
++#if REX_PLATFORM_SWITCH
++bool PhysicalHeap::SwitchUnwatchKeepingGpuCopy(uint32_t virtual_address) {
++  if (virtual_address < heap_base_ || virtual_address - heap_base_ >= heap_size_) {
++    return false;
++  }
++  const uint32_t heap_relative_address = virtual_address - heap_base_;
++  const uint32_t i = (heap_relative_address + host_address_offset()) / system_page_size_;
++  if (i >= system_page_count_) {
++    return false;
++  }
++  auto global_lock = global_critical_region_.Acquire();
++  SystemPageFlagsBlock& block = system_page_flags_[i >> 6];
++  const uint64_t bit = uint64_t(1) << (i & 63);
++  if (!(block.notify_on_invalidation & bit)) {
++    return false;
++  }
++  const uint32_t guest_page_number =
++      rex::sat_sub(i * system_page_size_, host_address_offset()) >> page_size_shift_;
++  if (guest_page_number >= page_table_.size() ||
++      ToPageAccess(page_table_[guest_page_number].current_protect) !=
++          rex::memory::PageAccess::kReadWrite) {
++    return false;
++  }
++  if (!rex::memory::Protect(membase_ + heap_base_ + i * system_page_size_, system_page_size_,
++                            rex::memory::PageAccess::kReadWrite)) {
++    return false;
++  }
++  block.notify_on_invalidation &= ~bit;
++  return true;
++}
++
++/*
++ * Watched pages that are read over and over
++ *
++ * Desktop watches a page for CPU writes by making it read-only, so reads are
++ * free. Horizon refuses permission changes on this memory, so a watched page is
++ * unmapped and every read of it is an emulated fault. Project 8's movies and menu
++ * read watched pages about 200,000 times a second, more than two cores, and the
++ * pages were mostly ones the GPU had written: resolve readback is off, so their
++ * CPU copy is stale and invalidating them would throw away the GPU's.
++ *
++ * So a hot page is unwatched without invalidating anything, and its contents are
++ * hashed. Once per frame, from IssueSwap, each such page is hashed again; if the
++ * CPU changed it, the invalidation a CPU write would have caused happens then.
++ * The trade-off is timing: a CPU write is noticed at the next frame boundary
++ * instead of at once, so a GPU read of that page later in the same frame can see
++ * the old data. Reads themselves become native.
++ */
++bool Memory::SwitchUnwatchHotReadPage(const void* host_address) {
++  if (reinterpret_cast<uintptr_t>(host_address) < reinterpret_cast<uintptr_t>(virtual_membase_) ||
++      reinterpret_cast<uintptr_t>(host_address) >= reinterpret_cast<uintptr_t>(physical_membase_)) {
++    return false;
++  }
++  const uint32_t virtual_page = HostToGuestVirtual(host_address) & ~uint32_t(0xFFF);
++  BaseHeap* heap = LookupHeap(virtual_page);
++  if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
++    return false;
++  }
++  auto* physical_heap = static_cast<PhysicalHeap*>(heap);
++  // Runs in the fault handler. Global lock first, the same order as every other
++  // path that nests them, and never block on the list: the per-frame check holds it,
++  // and a fault on the thread that holds it must fall back to emulation instead of
++  // deadlocking on itself.
++  auto global_lock = global_critical_region_.Acquire();
++  std::unique_lock<std::mutex> lock(switch_unwatched_mutex_, std::try_to_lock);
++  if (!lock.owns_lock()) {
++    return false;
++  }
++  auto existing =
++      std::find_if(switch_unwatched_pages_.begin(), switch_unwatched_pages_.end(),
++                   [&](const SwitchUnwatchedPage& p) { return p.virtual_page == virtual_page; });
++  if (existing == switch_unwatched_pages_.end() &&
++      switch_unwatched_pages_.size() >= kSwitchMaxUnwatchedPages) {
++    return false;
++  }
++  if (!physical_heap->SwitchUnwatchKeepingGpuCopy(virtual_page)) {
++    return false;
++  }
++  // Through the view that faulted: it was just mapped read/write, and watching it
++  // again needs the global lock held here, so this read cannot fault. The raw
++  // physical window might not be mapped yet, and a fault here would nest inside
++  // the fault handler.
++  const uint32_t physical_page = physical_heap->GetPhysicalAddress(virtual_page);
++  const uint64_t hash = XXH3_64bits(TranslateVirtual(virtual_page), 0x1000);
++  if (existing != switch_unwatched_pages_.end()) {
++    existing->hash = hash;  // watched again since; start over from its contents now
++  } else {
++    switch_unwatched_pages_.push_back({virtual_page, physical_page, hash});
++  }
++  return true;
++}
++
++void Memory::SwitchCheckUnwatchedPages() {
++  std::vector<uint32_t> changed;
++  {
++    std::lock_guard<std::mutex> lock(switch_unwatched_mutex_);
++    auto& pages = switch_unwatched_pages_;
++    for (size_t i = 0; i < pages.size();) {
++      // The raw physical window, never write-watched: a view address could be
++      // watched (unmapped) again by now, and a fault there would re-enter the
++      // unwatch path on this thread. At worst this window faults once to be mapped,
++      // which does not touch this list.
++      const uint64_t hash = XXH3_64bits(TranslatePhysical(pages[i].physical_page), 0x1000);
++      if (hash == pages[i].hash) {
++        ++i;
++        continue;
++      }
++      changed.push_back(pages[i].physical_page);
++      pages[i] = pages.back();
++      pages.pop_back();
++    }
++  }
++  if (changed.empty()) {
++    return;
++  }
++  // The same notification a CPU write to a watched page sends. The GPU side then
++  // re-uploads and watches the page again the next time it uses it.
++  auto global_lock = global_critical_region_.Acquire();
++  for (uint32_t physical_page : changed) {
++    for (auto* callback : physical_memory_invalidation_callbacks_) {
++      callback->first(callback->second, physical_page, 0x1000, true);
++    }
++  }
++}
++#endif  // REX_PLATFORM_SWITCH
++
+ }  // namespace rex::memory
+diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
+index 32264a2..5555adc 100644
+--- a/src/system/xobject.cpp
++++ b/src/system/xobject.cpp
+@@ -33,6 +33,9 @@
+ 
+ REXCVAR_DEFINE_BOOL(switch_stall_report, false, "Kernel",
+                     "Log untimed guest waits that last longer than three seconds");
++REXCVAR_DEFINE_INT32(switch_poll_sleep_us, 100, "Kernel",
++                     "Sleep for guest threads that spin on waits that time out at once; "
++                     "0 keeps yielding");
+ #endif
+ 
+ namespace rex::system {
+@@ -53,6 +56,38 @@ bool IsWaitTimeout(const std::pair<rex::thread::WaitResult, size_t>& result) {
+   return result.first == rex::thread::WaitResult::kTimeout;
+ }
+ 
++/*
++ * Guest threads that poll a wait in a tight loop
++ *
++ * Measured in Project 8's menu: one guest thread at 74% of a core, calling
++ * NtWaitForSingleObjectEx with a timeout that rounds to 0 ms, getting a timeout and
++ * yielding, over and over. A yield on Horizon only gives way to threads of the same
++ * priority on the same core, so the spin keeps its core busy while doing nothing.
++ *
++ * A poll that comes back within 50 us of the previous one, with no work in between,
++ * counts as spinning; after 32 of those in a row the thread sleeps briefly instead.
++ * A worker that checks an event between real pieces of work is never throttled,
++ * because its polls are far apart.
++ */
++void AfterPollTimeout(std::chrono::milliseconds timeout) {
++  thread_local std::chrono::steady_clock::time_point last{};
++  thread_local uint32_t tight = 0;
++  const int32_t sleep_us = REXCVAR_GET(switch_poll_sleep_us);
++  if (timeout.count() != 0 || sleep_us <= 0) {
++    tight = 0;
++    rex::thread::MaybeYield();
++    return;
++  }
++  const auto now = std::chrono::steady_clock::now();
++  tight = (now - last < std::chrono::microseconds(50)) ? tight + 1 : 0;
++  if (tight >= 32) {
++    rex::thread::Sleep(std::chrono::microseconds(sleep_us));
++  } else {
++    rex::thread::MaybeYield();
++  }
++  last = std::chrono::steady_clock::now();
++}
++
+ template <typename WaitFn>
+ auto WaitReportingStall(std::chrono::milliseconds timeout, const XObject* object,
+                         uint32_t count, WaitFn&& wait) {
+@@ -276,7 +311,11 @@ X_STATUS XObject::Wait(uint32_t wait_reason, uint32_t processor_mode, uint32_t a
+       // Or X_STATUS_ALERTED?
+       return X_STATUS_USER_APC;
+     case rex::thread::WaitResult::kTimeout:
++#if REX_PLATFORM_SWITCH
++      AfterPollTimeout(timeout_ms);
++#else
+       rex::thread::MaybeYield();
++#endif
+       return X_STATUS_TIMEOUT;
+     default:
+     case rex::thread::WaitResult::kAbandoned:
+@@ -303,7 +342,11 @@ X_STATUS XObject::SignalAndWait(XObject* signal_object, XObject* wait_object, ui
+       // Or X_STATUS_ALERTED?
+       return X_STATUS_USER_APC;
+     case rex::thread::WaitResult::kTimeout:
++#if REX_PLATFORM_SWITCH
++      AfterPollTimeout(timeout_ms);
++#else
+       rex::thread::MaybeYield();
++#endif
+       return X_STATUS_TIMEOUT;
+     default:
+     case rex::thread::WaitResult::kAbandoned:
+@@ -345,7 +388,11 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+         // Or X_STATUS_ALERTED?
+         return X_STATUS_USER_APC;
+       case rex::thread::WaitResult::kTimeout:
++#if REX_PLATFORM_SWITCH
++        AfterPollTimeout(timeout_ms);
++#else
+         rex::thread::MaybeYield();
++#endif
+         return X_STATUS_TIMEOUT;
+       default:
+       case rex::thread::WaitResult::kAbandoned:
+@@ -374,7 +421,11 @@ X_STATUS XObject::WaitMultiple(uint32_t count, XObject** objects, uint32_t wait_
+         // Or X_STATUS_ALERTED?
+         return X_STATUS_USER_APC;
+       case rex::thread::WaitResult::kTimeout:
++#if REX_PLATFORM_SWITCH
++        AfterPollTimeout(timeout_ms);
++#else
+         rex::thread::MaybeYield();
++#endif
+         return X_STATUS_TIMEOUT;
+       default:
+       case rex::thread::WaitResult::kAbandoned:
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 7c217fb..46ff369 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -72,6 +72,23 @@ REXCVAR_DEFINE_STRING(gpu_plugin, REX_DEFAULT_GPU_PLUGIN, "GPU",
+                       "GPU emulation")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++#if REX_PLATFORM_SWITCH
++#include <rex/ui/switch_apm.h>
++extern "C" u32 __nx_nv_transfermem_size;
++
++REXCVAR_DEFINE_INT32(switch_gpu_mhz, 460, "Switch",
++                     "Handheld GPU clock to request through apm: 0 leaves the system default "
++                     "(307.2 MHz), 384 or 460. Stock profiles games use, not an overclock.");
++REXCVAR_DEFINE_BOOL(switch_allow_ram_1600, false, "Switch",
++                    "Accept a high-GPU profile that also raises the memory clock to 1600 MHz");
++// Off by default: the transfer memory comes out of the capped newlib heap, and
++// 32 MB was enough to make the startup filesystem index fail with bad_alloc.
++REXCVAR_DEFINE_INT32(switch_nvmap_mb, 0, "Switch",
++                     "Transfer memory for the GPU driver's allocation tracking, in MB. libnx "
++                     "gives 8, about 4,000 GPU allocations; running out fails with 0x235C, "
++                     "which looks like running out of memory. 0 keeps the libnx default.");
++#endif
++
+ namespace rex {
+ 
+ // --- ReXApp ---
+@@ -178,6 +195,17 @@ bool ReXApp::SetupEnvironment() {
+   if (std::filesystem::exists(config_path_))
+     rex::cvar::LoadConfig(config_path_);
+ 
++#if REX_PLATFORM_SWITCH
++  // Both must be decided before the GPU driver starts: nvInitialize reads the
++  // transfer memory size when the Vulkan device is created. The clock profile is
++  // requested by the profiler thread after its warm-up (switch_perf.cpp).
++  if (REXCVAR_GET(switch_nvmap_mb) > 0) {
++    __nx_nv_transfermem_size = static_cast<u32>(REXCVAR_GET(switch_nvmap_mb)) << 20;
++  }
++  RexSwitchApmPedirGpuMhz(REXCVAR_GET(switch_gpu_mhz));
++  RexSwitchApmPermitirRam1600(REXCVAR_GET(switch_allow_ram_1600) ? 1 : 0);
++#endif
++
+   // Late-phase logging
+   std::string log_file_cvar = REXCVAR_GET(log_file);
+   std::string log_level_str = REXCVAR_GET(log_level);
+@@ -463,6 +491,28 @@ void ReXApp::LaunchModule() {
+     // Register the achievement notification callback now that the runtime and
+     // KernelState are guaranteed to exist. Done here (not OnCreateDialogs)
+     // because KernelState is null during SetupPresentation.
++#if REX_PLATFORM_SWITCH
++    // Created on the first achievement, not here. A dialog registers itself as a
++    // UI drawer for its whole life, and with any UI drawer registered the presenter
++    // paints from the UI thread and coalesces requests, discarding frames whose GPU
++    // work is already done. nfsmw-nx measured this idle dialog halving presented
++    // frames, about 18 to 9 per second, for the whole session.
++    if (achievement_notification_listener_ == 0 && runtime_ && runtime_->kernel_state()) {
++      achievement_notification_listener_ = achievements().RegisterNotificationCallback(
++          [this](const rex::system::AchievementEvent& event) {
++            rex::system::AchievementEvent copy = event;
++            app_context().CallInUIThreadDeferred([this, copy]() {
++              if (!achievement_notification_) {
++                achievement_notification_ = std::shared_ptr<ui::AchievementNotificationDialog>(
++                    CreateAchievementNotificationDialog());
++              }
++              if (achievement_notification_) {
++                achievement_notification_->Push(copy);
++              }
++            });
++          });
++    }
++#else
+     if (!achievement_notification_) {
+       achievement_notification_ =
+           std::shared_ptr<ui::AchievementNotificationDialog>(CreateAchievementNotificationDialog());
+@@ -477,6 +527,7 @@ void ReXApp::LaunchModule() {
+             }
+           });
+     }
++#endif
+ 
+     OnPreLaunchModule();
+ 
+diff --git a/src/ui/runtime_switch.cpp b/src/ui/runtime_switch.cpp
+index 1581dc1..53c6507 100644
+--- a/src/ui/runtime_switch.cpp
++++ b/src/ui/runtime_switch.cpp
+@@ -58,9 +58,11 @@ namespace {
+ 
+ __attribute__((constructor(101))) void RexSwitchInstallTerminate() {
+   std::set_terminate(RexSwitchTerminate);
+-#if defined(REX_SWITCH_NXVK)
+-  // This local NVK diagnostic has no Horizon file-locking backend.
++  // Mesa's disk shader cache only duplicates the runtime's own pipeline cache,
++  // on the SD card, from threads with 8 MB stacks (nfsmw-nx turns it off by
++  // default too). The NXVK build also has no Horizon file-locking backend for it.
+   setenv("MESA_SHADER_CACHE_DISABLE", "1", 0);
++#if defined(REX_SWITCH_NXVK)
+   // The pinned experimental NVK build refuses device creation without an
+   // explicit opt-in; this is scoped to the local driver path.
+   setenv("NVK_I_WANT_A_BROKEN_VULKAN_DRIVER", "1", 0);
+diff --git a/src/ui/switch_apm.cpp b/src/ui/switch_apm.cpp
+new file mode 100644
+index 0000000..e4f42b1
+--- /dev/null
++++ b/src/ui/switch_apm.cpp
+@@ -0,0 +1,355 @@
++/*
++ * Console performance profile (apm). Imported from nfsmw-nx (BSD-3-Clause SDK layer).
++ *
++ * Why
++ *   The GPU runs at 307.2 MHz in handheld mode and it is one of the two walls of the port (the other
++ *   is the CPU, with three cores at 85-99 %). Nintendo later released the 460.8 MHz handheld profile
++ *   precisely for games that need it, and this one does: 25 FPS with the GPU at its limit. It is not
++ *   an overclock: no KIP or sysmodule is touched, it is requested through Horizon's official API
++ *   (apm), the same one any commercial game uses. That is why not every game requests it: those that
++ *   do not need it get longer battery life.
++ *
++ *   307.2 -> 460.8 MHz is +50 % of GPU.
++ *
++ * Memory is not touched
++ *   The first version raised the memory from 1331.2 to 1597.5 MHz by accident: apm does not take MHz,
++ *   it takes a configuration number, and the high-GPU configurations come in two flavors, with EMC
++ *   1331.2 and with EMC 1600. The 1600 one got in. A clock overlay showed it, and a commercial game
++ *   runs at GPU 460.8 with MEM 1331.2: so that combination exists and it is the one we want.
++ *
++ *   Raising the memory clock uses more battery and heat without giving us anything: our own
++ *   measurements say bandwidth is at 27 % and what saturates is the fragment ALU.
++ *
++ * The three rounds it took, and what each one taught
++ *
++ *   1. It applied the configuration and read the clocks on the next line. The log said "la
++ *      memoria se queda en 1331.2" and the session profile recorded 1600.0 in every sample. They
++ *      did not contradict each other: it was checked too early. apm hands the change to pcv and
++ *      the clocks are applied later, so the immediate read returned the old value. The same bug
++ *      left dead a fix that only lowered the EMC by hand "if it is detected that it went up": it
++ *      was never detected.
++ *
++ *   2. A 250 ms wait plus a once-per-second watchdog that lowered the EMC with clkrst. The log said
++ *      the two things that needed knowing:
++ *        - after 250 ms the memory was still at 1331.2 (so the raise takes between 0.25 and ~1 s,
++ *          and 250 ms was not enough either);
++ *        - the watchdog found it at 1600 and lowered it eight times with clkrst; all eight were
++ *          accepted and all eight were reverted by the system. pcv reimposes the EMC of the active
++ *          apm configuration, and clkrst cannot fight that.
++ *
++ *   3. So the problem was never how to lower the memory, but which configuration is requested.
++ *      0x92220007 is "GPU 460.8 + EMC 1600", and its sibling 0x92220008 is "GPU 460.8 + EMC
++ *      1331.2": that is the right one, and it was missing from the list (a nonexistent 0x92220006
++ *      was there instead). Now:
++ *        1. the table has the real IDs, sorted with the low EMC first;
++ *        2. the check is a 1.5 s poll (MemoriaQuietaDurante), not a single read;
++ *        3. the watchdog stays as a safety net, in case the system reimposes the EMC on a mode
++ *           change or when waking from sleep.
++ *
++ *   It only ever lowers back to what the console had at the start: nothing is ever raised above
++ *   that. And if this firmware did not have the "high GPU + unchanged RAM" pair, the GPU is left
++ *   as it was rather than raising the RAM; switch_allow_ram_1600 opts into that trade.
++ */
++
++#include "rex/ui/switch_apm.h"
++
++#if REX_PLATFORM_SWITCH
++
++#include <switch.h>
++
++#include <atomic>
++#include <cstdio>
++
++namespace {
++
++std::atomic<int> g_pedido{0};
++std::atomic<bool> g_hecho{false};
++/*
++ * The escape hatch. By default no configuration that raises the RAM clock is accepted, even if that
++ * means staying with the low GPU clock. If the firmware turned out not to have the "high GPU +
++ * unchanged RAM" pair, setting this to true takes the RAM 1600 one anyway.
++ */
++std::atomic<bool> g_permitir_ram_1600{false};
++
++/*
++ * Watchdog state. g_emc_original is the memory clock the console had before we touched anything, in
++ * Hz, and it is 0 while we have not changed the configuration: with 0 the watchdog does nothing at
++ * all (it does not even open clkrst).
++ */
++std::atomic<u32> g_emc_original{0};
++std::atomic<int> g_tics_emc{0};
++std::atomic<int> g_correcciones_emc{0};
++std::atomic<bool> g_aviso_emc{false};
++std::atomic<bool> g_rendido_emc{false};
++
++/*
++ * How often the watchdog looks. For the first kTicsSeguidos ticks (one second each) it always looks,
++ * which is when the system finishes applying the change (the profile already saw 1600 in its first
++ * sample, at 8 s). From then on, one of every kTicsEspaciados, to catch late raises (mode change,
++ * waking from sleep) without opening clkrst every second for the whole session.
++ */
++constexpr int kTicsSeguidos = 20;
++constexpr int kTicsEspaciados = 30;
++/*
++ * And a cap on corrections. Measured: eight clkrst reductions were all accepted and all reverted by
++ * pcv, which reimposes the EMC of the active apm configuration. With the corrected table this should
++ * never fire; if it does, the chosen configuration is not the one we thought, and insisting fixes
++ * nothing. It is logged and left alone.
++ */
++constexpr int kMaxCorreccionesEmc = 3;
++
++/*
++ * What is watched after requesting the configuration, before accepting anything.
++ *
++ * Waiting 250 ms was still not enough: the log said "la memoria se queda en 1331.2 MHz (comprobado
++ * 250 ms despues)" and one second later the watchdog already found it at 1600. So the raise takes
++ * between 0.25 and ~1 s. Now it polls every 150 ms for 1.5 s, and a single read that sees it moved
++ * is enough to reject the configuration. It only costs that second and a half when the candidate is
++ * good; when it is bad it stops as soon as it shows.
++ */
++constexpr u64 kSondeoPasoNs = 150000000ULL;
++constexpr int kSondeoPasos = 10;  // 10 x 150 ms = 1,5 s
++constexpr u32 kMargenHz = 20000000u;  // 20 MHz: 1597.5 and 1331.2 are nowhere near each other
++
++/*
++ * Real hardware clocks, in Hz. Returns false if clkrst is not available. It is opened and closed on
++ * every call on purpose: this runs only a few times per session.
++ */
++bool LeerRelojes(u32& gpu_hz, u32& emc_hz) {
++  gpu_hz = 0;
++  emc_hz = 0;
++  if (R_FAILED(clkrstInitialize())) {
++    return false;
++  }
++  bool ok = true;
++  ClkrstSession ses_gpu{};
++  ClkrstSession ses_emc{};
++  if (R_SUCCEEDED(clkrstOpenSession(&ses_gpu, PcvModuleId_GPU, 3))) {
++    if (R_FAILED(clkrstGetClockRate(&ses_gpu, &gpu_hz))) ok = false;
++    clkrstCloseSession(&ses_gpu);
++  } else {
++    ok = false;
++  }
++  if (R_SUCCEEDED(clkrstOpenSession(&ses_emc, PcvModuleId_EMC, 3))) {
++    if (R_FAILED(clkrstGetClockRate(&ses_emc, &emc_hz))) ok = false;
++    clkrstCloseSession(&ses_emc);
++  } else {
++    ok = false;
++  }
++  clkrstExit();
++  return ok;
++}
++
++/*
++ * Polls the clocks for kSondeoPasos x kSondeoPasoNs and returns true if the memory clock stayed where
++ * it was the whole time. As soon as one read sees it moved, it stops and returns false, leaving the
++ * last values read in gpu/emc. A single read is not enough: one read at 250 ms said the memory was
++ * unchanged when it was about to go up a moment later.
++ */
++bool MemoriaQuietaDurante(u32 emc0, u32& gpu, u32& emc) {
++  for (int i = 0; i < kSondeoPasos; ++i) {
++    svcSleepThread(kSondeoPasoNs);
++    if (!LeerRelojes(gpu, emc)) {
++      return false;
++    }
++    if ((emc > emc0 ? emc - emc0 : emc0 - emc) > kMargenHz) {
++      return false;
++    }
++  }
++  return true;
++}
++
++/*
++ * Sets the memory module clock to hz. Returns whether the request was accepted (not whether the clock
++ * already changed: that is checked later, which is exactly the lesson of the first attempt).
++ */
++bool FijarMemoria(u32 hz) {
++  bool ok = false;
++  if (R_SUCCEEDED(clkrstInitialize())) {
++    ClkrstSession ses{};
++    if (R_SUCCEEDED(clkrstOpenSession(&ses, PcvModuleId_EMC, 3))) {
++      ok = R_SUCCEEDED(clkrstSetClockRate(&ses, hz));
++      clkrstCloseSession(&ses);
++    }
++    clkrstExit();
++  }
++  return ok;
++}
++
++struct Candidata {
++  int mhz;
++  uint32_t config;
++  int emc;  // log only: what Horizon's table says this configuration sets
++};
++/*
++ * The correct table. The first two are confirmed by a console log:
++ *
++ *   0x00020003  GPU 307.2  EMC 1331.2   <- "de partida: config 0x00020003 ... memoria 1331.2"
++ *   0x92220007  GPU 460.8  EMC 1600     <- "PUESTA 0x92220007" and the memory ended at 1600
++ *
++ * and they match Horizon's PerformanceConfiguration table exactly. The one we want is the sibling of
++ * the last one, 0x92220008 = GPU 460.8 with EMC 1331.2, which is exactly the pair a commercial game
++ * uses. An earlier list lacked it (it had 0x92220006, which does not exist), so the 1600 one always
++ * got in.
++ *
++ * They are sorted by EMC: first the one that does not touch the memory. Requesting one that does not
++ * exist returns an error and changes nothing, so it is enough to list them and let the check decide.
++ */
++constexpr Candidata kCandidatas[] = {
++    {460, 0x92220008u, 1331},  // GPU 460,8 + EMC 1331,2: la buena
++    {460, 0x92220007u, 1600},  // GPU 460.8 + EMC 1600: raises the RAM clock
++    {384, 0x00020004u, 1331},  // GPU 384 + EMC 1331,2
++    {384, 0x00010000u, 1600},  // GPU 384 + EMC 1600
++};
++
++
++}  // namespace
++
++extern "C" void RexSwitchApmPedirGpuMhz(int mhz) {
++  g_pedido.store(mhz, std::memory_order_relaxed);
++}
++
++extern "C" void RexSwitchApmPermitirRam1600(int permitir) {
++  g_permitir_ram_1600.store(permitir != 0, std::memory_order_relaxed);
++}
++
++extern "C" void RexSwitchApmAplicar(void) {
++  const int mhz = g_pedido.load(std::memory_order_relaxed);
++  if (mhz <= 0 || g_hecho.exchange(true)) {
++    return;
++  }
++
++  ApmPerformanceMode modo = ApmPerformanceMode_Invalid;
++  if (R_FAILED(apmGetPerformanceMode(&modo))) {
++    std::fprintf(stderr, "[apm] no se pudo leer el modo de rendimiento; no se toca nada\n");
++    return;
++  }
++  if (modo != ApmPerformanceMode_Normal) {
++    std::fprintf(stderr, "[apm] la consola esta en sobremesa (modo %d): no se pide nada\n", int(modo));
++    return;
++  }
++
++  uint32_t config_original = 0;
++  const bool hay_original = R_SUCCEEDED(apmGetPerformanceConfiguration(modo, &config_original));
++
++  u32 gpu0 = 0, emc0 = 0;
++  if (!LeerRelojes(gpu0, emc0)) {
++    std::fprintf(stderr,
++                 "[apm] no se pueden leer los relojes reales (clkrst): NO se cambia nada, porque sin "
++                 "comprobar no se puede garantizar que la memoria se quede donde esta\n");
++    return;
++  }
++  std::fprintf(stderr, "[apm] de partida: config 0x%08X, GPU %.1f MHz, memoria %.1f MHz\n",
++               hay_original ? config_original : 0u, double(gpu0) / 1e6, double(emc0) / 1e6);
++
++  const u32 objetivo_gpu_hz = u32(mhz) * 1000000u;
++
++  /*
++   * They are tried in table order (low EMC first) and the first one that raises the GPU without
++   * moving the memory is accepted. The check is the 1.5 s poll, not a single read: a read at 250 ms
++   * once said the memory was still at 1331.2, and one second later it was at 1600.
++   */
++  for (const Candidata& c : kCandidatas) {
++    if (c.mhz != mhz) {
++      continue;
++    }
++    if (R_FAILED(apmSetPerformanceConfiguration(modo, c.config))) {
++      continue;  // that configuration does not exist on this firmware
++    }
++    u32 gpu1 = 0, emc1 = 0;
++    const bool quieta_de_verdad = MemoriaQuietaDurante(emc0, gpu1, emc1);
++    const bool memoria_quieta =
++        quieta_de_verdad || g_permitir_ram_1600.load(std::memory_order_relaxed);
++    const bool gpu_subio = gpu1 + kMargenHz >= objetivo_gpu_hz;
++    if (gpu_subio && memoria_quieta) {
++      if (!quieta_de_verdad) {
++        std::fprintf(stderr,
++                     "[apm] 0x%08X sube la memoria a %.1f MHz, pero switch_allow_ram_1600 esta en "
++                     "true: se acepta y NO se vigila la memoria\n",
++                     c.config, double(emc1) / 1e6);
++        std::fprintf(stderr, "[apm] PUESTA 0x%08X: GPU %.1f MHz (era %.1f), memoria %.1f MHz\n",
++                     c.config, double(gpu1) / 1e6, double(gpu0) / 1e6, double(emc1) / 1e6);
++        return;  // watchdog not armed: lowering it would fight what the cvar asks for
++      }
++      /*
++       * Accepted. The watchdog is armed anyway: the system may reimpose the EMC later,
++       * on a mode change or when waking from sleep.
++       */
++      g_emc_original.store(emc0, std::memory_order_relaxed);
++      std::fprintf(stderr,
++                   "[apm] PUESTA la configuracion 0x%08X (tabla: GPU %d, EMC %d): GPU %.1f MHz (era "
++                   "%.1f) y la memoria se queda en %.1f MHz, comprobada durante %.1f s seguidos; "
++                   "queda vigilada\n",
++                   c.config, c.mhz, c.emc, double(gpu1) / 1e6, double(gpu0) / 1e6,
++                   double(emc1) / 1e6, double(kSondeoPasoNs) * kSondeoPasos / 1e9);
++      return;
++    }
++    std::fprintf(stderr, "[apm] descartada 0x%08X: GPU %.1f MHz, memoria %.1f MHz (%s)\n", c.config,
++                 double(gpu1) / 1e6, double(emc1) / 1e6,
++                 !gpu_subio ? "la GPU no sube lo pedido" : "MUEVE LA MEMORIA");
++  }
++
++  /*
++   * None worked. The memory is not lowered by hand: that was tried eight times with clkrst, all
++   * eight were accepted and all eight were reverted by the system in under a second. pcv reimposes
++   * the EMC of the active apm configuration, and clkrst cannot fight that.
++   *
++   * So the console is left as it was, and the log says exactly what trade is available and how to
++   * take it (nfsmw_switch_ram_1600).
++   */
++  if (hay_original && R_SUCCEEDED(apmSetPerformanceConfiguration(modo, config_original))) {
++    u32 gpu2 = 0, emc2 = 0;
++    MemoriaQuietaDurante(emc0, gpu2, emc2);
++    std::fprintf(stderr,
++                 "[apm] este firmware NO tiene ninguna configuracion de %d MHz que deje la memoria "
++                 "en %.1f MHz; se vuelve a la original 0x%08X (GPU %.1f MHz, memoria %.1f MHz).\n"
++                 "[apm] SI PREFIERES LA GPU ALTA AUNQUE LA RAM SUBA A 1600: pon "
++                 "switch_allow_ram_1600 = true en el .toml del juego\n",
++                 mhz, double(emc0) / 1e6, config_original, double(gpu2) / 1e6, double(emc2) / 1e6);
++  } else {
++    std::fprintf(stderr, "[apm] ninguna configuracion de %d MHz sirvio y NO se pudo restaurar la "
++                         "original: revisa los relojes en el overlay\n",
++                 mhz);
++  }
++}
++
++extern "C" void RexSwitchApmVigilar(void) {
++  const u32 emc0 = g_emc_original.load(std::memory_order_relaxed);
++  if (emc0 == 0 || g_rendido_emc.load(std::memory_order_relaxed)) {
++    return;  // nothing changed, or we already know this firmware does not allow it
++  }
++
++  const int tic = g_tics_emc.fetch_add(1, std::memory_order_relaxed);
++  if (tic >= kTicsSeguidos && (tic % kTicsEspaciados) != 0) {
++    return;
++  }
++
++  u32 gpu = 0, emc = 0;
++  if (!LeerRelojes(gpu, emc) || emc <= emc0 + kMargenHz) {
++    return;  // where it should be
++  }
++
++  /* It moved: the configuration raised it after we checked. */
++  const bool bajada = FijarMemoria(emc0);
++  const int n = g_correcciones_emc.fetch_add(1, std::memory_order_relaxed) + 1;
++  if (!g_aviso_emc.exchange(true)) {
++    std::fprintf(stderr,
++                 "[apm] la memoria habia subido sola a %.1f MHz (t=%d s): se baja a %.1f con clkrst "
++                 "(%s)\n",
++                 double(emc) / 1e6, tic, double(emc0) / 1e6, bajada ? "aceptado" : "RECHAZADO");
++  }
++  if (!bajada || n >= kMaxCorreccionesEmc) {
++    g_rendido_emc.store(true, std::memory_order_relaxed);
++    std::fprintf(stderr,
++                 "[apm] se deja de insistir con la memoria tras %d intento(s): este firmware la "
++                 "reimpone. La GPU se queda en lo pedido; la RAM, en lo que mande el sistema\n",
++                 n);
++  }
++}
++
++#else   // !REX_PLATFORM_SWITCH
++extern "C" void RexSwitchApmPedirGpuMhz(int) {}
++extern "C" void RexSwitchApmPermitirRam1600(int) {}
++extern "C" void RexSwitchApmAplicar(void) {}
++extern "C" void RexSwitchApmVigilar(void) {}
++#endif  // REX_PLATFORM_SWITCH
+diff --git a/src/ui/switch_perf.cpp b/src/ui/switch_perf.cpp
+new file mode 100644
+index 0000000..1ffff27
+--- /dev/null
++++ b/src/ui/switch_perf.cpp
+@@ -0,0 +1,1104 @@
++/**
++ * @file        switch_perf.cpp
++ * @brief       Performance measurement on the console, without a debugger
++ *
++ * The first boot that reached the title screen ran at 5-10 fps, with two cores at 97% and the
++ * GPU at 99.7% according to the Horizon OC monitor. That does not tell what to optimize: it takes
++ * knowing which thread spends the CPU and in which function. Horizon has no perf and no debugger
++ * on a retail console, so it is measured from inside. Every 10 s a report is appended to
++ * <NRO folder>/logs/rex/rex_perfil.log:
++ *
++ *  - Game FPS: guest presents (IssueSwap).
++ *  - Faults per second by type: each one costs an exception, or two with the resume through the
++ *    kernel.
++ *  - Exact CPU of each thread: the kernel keeps each thread's CPU time (svcGetInfo with
++ *    InfoType_ThreadTickCount, 13.0.0+), with its priority, its preferred core and its core mask.
++ *  - Where it is spent: sampling at 1 kHz. A high-priority thread pauses a busy thread
++ *    (svcSetThreadActivity), reads its pc, its lr and its stack through the x29 chain
++ *    (svcGetThreadContext3) and resumes it. The stacks also tell what a thread stopped in the
++ *    kernel is waiting for. Addresses come out as image+0x...; they are translated with addr2line
++ *    on the ELF.
++ *
++ * Threads: by wrapping libnx's threadCreate and threadClose (--wrap in rexglue_switch.cmake). Every
++ * thread goes through there, pthread ones included, so Mesa's and the SDK's show up too. The name
++ * comes from pthread_setname_np (switch_libc_supplement.c).
++ *
++ * libnx calls: also with --wrap, the calls that cost IPC or walk memory are counted, along with the
++ * time the calling thread spends inside: fences (zero-timeout queries and waits), submission
++ * kickoffs, new NvMaps (with and without CPU cache), GPU addresses and mappings, armDCacheClean, the
++ * window queue and svcSleepThread. Every fence query is at least one ioctl even when the GPU has
++ * already finished (see docs/platform-notes.md), so the count per second is needed before changing
++ * anything.
++ *
++ * Careful with the pause: while a thread is paused nothing is done that could take a lock (no
++ * malloc, no stdio): if the paused thread held it, this one would wait forever. Between pause and
++ * resume there are only system calls. If pausing fails (for example because the SDK had already
++ * suspended the thread) it is left alone: resuming it would break that suspension.
++ *
++ * It goes in the executable (rexglue_switch_startup): the SDK calls RexSwitchPerfCount from
++ * libraries, and the wrappers have to be defined before libnx.a enters the link.
++ */
++
++#include <algorithm>
++#include <atomic>
++#include <cinttypes>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include <switch.h>
++
++#include "rex/ui/switch_apm.h"
++#include "rex/ui/switch_saltynx.h"
++
++extern "C" {
++void _start(void);
++/* rexglue log folder, ending in '/' (switch_crash_hooks.c). */
++const char* RexSwitchLogDir(void);
++/*
++ * From the guest memory core (guest_memory_switch.cpp): how much backing is
++ * committed and how much is mapped in total, counting the 360 mirrors.
++ */
++size_t RexGmCommittedBytes(void);
++size_t RexGmMappedBytes(void);
++/* 0 = sin probar, 1 = permisos (paginas vigiladas legibles), 2 = desmapeo. */
++int RexGmModoProteccion(void);
++Result __real_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_mem,
++                           size_t stack_sz, int prio, int cpuid);
++Result __real_threadClose(Thread* t);
++Result __real_nvFenceWait(NvFence* f, s32 timeout_us);
++Result __real_nvGpuChannelKickoff(NvGpuChannel* c);
++Result __real_nvMapCreate(NvMap* m, void* cpu_addr, u32 size, u32 align, NvKind kind, bool is_cpu_cacheable);
++Result __real_nvAddressSpaceAllocFixed(NvAddressSpace* a, bool sparse, u64 size, iova_t iova);
++Result __real_nvioctlNvhostAsGpu_MapBufferEx(u32 fd, u32 flags, u32 kind, u32 nvmap_handle, u32 page_size,
++                                             u64 buffer_offset, u64 mapping_size, u64 input_offset, u64* offset);
++void __real_armDCacheClean(void* addr, size_t size);
++Result __real_nwindowQueueBuffer(NWindow* nw, s32 slot, const NvMultiFence* fence);
++Result __real_bqDequeueBuffer(Binder* b, bool async, u32 width, u32 height, s32 format, u32 usage, s32* buf,
++                              NvMultiFence* fence);
++void __real_svcSleepThread(s64 nano);
++}
++
++namespace {
++
++constexpr size_t kMaxThreads = 160;
++constexpr u64 kSampleIntervalNs = 1000000ULL;  // 1 ms
++constexpr u64 kSegundoNs = 1000000000ULL;      // tick for the console overlays
++
++/* internal resolution published to the overlays. The game sets it when choosing the video mode. */
++std::atomic<uint32_t> g_resolucion{(1280u << 16) | 720u};
++constexpr u64 kPassiveIntervalNs = 100000000ULL;  // 100 ms, without pausing threads
++// Next to the rexglue logs, in <NRO folder>/logs/rex/.
++std::string StackFlagPath() {
++  return std::string(RexSwitchLogDir()) + "perfil_pilas.flag";
++}
++constexpr u64 kReportSeconds = 10;
++/*
++ * Let the game start first. This only delays stack sampling and the first report, which read the
++ * SD and pause threads. The console overlays (FPS and resolution) are published from second zero:
++ * see the warm-up loop in ProfilerMain.
++ */
++constexpr u64 kStartDelayNs = 8000000000ULL;
++constexpr size_t kMaxSamples = 1 << 15;
++constexpr size_t kFrames = 10;
++constexpr unsigned kCounterCount = 35;  // 33 = hot pages unwatched, 34 = unwatch refused
++// In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
++std::string ReportPath() {
++  return std::string(RexSwitchLogDir()) + "rex_perfil.log";
++}
++
++struct Slot {
++  std::atomic<u32> handle{0};
++  char name[32]{};
++  // Only the profiler thread touches these:
++  u32 seen = 0;
++  u64 last_ticks = 0;
++  bool busy = true;
++  double cpu = 0.0;
++};
++Slot g_slots[kMaxThreads];
++
++struct Sample {
++  u64 pc;
++  u64 lr;
++  u64 frames[kFrames];  // return addresses along the x29 chain
++  u16 slot;
++  u64 tick;  // when it was taken (armGetSystemTick), to separate those from long frames
++};
++
++/*
++ * Long frame windows. The renderer calls RexSwitchPerfTiron with the interval of every frame over
++ * 45 ms; the report separates the samples taken inside those intervals and says what each thread was
++ * doing right then (section "durante los tirones"). Only works with perfil_pilas.flag.
++ */
++constexpr size_t kMaxTirones = 256;
++struct VentanaTiron {
++  u64 inicio;
++  u64 fin;
++};
++VentanaTiron g_tirones[kMaxTirones];
++std::atomic<u32> g_num_tirones{0};
++Sample g_samples[kMaxSamples];
++size_t g_sample_count = 0;
++
++std::atomic<u64> g_counters[kCounterCount];
++
++/*
++ * Wrapped libnx calls (see the file header): how many, how much time inside and, where it makes
++ * sense, how many bytes. They are constant-initialized, so they are valid even if someone calls
++ * before the constructors.
++ */
++enum : unsigned {
++  kFenceConsulta,     // nvFenceWait con espera 0
++  kFenceEspera,       // nvFenceWait con espera
++  kKickoff,           // nvGpuChannelKickoff
++  kNvMapCacheada,     // nvMapCreate with CPU cache
++  kNvMapSinCache,     // nvMapCreate without CPU cache
++  kReservaDireccion,  // nvAddressSpaceAllocFixed
++  kMapeoGpu,          // nvioctlNvhostAsGpu_MapBufferEx
++  kCacheClean,        // armDCacheClean
++  kQueueBuffer,       // nwindowQueueBuffer
++  kDequeueBuffer,     // bqDequeueBuffer
++  kSleep0,            // svcSleepThread(0)
++  kSleepCeder,        // svcSleepThread(-1 o -2)
++  kSleepCorto,        // up to 1 ms
++  kSleepLargo,        // over 1 ms
++  kLlamadasCount,
++};
++struct Llamadas {
++  std::atomic<u64> n{0};
++  std::atomic<u64> ticks{0};
++  std::atomic<u64> bytes{0};
++};
++Llamadas g_llamadas[kLlamadasCount];
++
++inline void Anotar(unsigned id, u64 desde, u64 bytes = 0) {
++  const u64 ticks = armGetSystemTick() - desde;
++  Llamadas& l = g_llamadas[id];
++  l.n.fetch_add(1, std::memory_order_relaxed);
++  l.ticks.fetch_add(ticks, std::memory_order_relaxed);
++  if (bytes) {
++    l.bytes.fetch_add(bytes, std::memory_order_relaxed);
++  }
++}
++
++/*
++ * Automatic A/B tests. Each report (10 s) removes one part of the GPU work: those commands (draw or
++ * dispatch) stop being recorded, but everything else stays the same, so the state does not break.
++ * The image looks wrong while the mode lasts; that is expected. If with "sin nada" it is just as
++ * slow, the cost is not in the work but in something fixed (submissions, driver).
++ */
++struct Mode {
++  u32 mask;
++  const char* name;
++};
++constexpr Mode kModes[] = {
++    {0, "normal"},
++    {1, "sin dibujados"},
++    {2, "sin transferencias"},
++    {4, "sin resolves"},
++    {8, "sin cargas de texturas"},
++    {16, "sin efecto de presentacion"},
++    {32, "sin despacho por baldosas"},
++    {63, "sin nada"},
++};
++constexpr size_t kModeCount = sizeof(kModes) / sizeof(kModes[0]);
++
++/*
++ * A/B tests, started by hand
++ *
++ * They used to be enabled with this constant and rotate on their own from startup. That is no good:
++ * the game takes a while to reach a race, and on the way it spent its time in modes with drawing
++ * turned off. Once they were left on by mistake and the game did not even reach the title screen.
++ *
++ * Now the player starts the rotation with L+R+ZL from inside the race, which is the only place where
++ * the measurement is useful. From then on it removes one part of the GPU work per report, goes once
++ * through the eight modes and returns to "normal".
++ *
++ * How to read it. If with "sin nada" the game is just as slow, the cost is not in the GPU work but
++ * in something fixed: submissions, the driver, or the guest itself. If FPS shoots up, the mode where
++ * it rises most points to the culprit.
++ */
++std::atomic<bool> g_ab_activas{false};
++std::atomic<u32> g_skip_mask{0};
++
++extern "C" void RexSwitchPerfToggleAb(void) {
++  const bool nuevo = !g_ab_activas.load(std::memory_order_relaxed);
++  g_ab_activas.store(nuevo, std::memory_order_relaxed);
++  if (!nuevo) {
++    g_skip_mask.store(0, std::memory_order_relaxed);
++  }
++}
++
++/*
++ * Horizon limits how much memory a process may map (LimitableResource_Memory). Our
++ * guest memory model maps each chunk several times (the shadow and once per 360
++ * view), so that limit is the real ceiling, not free memory. When it runs out,
++ * even committing 4 KB fails with 2001-0103 (resource exhausted).
++ */
++void LimiteDeMapeo(u64* usado_mb, u64* tope_mb, u64* proceso_mb, u64* total_mb) {
++  *usado_mb = *tope_mb = *proceso_mb = *total_mb = 0;
++  u64 v = 0;
++  if (R_SUCCEEDED(svcGetInfo(&v, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0))) {
++    *proceso_mb = v >> 20;
++  }
++  if (R_SUCCEEDED(svcGetInfo(&v, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0))) {
++    *total_mb = v >> 20;
++  }
++  Handle reslimit = INVALID_HANDLE;
++  if (R_FAILED(svcGetInfo(&v, InfoType_ResourceLimit, CUR_PROCESS_HANDLE, 0))) {
++    return;
++  }
++  reslimit = static_cast<Handle>(v);
++  s64 actual = 0, tope = 0;
++  if (R_SUCCEEDED(svcGetResourceLimitCurrentValue(&actual, reslimit, LimitableResource_Memory))) {
++    *usado_mb = static_cast<u64>(actual) >> 20;
++  }
++  if (R_SUCCEEDED(svcGetResourceLimitLimitValue(&tope, reslimit, LimitableResource_Memory))) {
++    *tope_mb = static_cast<u64>(tope) >> 20;
++  }
++  svcCloseHandle(reslimit);
++}
++
++u64 g_base = 0, g_text_lo = 0, g_text_hi = 0;
++Thread g_thread;
++
++void Register(Handle h) {
++  if (!h) {
++    return;
++  }
++  for (auto& s : g_slots) {
++    u32 expected = 0;
++    if (s.handle.compare_exchange_strong(expected, h)) {
++      s.name[0] = 0;
++      return;
++    }
++  }
++}
++
++void Unregister(Handle h) {
++  if (!h) {
++    return;
++  }
++  for (auto& s : g_slots) {
++    u32 expected = h;
++    if (s.handle.compare_exchange_strong(expected, 0)) {
++      return;
++    }
++  }
++}
++
++bool InText(u64 addr) { return addr >= g_text_lo && addr < g_text_hi; }
++
++void PrintAddr(FILE* f, u64 addr) {
++  if (InText(addr)) {
++    std::fprintf(f, "imagen+0x%" PRIx64, addr - g_base);
++  } else {
++    std::fprintf(f, "0x%016" PRIx64, addr);
++  }
++}
++
++/*
++ * Is the pc right after a system call? Then the thread is waiting in the kernel,
++ * not using CPU.
++ */
++bool AfterSvc(u64 pc) {
++  if (!InText(pc) || pc < g_text_lo + 4) {
++    return false;
++  }
++  const u32 insn = *reinterpret_cast<const u32*>(pc - 4);
++  return (insn & 0xFFE0001Fu) == 0xD4000001u;
++}
++
++struct Count {
++  u64 addr;
++  u32 n;
++};
++
++std::vector<Count> Histogram(std::vector<u64>& addrs) {
++  std::sort(addrs.begin(), addrs.end());
++  std::vector<Count> out;
++  for (u64 a : addrs) {
++    if (out.empty() || out.back().addr != a) {
++      out.push_back({a, 1});
++    } else {
++      ++out.back().n;
++    }
++  }
++  std::sort(out.begin(), out.end(), [](const Count& x, const Count& y) { return x.n > y.n; });
++  return out;
++}
++
++void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
++            const char* mode) {
++  const double seconds = double(elapsed_ticks) / double(tick_freq);
++
++  u64 counters_now[kCounterCount];
++  for (unsigned i = 0; i < kCounterCount; ++i) {
++    counters_now[i] = g_counters[i].load(std::memory_order_relaxed);
++  }
++
++  // CPU of each thread over the interval, as % of one core.
++  std::vector<size_t> order;
++  for (size_t i = 0; i < kMaxThreads; ++i) {
++    Slot& s = g_slots[i];
++    const u32 h = s.handle.load();
++    if (!h) {
++      s.seen = 0;
++      continue;
++    }
++    u64 ticks = 0;
++    if (R_FAILED(svcGetInfo(&ticks, InfoType_ThreadTickCount, h, UINT64_MAX))) {
++      continue;
++    }
++    if (s.seen != h) {  // new thread: no interval yet
++      s.seen = h;
++      s.last_ticks = ticks;
++      s.busy = true;
++      s.cpu = 0.0;
++      continue;
++    }
++    s.cpu = double(ticks - s.last_ticks) * 100.0 / double(elapsed_ticks);
++    s.last_ticks = ticks;
++    /*
++     * All threads are sampled, including those that use no CPU. In a hang caused by
++     * a wait, the thread that matters is exactly that one: the stopped one.
++     */
++    s.busy = true;
++    order.push_back(i);
++  }
++  std::sort(order.begin(), order.end(),
++            [](size_t a, size_t b) { return g_slots[a].cpu > g_slots[b].cpu; });
++
++  FILE* f = std::fopen(ReportPath().c_str(), "a");
++  if (!f) {
++    g_sample_count = 0;
++    return;
++  }
++
++  u64 lim_usado = 0, lim_tope = 0, proc_usado = 0, proc_total = 0;
++  LimiteDeMapeo(&lim_usado, &lim_tope, &proc_usado, &proc_total);
++
++  double total_cpu = 0.0;
++  for (size_t i : order) {
++    total_cpu += g_slots[i].cpu;
++  }
++  std::fprintf(f,
++               "==== %.1f s | modo: %s | juego %.1f fps | CPU total %.0f%% (400%% = 4 nucleos) | fallos/s: "
++               "lectura emulada %.0f, paginas calientes liberadas %.0f, no liberadas %.0f, manejador SDK %.0f, reintento emulado %.0f, SEH %.0f, "
++               "fisica confirmada %.0f, vistas %.0f | invitado %zu/%zu MB (respaldo/mapeado) | "
++               "limite de mapeo %llu/%llu MB, proceso %llu/%llu MB | "
++               "muestras %zu | vigilancia: %s | samplers: %.0f nuevos/s, %.0f parones/s\n",
++               seconds, mode, double(counters_now[0] - counters_last[0]) / seconds, total_cpu,
++               double(counters_now[1] - counters_last[1]) / seconds,
++               double(counters_now[33] - counters_last[33]) / seconds,
++               double(counters_now[34] - counters_last[34]) / seconds,
++               double(counters_now[2] - counters_last[2]) / seconds,
++               double(counters_now[3] - counters_last[3]) / seconds,
++               double(counters_now[4] - counters_last[4]) / seconds,
++               double(counters_now[17] - counters_last[17]) / seconds,
++               double(counters_now[18] - counters_last[18]) / seconds,
++               RexGmCommittedBytes() >> 20, RexGmMappedBytes() >> 20,
++               (u64)lim_usado, (u64)lim_tope, (u64)proc_usado, (u64)proc_total, g_sample_count,
++                (RexGmModoProteccion() == 1   ? "permisos (paginas legibles)"
++                 : RexGmModoProteccion() == 2 ? "desmapeo (cada lectura falla)"
++                                              : "sin probar"),
++                double(counters_now[20] - counters_last[20]) / seconds,
++                double(counters_now[19] - counters_last[19]) / seconds);
++  // Work the game sends to the GPU, per presented frame. One screen is
++  // 1280x720 = 921,600 pixels.
++  const auto delta = [&](unsigned id) { return double(counters_now[id] - counters_last[id]); };
++  const double frames = delta(0);
++  // Mix clipping before conversion to 16 bits (21 samples above 1.0, 22 buffers with a peak of 0.98 or
++  // more, 23 maximum peak of the interval in ten-thousandths) and the console mode, for the crackling
++  // in handheld mode.
++  const u64 pico_audio = g_counters[23].exchange(0, std::memory_order_relaxed);
++  std::fprintf(f,
++               "     audio: %.0f bloques de cliente mezclados, %.0f solicitudes sin datos, "
++               "%.0f/%.0f buffers audout con PCM no nulo, %.0f muestras saturadas (mas de 1,0 antes de recortar), "
++               "%.0f buffers con pico de 0,98 o mas, pico maximo %.3f | consola en modo %s\n",
++               delta(24), delta(25), delta(26), delta(27), delta(21), delta(22), double(pico_audio) / 10000.0,
++               rex::ui::switch_saltynx::ModoBase(appletGetOperationMode() == AppletOperationMode_Console)
++                   ? "sobremesa"
++                   : "portatil");
++  // Reverse-NX state as is, without interpretation. A whole test session was wasted because its
++  // overlay said "Docked" while "Controlled by system" was Yes, and in that case its mode does not
++  // rule: it only mirrors the console's. This shows at a glance which of the two is happening.
++  {
++    const auto reverse = rex::ui::switch_saltynx::EstadoReverse();
++    const bool real = appletGetOperationMode() == AppletOperationMode_Console;
++    if (!reverse.hay) {
++      std::fprintf(f, "     Reverse-NX: sin bloque (consola %s, manda ella)\n",
++                   real ? "en la base" : "en las manos");
++    } else {
++      std::fprintf(f,
++                   "     Reverse-NX: dice %s, manda %s (Controlled by system %s), el juego ha preguntado: %s; "
++                   "consola de verdad %s -> se obedece %s\n",
++                   reverse.en_base ? "sobremesa" : "portatil", reverse.por_defecto ? "la consola" : "Reverse-NX",
++                   reverse.por_defecto ? "Yes" : "No", reverse.plugin_activo ? "si" : "no",
++                   real ? "en la base" : "en las manos",
++                   rex::ui::switch_saltynx::ModoBase(real) ? "sobremesa" : "portatil");
++    }
++  }
++  // Real console clocks (clkrst, 8.0.0+) and the cores the process may use. It tells whether the
++  // session ran overclocked and with which CPU limit it was measured: performance tests run without
++  // overclock.
++  {
++    static bool iniciado = false;
++    static bool hay_clkrst = false;
++    static ClkrstSession sesiones[3]{};
++    static u64 mascara_nucleos = 0;
++    if (!iniciado) {
++      iniciado = true;
++      if (R_FAILED(svcGetInfo(&mascara_nucleos, InfoType_CoreMask, CUR_PROCESS_HANDLE, 0))) {
++        mascara_nucleos = 0;
++      }
++      if (R_SUCCEEDED(clkrstInitialize())) {
++        static const PcvModuleId modulos[3] = {PcvModuleId_CpuBus, PcvModuleId_GPU, PcvModuleId_EMC};
++        hay_clkrst = true;
++        for (unsigned i = 0; i < 3; ++i) {
++          if (R_FAILED(clkrstOpenSession(&sesiones[i], modulos[i], 3))) {
++            hay_clkrst = false;
++          }
++        }
++      }
++    }
++    u32 hz[3] = {0, 0, 0};
++    if (hay_clkrst) {
++      for (unsigned i = 0; i < 3; ++i) {
++        clkrstGetClockRate(&sesiones[i], &hz[i]);
++      }
++    }
++    unsigned nucleos = 0;
++    for (unsigned i = 0; i < 64; ++i) {
++      nucleos += unsigned((mascara_nucleos >> i) & 1);
++    }
++    // SoC and board temperature (ts service, sessions on [10.0.0+]). The system lowers clocks around
++    // 70 degrees and Erista gets there before Mariko: without this, "it is slow" cannot be told apart
++    // from "it is hot". On the OLED model the board sensor reads wrong, because it sits next to the
++    // charging IC.
++    static bool ts_iniciado = false;
++    static bool hay_ts = false;
++    static TsSession ts_soc{}, ts_placa{};
++    if (!ts_iniciado) {
++      ts_iniciado = true;
++      if (R_SUCCEEDED(tsInitialize())) {
++        hay_ts = R_SUCCEEDED(tsOpenSession(&ts_soc, TsDeviceCode_LocationExternal)) &&
++                 R_SUCCEEDED(tsOpenSession(&ts_placa, TsDeviceCode_LocationInternal));
++      }
++    }
++    float grados_soc = 0.0f, grados_placa = 0.0f;
++    if (hay_ts) {
++      tsSessionGetTemperature(&ts_soc, &grados_soc);
++      tsSessionGetTemperature(&ts_placa, &grados_placa);
++    }
++    std::fprintf(f,
++                 "     relojes: CPU %.1f MHz, GPU %.1f MHz, memoria %.1f MHz%s | nucleos del proceso %u "
++                 "(mascara 0x%llX) | SoC %.1f C, placa %.1f C%s\n",
++                 double(hz[0]) / 1.0e6, double(hz[1]) / 1.0e6, double(hz[2]) / 1.0e6,
++                 hay_clkrst ? "" : " (clkrst no disponible)", nucleos,
++                 (unsigned long long)mascara_nucleos, double(grados_soc), double(grados_placa),
++                 hay_ts ? "" : " (ts no disponible)");
++  }
++  // libnx calls: per second, with the ms per second the calling threads spend inside.
++  {
++    static u64 ultimo[kLlamadasCount][3];
++    double n[kLlamadasCount], ms[kLlamadasCount], mb[kLlamadasCount];
++    for (unsigned i = 0; i < kLlamadasCount; ++i) {
++      const u64 vn = g_llamadas[i].n.load(std::memory_order_relaxed);
++      const u64 vt = g_llamadas[i].ticks.load(std::memory_order_relaxed);
++      const u64 vb = g_llamadas[i].bytes.load(std::memory_order_relaxed);
++      n[i] = double(vn - ultimo[i][0]) / seconds;
++      ms[i] = double(vt - ultimo[i][1]) * 1000.0 / double(tick_freq) / seconds;
++      mb[i] = double(vb - ultimo[i][2]) / 1048576.0 / seconds;
++      ultimo[i][0] = vn;
++      ultimo[i][1] = vt;
++      ultimo[i][2] = vb;
++    }
++    std::fprintf(f,
++                 "     libnx por segundo (llamadas y ms dentro): fences consultadas %.0f (%.1f ms), esperadas %.0f "
++                 "(%.1f ms) | kickoff %.0f (%.1f ms) | NvMap nuevos %.1f con cache (%.1f MB) y %.1f sin cache "
++                 "(%.1f MB), %.1f ms | direcciones de GPU %.1f (%.1f ms), mapeos %.1f (%.1f MB, %.1f ms) | "
++                 "armDCacheClean %.0f (%.1f MB, %.1f ms) | cola de la ventana %.1f (%.1f ms), sacar buffer %.1f "
++                 "(%.1f ms) | svcSleepThread: 0 %.0f, ceder %.0f, hasta 1 ms %.0f (%.1f ms), mas %.0f\n",
++                 n[kFenceConsulta], ms[kFenceConsulta], n[kFenceEspera], ms[kFenceEspera], n[kKickoff],
++                 ms[kKickoff], n[kNvMapCacheada], mb[kNvMapCacheada], n[kNvMapSinCache], mb[kNvMapSinCache],
++                 ms[kNvMapCacheada] + ms[kNvMapSinCache], n[kReservaDireccion], ms[kReservaDireccion],
++                 n[kMapeoGpu], mb[kMapeoGpu], ms[kMapeoGpu], n[kCacheClean], mb[kCacheClean], ms[kCacheClean],
++                 n[kQueueBuffer], ms[kQueueBuffer], n[kDequeueBuffer], ms[kDequeueBuffer], n[kSleep0],
++                 n[kSleepCeder], n[kSleepCorto], ms[kSleepCorto], n[kSleepLargo]);
++  }
++  if (frames > 0) {
++    std::fprintf(f,
++                 "     por fotograma: %.0f dibujados | tijera %.1f pantallas | %.1f envios | "
++                 "%.1f resolves (%.2f pantallas) | transferencias: %.1f llamadas, %.1f render "
++                 "targets, %.1f dibujados | %.1f texturas cargadas | %.2f MB de memoria "
++                 "compartida subida | pipelines creados en el intervalo: %.0f\n",
++                 delta(5) / frames, delta(6) / frames / 921600.0, delta(7) / frames,
++                 delta(9) / frames, delta(10) / frames / 921600.0, delta(11) / frames,
++                 delta(12) / frames, delta(13) / frames, delta(14) / frames,
++                 delta(15) / frames / 1048576.0, delta(16));
++    std::fprintf(f,
++                 "     dibujados por ancho de superficie: 1600+ %.0f | 1280-1599 %.0f | "
++                 "640-1279 %.0f | 256-639 %.0f | menos de 256 %.0f\n",
++                 delta(28) / frames, delta(29) / frames, delta(30) / frames, delta(31) / frames,
++                 delta(32) / frames);
++  }
++
++  for (unsigned i = 0; i < kCounterCount; ++i) {
++    counters_last[i] = counters_now[i];
++  }
++
++  std::vector<Sample> samples(g_samples, g_samples + g_sample_count);
++  g_sample_count = 0;
++  std::sort(samples.begin(), samples.end(),
++            [](const Sample& a, const Sample& b) { return a.slot < b.slot; });
++
++  // What each thread was doing during the long frames of this interval.
++  {
++    const u32 nt = std::min<u32>(g_num_tirones.exchange(0), kMaxTirones);
++    if (nt && !samples.empty()) {
++      std::vector<VentanaTiron> v(g_tirones, g_tirones + nt);
++      std::sort(v.begin(), v.end(), [](const VentanaTiron& a, const VentanaTiron& b) { return a.inicio < b.inicio; });
++      double ms_total = 0.0;
++      for (const VentanaTiron& w : v) {
++        ms_total += double(w.fin - w.inicio) * 1000.0 / double(tick_freq);
++      }
++      const auto dentro = [&v](u64 t) {
++        auto it = std::upper_bound(v.begin(), v.end(), t, [](u64 x, const VentanaTiron& w) { return x < w.inicio; });
++        return it != v.begin() && t <= (it - 1)->fin;
++      };
++      std::fprintf(f, "\n== durante los tirones: %u fotogramas de mas de 45 ms (%.0f ms en total) ==\n", nt, ms_total);
++      for (size_t i : order) {
++        std::vector<u64> pcs;
++        std::vector<const Sample*> todas;
++        size_t en_svc = 0;
++        for (const Sample& m : samples) {
++          if (m.slot != i || !dentro(m.tick)) {
++            continue;
++          }
++          todas.push_back(&m);
++          if (AfterSvc(m.pc)) {
++            ++en_svc;
++          } else {
++            pcs.push_back(m.pc);
++          }
++        }
++        if (todas.size() < 5) {
++          continue;
++        }
++        const Slot& s = g_slots[i];
++        std::fprintf(f, "-- hilo \"%s\": %zu muestras en los tirones, %.0f%% esperando en el kernel\n",
++                     s.name[0] ? s.name : "?", todas.size(), double(en_svc) * 100.0 / double(todas.size()));
++        const auto h = Histogram(pcs);
++        for (size_t k = 0; k < h.size() && k < 25; ++k) {
++          std::fprintf(f, "   %5.1f%%  pc ", double(h[k].n) * 100.0 / double(todas.size()));
++          PrintAddr(f, h[k].addr);
++          std::fputc('\n', f);
++        }
++        std::sort(todas.begin(), todas.end(), [](const Sample* a, const Sample* b) {
++          return std::memcmp(a->frames, b->frames, sizeof(a->frames)) < 0;
++        });
++        std::vector<std::pair<const Sample*, u32>> pilas;
++        for (const Sample* m : todas) {
++          if (pilas.empty() || std::memcmp(pilas.back().first->frames, m->frames, sizeof(m->frames)) != 0) {
++            pilas.push_back({m, 1});
++          } else {
++            ++pilas.back().second;
++          }
++        }
++        std::sort(pilas.begin(), pilas.end(), [](const auto& a, const auto& b) { return a.second > b.second; });
++        for (size_t k = 0; k < pilas.size() && k < 10; ++k) {
++          std::fprintf(f, "   %5.1f%%  pila", double(pilas[k].second) * 100.0 / double(todas.size()));
++          for (size_t j = 0; j < kFrames && pilas[k].first->frames[j]; ++j) {
++            std::fputs(j == 0 ? " " : " <- ", f);
++            PrintAddr(f, pilas[k].first->frames[j]);
++          }
++          std::fputc('\n', f);
++        }
++      }
++    }
++  }
++
++  for (size_t i : order) {
++    const Slot& s = g_slots[i];
++    /*
++     * Threads that use no CPU are listed too, with less detail: in a hang their
++     * stacks are needed to know what they are waiting for.
++     */
++    const bool activo = s.cpu >= 1.0;
++    u64 tid = 0;
++    svcGetThreadId(&tid, s.handle.load());
++    // Horizon priority, preferred core and allowed cores: who can take the CPU from whom.
++    s32 prioridad = -1;
++    s32 preferido = -1;
++    u64 mascara = 0;
++    svcGetThreadPriority(&prioridad, s.handle.load());
++    svcGetThreadCoreMask(&preferido, &mascara, s.handle.load());
++    std::fprintf(f,
++                 "\n-- hilo %" PRIu64 " \"%s\": CPU %.1f%% | prioridad 0x%X, nucleo preferido %d, "
++                 "mascara 0x%llX\n",
++                 tid, s.name[0] ? s.name : "?", s.cpu, static_cast<unsigned>(prioridad),
++                 static_cast<int>(preferido), static_cast<unsigned long long>(mascara));
++
++    auto lo = std::lower_bound(samples.begin(), samples.end(), i,
++                               [](const Sample& a, size_t v) { return a.slot < v; });
++    auto hi = std::upper_bound(samples.begin(), samples.end(), i,
++                               [](size_t v, const Sample& a) { return v < a.slot; });
++    const size_t n = size_t(hi - lo);
++    if (n == 0) {
++      std::fprintf(f, "   sin muestras\n");
++      continue;
++    }
++    std::vector<u64> pcs, lrs;
++    size_t in_svc = 0;
++    for (auto it = lo; it != hi; ++it) {
++      if (AfterSvc(it->pc)) {
++        ++in_svc;
++        continue;
++      }
++      pcs.push_back(it->pc);
++      lrs.push_back(it->lr);
++    }
++    std::fprintf(f, "   %zu muestras, %.0f%% esperando en el kernel\n", n,
++                 double(in_svc) * 100.0 / double(n));
++    const auto pc_hist = Histogram(pcs);
++    const size_t busy = pcs.size();
++    for (size_t k = 0; k < pc_hist.size() && k < (activo ? 80u : 3u); ++k) {
++      std::fprintf(f, "   %5.1f%%  pc ", double(pc_hist[k].n) * 100.0 / double(busy));
++      PrintAddr(f, pc_hist[k].addr);
++      std::fputc('\n', f);
++    }
++    const auto lr_hist = Histogram(lrs);
++    for (size_t k = 0; k < lr_hist.size() && k < (activo ? 40u : 3u); ++k) {
++      std::fprintf(f, "   %5.1f%%  lr ", double(lr_hist[k].n) * 100.0 / double(busy));
++      PrintAddr(f, lr_hist[k].addr);
++      std::fputc('\n', f);
++    }
++
++    // Full stacks, waits included: they say what the thread is waiting for.
++    std::vector<const Sample*> by_stack;
++    for (auto it = lo; it != hi; ++it) {
++      by_stack.push_back(&*it);
++    }
++    std::sort(by_stack.begin(), by_stack.end(), [](const Sample* a, const Sample* b) {
++      return std::memcmp(a->frames, b->frames, sizeof(a->frames)) < 0;
++    });
++    struct StackCount {
++      const Sample* s;
++      u32 n;
++    };
++    std::vector<StackCount> stacks;
++    for (const Sample* s : by_stack) {
++      if (stacks.empty() ||
++          std::memcmp(stacks.back().s->frames, s->frames, sizeof(s->frames)) != 0) {
++        stacks.push_back({s, 1});
++      } else {
++        ++stacks.back().n;
++      }
++    }
++    std::sort(stacks.begin(), stacks.end(),
++              [](const StackCount& a, const StackCount& b) { return a.n > b.n; });
++    for (size_t k = 0; k < stacks.size() && k < (activo ? 30u : 3u); ++k) {
++      std::fprintf(f, "   %5.1f%%  pila", double(stacks[k].n) * 100.0 / double(n));
++      for (size_t j = 0; j < kFrames && stacks[k].s->frames[j]; ++j) {
++        std::fputs(j == 0 ? " " : " <- ", f);
++        PrintAddr(f, stacks[k].s->frames[j]);
++      }
++      std::fputc('\n', f);
++    }
++  }
++  std::fputc('\n', f);
++  std::fclose(f);
++}
++
++/*
++ * The one-second tick for the console overlays, separate from the profile loop.
++ *
++ * Two loops use it: the warm-up one (from second zero) and the normal one (from kStartDelayNs on).
++ * When it lived only in the normal loop there was neither FPS nor resolution until 8 seconds had
++ * passed: they appeared with the EA logo instead of with the Most Wanted logo, which comes much
++ * earlier.
++ *
++ * It is cheap: two counter reads and a few bytes in shared memory. Actualizar also re-attaches the
++ * block if it is missing, so the overlay can be opened at any time.
++ */
++struct TicOverlay {
++  u64 tic = 0;
++  u64 presentados = 0;
++  double media[10] = {};
++  size_t pos = 0;
++
++  void Arrancar(u64 ahora) {
++    tic = ahora;
++    presentados = g_counters[0].load(std::memory_order_relaxed);
++    // Publish what is known right away: the resolution is valid from the first instant (g_resolucion
++    // starts at 1280x720 and the game corrects it when choosing the video mode), so the overlay's RES
++    // row can show up even before the first frame.
++    const uint32_t res = g_resolucion.load(std::memory_order_relaxed);
++    rex::ui::switch_saltynx::Actualizar(0.0, 0.0, res >> 16, res & 0xFFFF, presentados);
++  }
++
++  // Once per second. `con_relojes` turns off the Reverse-NX and clock sysmodule part, which is better
++  // left alone during warm-up.
++  void Paso(u64 ahora, u64 freq, bool con_relojes) {
++    if (ahora - tic < freq) {
++      return;
++    }
++    const double segundos = double(ahora - tic) / double(freq);
++    const u64 ahora_presentados = g_counters[0].load(std::memory_order_relaxed);
++    const double fps = segundos > 0.0 ? double(ahora_presentados - presentados) / segundos : 0.0;
++    media[pos] = fps;
++    pos = (pos + 1) % 10;
++    double suma = 0.0;
++    size_t cuantos = 0;
++    for (double v : media) {
++      if (v > 0.0) {
++        suma += v;
++        ++cuantos;
++      }
++    }
++    const uint32_t res = g_resolucion.load(std::memory_order_relaxed);
++    rex::ui::switch_saltynx::Actualizar(fps, cuantos ? suma / double(cuantos) : fps, res >> 16, res & 0xFFFF,
++                                        ahora_presentados);
++    // Reverse-NX is also told that the game keeps asking for the mode (its overlay requires it to show
++    // the controls) and, if the system rules, the real mode is mirrored. nfsmw-nx also drives a clock
++    // sysmodule from here; that overclocking path is not imported.
++    if (con_relojes) {
++      const bool sobremesa_real = appletGetOperationMode() == AppletOperationMode_Console;
++      (void)rex::ui::switch_saltynx::ModoBase(sobremesa_real);
++    }
++    /*
++     * The memory clock is watched here too. It is outside the if above on purpose: the
++     * system raises the EMC right after we request the GPU profile, that is, during
++     * warm-up, which is when con_relojes is false. It is one clkrst read per second for
++     * the first 20 and one every 30 after that; when we have not changed anything it
++     * does not even do that.
++     */
++    RexSwitchApmVigilar();
++    presentados = ahora_presentados;
++    tic = ahora;
++  }
++};
++
++void ProfilerMain(void*) {
++  const u64 tick_freq = armGetSystemTickFreq();
++
++  /*
++   * The overlay first, without waiting for kStartDelayNs. Those 8 seconds are for stack sampling and
++   * the first report (which read the SD and pause threads), not for this: publishing FPS and
++   * resolution is a few bytes in shared memory, and it has to show already at the Most Wanted logo.
++   * During warm-up the tick keeps running every second, so attaching the block is also retried if
++   * SaltyNX is slow.
++   */
++  TicOverlay overlay;
++  const u64 inicio = armGetSystemTick();
++  overlay.Arrancar(inicio);
++  const u64 calentamiento = (kStartDelayNs / 1000000ULL) * tick_freq / 1000ULL;
++  while (armGetSystemTick() - inicio < calentamiento) {
++    __real_svcSleepThread(kPassiveIntervalNs);
++    overlay.Paso(armGetSystemTick(), tick_freq, false);
++  }
++
++  // The stock high-GPU profile (switch_apm.cpp). Requested here, after the warm-up, because the
++  // title's configuration has been read by now; it polls the clocks for about 1.5 s.
++  RexSwitchApmAplicar();
++
++  // Invasive sampling is only enabled explicitly, for diagnostics.
++  // The normal mode keeps FPS, CPU and counters, without stopping the game.
++  bool sample_stacks = false;
++  if (FILE* flag = std::fopen(StackFlagPath().c_str(), "r")) {
++    sample_stacks = true;
++    std::fclose(flag);
++  }
++
++  u64 counters_last[kCounterCount]{};
++  for (unsigned i = 0; i < kCounterCount; ++i) {
++    counters_last[i] = g_counters[i].load(std::memory_order_relaxed);
++  }
++  if (FILE* f = std::fopen(ReportPath().c_str(), "w")) {
++    std::fprintf(f, "imagen 0x%016" PRIx64 ", codigo hasta 0x%016" PRIx64 "\n\n", g_base,
++                 g_text_hi);
++    std::fprintf(f, "Muestreo de pilas: %s\n", sample_stacks ? "activo (1 ms)" : "desactivado");
++    std::fclose(f);
++  }
++
++  // The console overlays read from SaltyNX's shared memory. That is already running from second
++  // zero (see the warm-up loop above); only the normal loop continues here.
++
++  // A short first report just to set the starting CPU time.
++  u64 report_start = armGetSystemTick();
++  Report(1, tick_freq, counters_last, "arranque");
++  report_start = armGetSystemTick();
++
++  size_t rr = 0;
++  size_t mode_index = 0;
++  while (true) {
++    __real_svcSleepThread(sample_stacks ? kSampleIntervalNs : kPassiveIntervalNs);
++
++    for (size_t tries = 0; sample_stacks && tries < kMaxThreads; ++tries) {
++      const size_t idx = rr;
++      rr = (rr + 1) % kMaxThreads;
++      Slot& s = g_slots[idx];
++      const u32 h = s.handle.load();
++      if (!h || !s.busy) {
++        continue;
++      }
++      if (R_FAILED(svcSetThreadActivity(h, ThreadActivity_Paused))) {
++        break;
++      }
++      ThreadContext ctx;
++      const Result rc = svcGetThreadContext3(&ctx, h);
++      if (R_SUCCEEDED(rc) && g_sample_count < kMaxSamples) {
++        Sample& out = g_samples[g_sample_count++];
++        out = {};
++        out.pc = ctx.pc.x;
++        out.lr = ctx.lr;
++        out.slot = static_cast<u16>(idx);
++        out.tick = armGetSystemTick();
++        // The stack, with the thread still paused: it is our own memory and
++        // there are no locks. Only frames within the region of its sp.
++        MemoryInfo smi;
++        u32 spi = 0;
++        if (R_SUCCEEDED(svcQueryMemory(&smi, &spi, ctx.sp)) && (smi.perm & Perm_R)) {
++          const u64 lo = smi.addr, hi = smi.addr + smi.size;
++          u64 fp = ctx.fp;
++          for (size_t k = 0; k < kFrames && fp >= lo && fp + 16 <= hi && (fp & 7) == 0; ++k) {
++            out.frames[k] = reinterpret_cast<const u64*>(fp)[1];
++            const u64 next = reinterpret_cast<const u64*>(fp)[0];
++            if (next <= fp) {
++              break;
++            }
++            fp = next;
++          }
++        }
++      }
++      svcSetThreadActivity(h, ThreadActivity_Runnable);
++      break;
++    }
++
++    const u64 now = armGetSystemTick();
++    // Once per second, FPS and resolution for the overlay (the profile report runs every 10 s).
++    overlay.Paso(now, tick_freq, true);
++    if (now - report_start >= kReportSeconds * tick_freq) {
++      Report(now - report_start, tick_freq, counters_last, kModes[mode_index].name);
++      if (g_ab_activas.load(std::memory_order_relaxed)) {
++        mode_index = (mode_index + 1) % kModeCount;
++        g_skip_mask.store(kModes[mode_index].mask, std::memory_order_relaxed);
++        if (mode_index == 0) {
++          // Full cycle: it turns itself off and the game looks right again.
++          g_ab_activas.store(false, std::memory_order_relaxed);
++        }
++      }
++      report_start = armGetSystemTick();
++    }
++  }
++}
++
++/* Priority 102: after switch_crash_hooks.c, before the SDK. */
++__attribute__((constructor(102))) void StartProfiler() {
++  g_base = reinterpret_cast<u64>(&_start);
++  MemoryInfo mi;
++  u32 page_info = 0;
++  if (R_SUCCEEDED(svcQueryMemory(&mi, &page_info, g_base))) {
++    g_text_lo = mi.addr;
++    g_text_hi = mi.addr + mi.size;
++  }
++  Register(envGetMainThreadHandle());
++  std::strncpy(g_slots[0].name, "main (interfaz)", sizeof(g_slots[0].name) - 1);
++  // 0x2A: above everything in the game (audio runs at 0x2B), so the samples
++  // are taken on time. It sleeps almost all the time.
++  if (R_SUCCEEDED(__real_threadCreate(&g_thread, ProfilerMain, nullptr, nullptr, 0x10000, 0x2A,
++                                      -2))) {
++    threadStart(&g_thread);
++  }
++}
++
++}  // namespace
++
++extern "C" {
++
++Result __wrap_threadCreate(Thread* t, ThreadFunc entry, void* arg, void* stack_mem,
++                           size_t stack_sz, int prio, int cpuid) {
++  const Result rc = __real_threadCreate(t, entry, arg, stack_mem, stack_sz, prio, cpuid);
++  if (R_SUCCEEDED(rc) && t) {
++    Register(t->handle);
++  }
++  return rc;
++}
++
++Result __wrap_threadClose(Thread* t) {
++  if (t) {
++    Unregister(t->handle);
++  }
++  return __real_threadClose(t);
++}
++
++/* libnx calls that cost IPC or walk memory. See g_llamadas. */
++Result __wrap_nvFenceWait(NvFence* f, s32 timeout_us) {
++  const u64 desde = armGetSystemTick();
++  const Result rc = __real_nvFenceWait(f, timeout_us);
++  Anotar(timeout_us == 0 ? kFenceConsulta : kFenceEspera, desde);
++  return rc;
++}
++
++Result __wrap_nvGpuChannelKickoff(NvGpuChannel* c) {
++  const u64 desde = armGetSystemTick();
++  const Result rc = __real_nvGpuChannelKickoff(c);
++  Anotar(kKickoff, desde);
++  return rc;
++}
++
++Result __wrap_nvMapCreate(NvMap* m, void* cpu_addr, u32 size, u32 align, NvKind kind, bool is_cpu_cacheable) {
++  const u64 desde = armGetSystemTick();
++  const Result rc = __real_nvMapCreate(m, cpu_addr, size, align, kind, is_cpu_cacheable);
++  Anotar(is_cpu_cacheable ? kNvMapCacheada : kNvMapSinCache, desde, size);
++  return rc;
++}
++
++Result __wrap_nvAddressSpaceAllocFixed(NvAddressSpace* a, bool sparse, u64 size, iova_t iova) {
++  const u64 desde = armGetSystemTick();
++  const Result rc = __real_nvAddressSpaceAllocFixed(a, sparse, size, iova);
++  Anotar(kReservaDireccion, desde, size);
++  return rc;
++}
++
++Result __wrap_nvioctlNvhostAsGpu_MapBufferEx(u32 fd, u32 flags, u32 kind, u32 nvmap_handle, u32 page_size,
++                                             u64 buffer_offset, u64 mapping_size, u64 input_offset, u64* offset) {
++  const u64 desde = armGetSystemTick();
++  const Result rc = __real_nvioctlNvhostAsGpu_MapBufferEx(fd, flags, kind, nvmap_handle, page_size, buffer_offset,
++                                                          mapping_size, input_offset, offset);
++  Anotar(kMapeoGpu, desde, mapping_size);
++  return rc;
++}
++
++void __wrap_armDCacheClean(void* addr, size_t size) {
++  const u64 desde = armGetSystemTick();
++  __real_armDCacheClean(addr, size);
++  Anotar(kCacheClean, desde, size);
++}
++
++/*
++ * The presentation interval (nfsmw_intervalo_swap).
++ *
++ * It is reapplied on every present, not when the chain is created, on purpose: the WSI sets it to 1
++ * when creating the swapchain, and the chain is recreated when switching from docked to handheld.
++ * With 0 nothing is touched and the swapchain mode rules (IMMEDIATE -> interval 0).
++ *
++ * libnx only accepts interval 0 if the NWindow has three or more buffers; the Horizon WSI always
++ * configures exactly 3, so the condition holds. 2 is always accepted.
++ *
++ * Warning: it is 0 and must stay that way. Measured: with the current frame time, setting 2 sends
++ * 22 % of the frames to 66.7 ms. It only makes sense with a median frame time below 31 ms.
++ */
++std::atomic<unsigned> g_intervalo_swap{0};
++
++Result __wrap_nwindowQueueBuffer(NWindow* nw, s32 slot, const NvMultiFence* fence) {
++  const u64 desde = armGetSystemTick();
++  const unsigned pedido = g_intervalo_swap.load(std::memory_order_relaxed);
++  if (pedido != 0 && nw != nullptr && nw->swap_interval != pedido) {
++    nwindowSetSwapInterval(nw, pedido);
++  }
++  const Result rc = __real_nwindowQueueBuffer(nw, slot, fence);
++  Anotar(kQueueBuffer, desde);
++  return rc;
++}
++
++Result __wrap_bqDequeueBuffer(Binder* b, bool async, u32 width, u32 height, s32 format, u32 usage, s32* buf,
++                              NvMultiFence* fence) {
++  const u64 desde = armGetSystemTick();
++  const Result rc = __real_bqDequeueBuffer(b, async, width, height, format, usage, buf, fence);
++  Anotar(kDequeueBuffer, desde);
++  return rc;
++}
++
++void __wrap_svcSleepThread(s64 nano) {
++  const u64 desde = armGetSystemTick();
++  __real_svcSleepThread(nano);
++  Anotar(nano == 0 ? kSleep0 : nano < 0 ? kSleepCeder : nano <= 1000000 ? kSleepCorto : kSleepLargo, desde);
++}
++
++/*
++ * Counters: 0 = guest present, 1 = read emulated through the shadow,
++ * 2 = fault resolved by an SDK handler, 3 = retry emulated through the
++ * shadow, 4 = SEH. 28..32 = draws per surface width from IssueDraw
++ * (1600 or more, 1280-1599, 640-1279, 256-639, under 256).
++ */
++// A long frame, in armGetSystemTick ticks (see VentanaTiron).
++void RexSwitchPerfTiron(u64 inicio, u64 fin) {
++  const u32 i = g_num_tirones.fetch_add(1);
++  if (i < kMaxTirones) {
++    g_tirones[i] = {inicio, fin};
++  }
++}
++
++void RexSwitchPerfResolution(unsigned ancho, unsigned alto) {
++  g_resolucion.store(((ancho & 0xFFFF) << 16) | (alto & 0xFFFF), std::memory_order_relaxed);
++}
++
++// See g_intervalo_swap, next to the nwindowQueueBuffer wrapper. 0 = touch nothing (the normal case).
++void RexSwitchPerfIntervaloSwap(unsigned vblanks) {
++  g_intervalo_swap.store(vblanks, std::memory_order_relaxed);
++}
++
++void RexSwitchPerfCount(unsigned id) {
++  if (id < kCounterCount) {
++    g_counters[id].fetch_add(1, std::memory_order_relaxed);
++  }
++  if (id == 0) {
++    // Counter 0 is presents. The console overlay clears the "alive" mark and the resolution mark and
++    // only waits 100 ms, so it has to be answered on every frame, not once per second. It is writing a
++    // few bytes to shared memory.
++    const uint32_t res = g_resolucion.load(std::memory_order_relaxed);
++    rex::ui::switch_saltynx::Latir(res >> 16, res & 0xFFFF);
++  }
++}
++
++/*
++ * 5 draws, 6 scissor area of the draws (pixels), 7 queue submissions,
++ * 9 resolves, 10 resolve area, 11 render target transfer calls,
++ * 12 render targets transferred, 13 transfer draws, 14 textures loaded,
++ * 15 shared memory bytes uploaded, 16 pipelines created, 17 physical memory
++ * chunks committed on touch, 18 chunks mapped into a view on touch,
++ * 21 clipped audio samples, 22 audio buffers with a peak of 0.98 or more.
++ */
++void RexSwitchPerfAdd(unsigned id, u64 value) {
++  if (id < kCounterCount) {
++    g_counters[id].fetch_add(value, std::memory_order_relaxed);
++  }
++}
++
++/* max counter (23 = audio mix peak in ten-thousandths; the report resets it to 0). */
++void RexSwitchPerfMax(unsigned id, u64 value) {
++  if (id >= kCounterCount) {
++    return;
++  }
++  u64 actual = g_counters[id].load(std::memory_order_relaxed);
++  while (value > actual && !g_counters[id].compare_exchange_weak(actual, value, std::memory_order_relaxed)) {
++  }
++}
++
++/*
++ * Bits: 1 draws, 2 transfers, 4 resolves, 8 texture loads,
++ * 16 presentation effect, 32 tiled dispatch.
++ */
++bool RexSwitchPerfSkip(unsigned bit) {
++  return (g_skip_mask.load(std::memory_order_relaxed) & bit) != 0;
++}
++
++void RexSwitchPerfSetThreadName(u32 handle, const char* name) {
++  if (!handle || !name) {
++    return;
++  }
++  for (auto& s : g_slots) {
++    if (s.handle.load() == handle) {
++      char tmp[sizeof(s.name)]{};
++      std::strncpy(tmp, name, sizeof(tmp) - 1);
++      std::memcpy(s.name, tmp, sizeof(tmp));
++      return;
++    }
++  }
++}
++
++}  // extern "C"

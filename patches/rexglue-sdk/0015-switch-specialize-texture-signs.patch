@@ -1,0 +1,229 @@
+diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
+index dce3dbf..54e3eb1 100644
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -881,6 +881,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
+     kSystemConstantEdramBlendConstant,
+   };
+   spv::Id uniform_system_constants_;
++  // gpu_specialize_texture_signs: one specialization constant per word of
++  // texture_swizzled_signs (4 fetch constants each), created on first use.
++  spv::Id texture_swizzled_signs_spec_constants_[8];
+   spv::Id uniform_float_constants_;
+   spv::Id uniform_bool_loop_constants_;
+   spv::Id uniform_fetch_constants_;
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index d3bcea4..2cfd93f 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -522,6 +522,15 @@ class TextureCache {
+   Texture* FindOrCreateTexture(TextureKey key);
+ 
+  public:
++  // The swizzled signs a texture binding would have for this fetch constant
++  // (unsigned for one that describes no valid texture), without binding it.
++  static uint8_t GetSwizzledSignsForFetchConstant(const xenos::xe_gpu_texture_fetch_t& fetch) {
++    TextureKey key;
++    uint8_t swizzled_signs;
++    BindingInfoFromFetchConstant(fetch, key, &swizzled_signs);
++    return key.is_valid ? swizzled_signs : kSwizzledSignsUnsigned;
++  }
++
+   // Resolve forwarding: the texture that is the only one reading a 2D tiled
+   // resolve destination at base_address (no larger than max_width x
+   // max_height, same pitch in texels, format and endianness), or nullptr.
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index e034a55..7332663 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -206,8 +206,13 @@ class VulkanPipelineCache {
+     // Filled only for the attachments present in the render pass object.
+     PipelineRenderTarget render_targets[xenos::kMaxColorRenderTargets];
+ 
++    // gpu_specialize_texture_signs: the swizzled signs of the fetch constants
++    // the shaders sample (8 bits each, 4 per word), passed to them as
++    // specialization constants. Zero when the option is off.
++    uint32_t texture_swizzled_signs[8];
++
+     // Including all the padding, for a stable hash.
+-    static constexpr uint32_t kVersion = 0x20260228;
++    static constexpr uint32_t kVersion = 0x20260930;
+     PipelineDescription() {
+       Reset();
+     }
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 1774f97..6eabcd3 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -20,12 +20,18 @@
+ #include <SPIRV/GLSL.std.450.h>
+ #include <fmt/format.h>
+ 
++#include <rex/cvar.h>
+ #include <rex/assert.h>
+ #include <rex/graphics/pipeline/shader/spirv.h>
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+ #include <rex/math.h>
+ #include <rex/string/buffer.h>
+ 
++REXCVAR_DEFINE_BOOL(gpu_specialize_texture_signs, false, "GPU",
++                    "Compile each pipeline for the signedness and gamma of the textures bound "
++                    "when it is created, instead of selecting them at run time in every fetch")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace rex::graphics {
+ 
+ SpirvShaderTranslator::Features::Features(bool all)
+@@ -172,6 +178,9 @@ uint32_t SpirvShaderTranslator::GetModificationRegisterCount() const {
+ }
+ 
+ void SpirvShaderTranslator::StartTranslation() {
++  for (spv::Id& id : texture_swizzled_signs_spec_constants_) {
++    id = spv::NoResult;
++  }
+   // TODO(Triang3l): Logger.
+   builder_ = std::make_unique<SpirvBuilder>(features_.spirv_version, (kSpirvMagicToolId << 16) | 1,
+                                             nullptr);
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 9ce3bb4..82e6437 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -22,6 +22,9 @@
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+ #include <rex/math.h>
+ 
++#include <rex/cvar.h>
++REXCVAR_DECLARE(bool, gpu_specialize_texture_signs);
++
+ namespace rex::graphics {
+ 
+ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
+@@ -1288,17 +1291,35 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+         }
+       }
+ 
+-      id_vector_temp_.clear();
+-      id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantTextureSwizzledSigns));
+-      id_vector_temp_.push_back(builder_->makeIntConstant(fetch_constant_index >> 4));
+-      id_vector_temp_.push_back(builder_->makeIntConstant((fetch_constant_index >> 2) & 3));
+       // All 32 bits containing the values for 4 fetch constants (use
+       // OpBitFieldUExtract to get the signednesses for the specific components
+       // of this texture).
+-      spv::Id swizzled_signs_word = builder_->createLoad(
+-          builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
+-                                      id_vector_temp_),
+-          spv::NoPrecision);
++      spv::Id swizzled_signs_word;
++      if (REXCVAR_GET(gpu_specialize_texture_signs)) {
++        // A specialization constant filled from the fetch constants when the
++        // pipeline is created. Each fetch otherwise selected between signed,
++        // unsigned, biased and gamma per component at run time, and sampled
++        // both the signed and the unsigned view: about 5 KB of SPIR-V per
++        // fetch, most of a pixel shader's cost on the Switch GPU. Folded, only
++        // the case in use remains.
++        spv::Id& spec_constant =
++            texture_swizzled_signs_spec_constants_[fetch_constant_index >> 2];
++        if (spec_constant == spv::NoResult) {
++          spec_constant = builder_->makeUintConstant(0, true);
++          builder_->addDecoration(spec_constant, spv::DecorationSpecId,
++                                  int(fetch_constant_index >> 2));
++        }
++        swizzled_signs_word = spec_constant;
++      } else {
++        id_vector_temp_.clear();
++        id_vector_temp_.push_back(builder_->makeIntConstant(kSystemConstantTextureSwizzledSigns));
++        id_vector_temp_.push_back(builder_->makeIntConstant(fetch_constant_index >> 4));
++        id_vector_temp_.push_back(builder_->makeIntConstant((fetch_constant_index >> 2) & 3));
++        swizzled_signs_word = builder_->createLoad(
++            builder_->createAccessChain(spv::StorageClassUniform, uniform_system_constants_,
++                                        id_vector_temp_),
++            spv::NoPrecision);
++      }
+       uint32_t swizzled_signs_word_offset = 8 * (fetch_constant_index & 3);
+ 
+       spv::Builder::TextureParameters texture_parameters = {};
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index af9f160..ea0621b 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -68,6 +68,8 @@ extern "C" void RexSwitchPerfAdd(unsigned id, uint64_t value);
+ extern "C" bool RexSwitchPerfSkip(unsigned bit);
+ #endif
+ 
++REXCVAR_DECLARE(bool, gpu_specialize_texture_signs);
++
+ namespace rex::graphics::vulkan {
+ 
+ namespace {
+@@ -1567,6 +1569,22 @@ bool VulkanPipelineCache::GetCurrentStateDescription(
+   }
+   description_out.render_pass_key = render_pass_key;
+ 
++  if (REXCVAR_GET(gpu_specialize_texture_signs)) {
++    for (const VulkanShader::VulkanTranslation* translation : {vertex_shader, pixel_shader}) {
++      if (!translation) {
++        continue;
++      }
++      for (const Shader::TextureBinding& binding : translation->shader().texture_bindings()) {
++        const uint32_t fetch_constant = binding.fetch_constant;
++        const uint8_t signs = TextureCache::GetSwizzledSignsForFetchConstant(
++            regs.GetTextureFetch(fetch_constant));
++        uint32_t& word = description_out.texture_swizzled_signs[fetch_constant >> 2];
++        const uint32_t shift = 8 * (fetch_constant & 3);
++        word = (word & ~(UINT32_C(0xFF) << shift)) | (uint32_t(signs) << shift);
++      }
++    }
++  }
++
+   bool tessellated = primitive_processing_result.IsTessellated();
+   PipelineGeometryShader geometry_shader = PipelineGeometryShader::kNone;
+   PipelinePrimitiveTopology primitive_topology;
+@@ -3224,6 +3242,22 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+   std::array<VkPipelineShaderStageCreateInfo, 5> shader_stages;
+   uint32_t shader_stage_count = 0;
+ 
++  // gpu_specialize_texture_signs: the words the translator declared as
++  // specialization constants 0-7.
++  VkSpecializationMapEntry texture_signs_map_entries[8];
++  for (uint32_t i = 0; i < 8; ++i) {
++    texture_signs_map_entries[i].constantID = i;
++    texture_signs_map_entries[i].offset = uint32_t(sizeof(uint32_t) * i);
++    texture_signs_map_entries[i].size = sizeof(uint32_t);
++  }
++  VkSpecializationInfo texture_signs_specialization;
++  texture_signs_specialization.mapEntryCount = 8;
++  texture_signs_specialization.pMapEntries = texture_signs_map_entries;
++  texture_signs_specialization.dataSize = sizeof(description.texture_swizzled_signs);
++  texture_signs_specialization.pData = description.texture_swizzled_signs;
++  const VkSpecializationInfo* guest_specialization =
++      REXCVAR_GET(gpu_specialize_texture_signs) ? &texture_signs_specialization : nullptr;
++
+   // Vertex or tessellation evaluation shader (plus helper stages for tessellation).
+   assert_true(creation_arguments.vertex_shader->is_translated());
+   if (!creation_arguments.vertex_shader->is_valid()) {
+@@ -3263,7 +3297,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+     shader_stage_tess_eval.module = creation_arguments.vertex_shader->shader_module();
+     assert_true(shader_stage_tess_eval.module != VK_NULL_HANDLE);
+     shader_stage_tess_eval.pName = "main";
+-    shader_stage_tess_eval.pSpecializationInfo = nullptr;
++    shader_stage_tess_eval.pSpecializationInfo = guest_specialization;
+   } else {
+     VkPipelineShaderStageCreateInfo& shader_stage_vertex = shader_stages[shader_stage_count++];
+     shader_stage_vertex.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+@@ -3273,7 +3307,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+     shader_stage_vertex.module = creation_arguments.vertex_shader->shader_module();
+     assert_true(shader_stage_vertex.module != VK_NULL_HANDLE);
+     shader_stage_vertex.pName = "main";
+-    shader_stage_vertex.pSpecializationInfo = nullptr;
++    shader_stage_vertex.pSpecializationInfo = guest_specialization;
+   }
+   // Geometry shader.
+   if (creation_arguments.geometry_shader != VK_NULL_HANDLE) {
+@@ -3307,6 +3341,7 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
+     }
+     shader_stage_fragment.module = creation_arguments.pixel_shader->shader_module();
+     assert_true(shader_stage_fragment.module != VK_NULL_HANDLE);
++    shader_stage_fragment.pSpecializationInfo = guest_specialization;
+   } else {
+     if (edram_fragment_shader_interlock) {
+       shader_stage_fragment.module = depth_only_fragment_shader_;

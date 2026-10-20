@@ -1,0 +1,117 @@
+diff --git a/src/nouveau/horizon/nouveau_horizon_channel.c b/src/nouveau/horizon/nouveau_horizon_channel.c
+index e0fa51f..f0181ed 100644
+--- a/src/nouveau/horizon/nouveau_horizon_channel.c
++++ b/src/nouveau/horizon/nouveau_horizon_channel.c
+@@ -810,9 +810,10 @@ nouveau_horizon_channel_reserve_entries_locked(
+ {
+    const uint32_t total_order_entry =
+       channel->device->total_order_channels ? 1 : 0;
++   const uint32_t bootstrap_entries = channel->bind_3d_emitted ? 0 : 1;
+    const uint64_t required =
+       (uint64_t)channel->gpu_channel.num_entries + entries + tail_entries +
+-      NOUVEAU_HORIZON_GPFIFO_FINAL_SKID + total_order_entry;
++      NOUVEAU_HORIZON_GPFIFO_FINAL_SKID + total_order_entry + bootstrap_entries;
+    if (required > GPFIFO_QUEUE_SIZE)
+       return NOUVEAU_HORIZON_ERROR_NO_SPACE;
+    return NOUVEAU_HORIZON_SUCCESS;
+@@ -836,7 +837,9 @@ nouveau_horizon_channel_append_locked(
+    enum nouveau_horizon_status status;
+ 
+    if (consume_reserved) {
+-      status = channel->gpu_channel.num_entries + 1 + tail_entries <=
++      const uint32_t bootstrap_entries = channel->bind_3d_emitted ? 0 : 1;
++      status = channel->gpu_channel.num_entries + 1 + tail_entries +
++                  bootstrap_entries <=
+                   GPFIFO_QUEUE_SIZE ?
+                   NOUVEAU_HORIZON_SUCCESS :
+                   NOUVEAU_HORIZON_ERROR_NO_SPACE;
+@@ -847,6 +850,30 @@ nouveau_horizon_channel_append_locked(
+    if (status != NOUVEAU_HORIZON_SUCCESS)
+       return status;
+ 
++   /* The channel's own cache-acquire and fence packets use 3D subchannel 0
++    * before the client's context-initialization stream runs. Bind it once
++    * before any packet is submitted. In particular, Eden does not infer the
++    * binding from AllocObjCtx and dereferences an unbound engine on 0x4A2.
++    * Keep this lazy so mapped-completion setup still sees an empty queue.
++    */
++   if (!channel->bind_3d_emitted) {
++      const Result bind_rc = nvGpuChannelAppendEntry(
++         &channel->gpu_channel,
++         channel->builtin_addr + 4ull * channel->bind_3d_offset_words,
++         2, GPFIFO_ENTRY_NOT_MAIN, 0);
++      if (R_FAILED(bind_rc)) {
++         if (channel->device->enable_timing)
++            channel->stats.submit_failures++;
++         nouveau_horizon_channel_latch_error(
++            channel, NOUVEAU_HORIZON_ERROR_DEVICE_LOST, bind_rc);
++         nouveau_horizon_channel_check_error_locked(channel);
++         return channel->error.status;
++      }
++      channel->bind_3d_emitted = true;
++      channel->pending_command_bytes += 2 * sizeof(uint32_t);
++      channel->pending_dwords += 2;
++   }
++
+    const Result rc = nvGpuChannelAppendEntry(&channel->gpu_channel,
+                                               addr, command_count,
+                                               flags, 0);
+@@ -952,7 +979,6 @@ nouveau_horizon_channel_append_waits_locked(
+    const uint32_t command_count = nouveau_horizon_gm20b_build_waits(
+       commands, wait_count, waits);
+ 
+-   const uint32_t original_entries = channel->gpu_channel.num_entries;
+    status = nouveau_horizon_channel_append_locked(
+       channel, nouveau_horizon_channel_wait_slice_addr(channel, slice),
+       command_count,
+@@ -961,12 +987,17 @@ nouveau_horizon_channel_append_waits_locked(
+    if (status != NOUVEAU_HORIZON_SUCCESS)
+       return status;
+ 
+-   if (prepend && original_entries > 0) {
++   if (prepend && channel->gpu_channel.num_entries > 1) {
++      /* append_locked may have inserted the one-time 3D binding too. The
++       * requested wait is always last, regardless of that extra entry.
++       * These FIFO waits do not require a bound 3D engine.
++       */
++      const uint32_t wait_index = channel->gpu_channel.num_entries - 1;
+       const nvioctl_gpfifo_entry wait_entry =
+-         channel->gpu_channel.entries[original_entries];
++         channel->gpu_channel.entries[wait_index];
+       memmove(&channel->gpu_channel.entries[1],
+               &channel->gpu_channel.entries[0],
+-              original_entries * sizeof(channel->gpu_channel.entries[0]));
++              wait_index * sizeof(channel->gpu_channel.entries[0]));
+       channel->gpu_channel.entries[0] = wait_entry;
+    }
+ 
+@@ -1542,6 +1573,9 @@ nouveau_horizon_channel_create(
+    uint32_t *commands = channel->builtin_cpu +
+       NOUVEAU_HORIZON_WAIT_SLICE_COUNT *
+          NOUVEAU_HORIZON_WAIT_SLICE_WORDS;
++   channel->bind_3d_offset_words = commands - channel->builtin_cpu;
++   *commands++ = 0x20010000; /* SET_OBJECT, subchannel 0, one word */
++   *commands++ = 0x0000b197; /* MAXWELL_B, GM20B's 3D engine */
+    channel->cache_acquire_offset_words = commands - channel->builtin_cpu;
+    channel->cache_acquire_words =
+       nouveau_horizon_gm20b_build_cache_acquire(commands);
+diff --git a/src/nouveau/horizon/nouveau_horizon_private.h b/src/nouveau/horizon/nouveau_horizon_private.h
+index 1af98bb..df990b7 100644
+--- a/src/nouveau/horizon/nouveau_horizon_private.h
++++ b/src/nouveau/horizon/nouveau_horizon_private.h
+@@ -182,6 +182,7 @@ struct nouveau_horizon_channel {
+    bool quarantined;
+    bool pending_work;
+    bool cache_acquire_emitted;
++   bool bind_3d_emitted;
+    bool last_fence_valid;
+    bool last_fence_cpu_visible;
+    bool lost;
+@@ -196,6 +197,7 @@ struct nouveau_horizon_channel {
+    uint32_t *builtin_cpu;
+    uint64_t builtin_addr;
+ 
++   uint32_t bind_3d_offset_words;
+    uint32_t cache_acquire_offset_words;
+    uint32_t cache_acquire_words;
+    uint32_t cache_acquire_sync_offset_words;

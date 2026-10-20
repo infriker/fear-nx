@@ -1,0 +1,103 @@
+diff --git a/src/core/guest_memory_switch.cpp b/src/core/guest_memory_switch.cpp
+index 435e97f..3f6ecb2 100644
+--- a/src/core/guest_memory_switch.cpp
++++ b/src/core/guest_memory_switch.cpp
+@@ -7,6 +7,7 @@
+ #include <malloc.h>
+ #include <string.h>
+ #include <switch.h>
++#include <rex/logging.h>
+ 
+ #include <map>
+ #include <set>
+@@ -783,11 +784,51 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
+      * it. Pages that already had logical protection keep it.
+      */
+     (void)access;
+-    if (length == 0) return true;
+-
+     State& s = S();
+     std::lock_guard<std::mutex> lock(s.mutex);
+-    if (!s.base) return false;
++    s.last_result = 0;
++    if (length == 0) return true;
++
++    auto fail = [&](const char* stage, uint32_t result, size_t chunk_offset,
++                    size_t chunk_length) {
++        s.last_result = result;
++        u64 system_resource_used_bytes = 0;
++        u64 system_resource_total_bytes = 0;
++        const Result system_resource_used_result =
++            svcGetInfo(&system_resource_used_bytes, InfoType_SystemResourceSizeUsed,
++                       CUR_PROCESS_HANDLE, 0);
++        const Result system_resource_total_result =
++            svcGetInfo(&system_resource_total_bytes, InfoType_SystemResourceSizeTotal,
++                       CUR_PROCESS_HANDLE, 0);
++
++        size_t chunks_4k = 0;
++        size_t chunks_4k_64k = 0;
++        size_t chunks_64k_1m = 0;
++        size_t chunks_over_1m = 0;
++        for (const auto& entry : s.chunks) {
++            const size_t chunk_size = entry.second.length;
++            if (chunk_size <= 0x1000) ++chunks_4k;
++            else if (chunk_size <= 0x10000) ++chunks_4k_64k;
++            else if (chunk_size <= 0x100000) ++chunks_64k_1m;
++            else ++chunks_over_1m;
++        }
++
++        REXLOG_ERROR(
++            "GuestMemory commit failed: stage={} result=0x{:08X} module={} description={} "
++            "offset=0x{:X} bytes=0x{:X} chunk_offset=0x{:X} chunk_bytes=0x{:X} "
++            "committed_bytes={} mapped_bytes={} chunks={} chunks_4k={} chunks_4k_64k={} "
++            "chunks_64k_1m={} chunks_over_1m={} view_mapped={} "
++            "system_resource_used_bytes={} system_resource_used_query=0x{:08X} "
++            "system_resource_total_bytes={} system_resource_total_query=0x{:08X}",
++            stage, result, result & 0x1FFu, (result >> 9) & 0x1FFFu, offset, length,
++            chunk_offset, chunk_length, s.committed, s.mapped, s.chunks.size(),
++            chunks_4k, chunks_4k_64k, chunks_64k_1m, chunks_over_1m, s.view_mapped.size(),
++            system_resource_used_bytes, unsigned(system_resource_used_result),
++            system_resource_total_bytes, unsigned(system_resource_total_result));
++        return false;
++    };
++
++    if (!s.base) return fail("uninitialized", 0, offset, length);
+ 
+     const size_t begin = AlignDown(offset, kPageSize);
+     const size_t end   = AlignUp(offset + length, kPageSize);
+@@ -811,8 +852,7 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
+ 
+         void* backing = memalign(align, tam);
+         if (!backing) {
+-            s.last_result = REX_GM_ERR_NOMEM;
+-            return false;
++            return fail("memalign", REX_GM_ERR_NOMEM, cur, tam);
+         }
+         memset(backing, 0, tam);
+ 
+@@ -825,13 +865,11 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
+ 
+         if (!shadow) {
+             free(backing);
+-            s.last_result = REX_GM_ERR_NOCODEVA;
+-            return false;
++            return fail("find-code-va", REX_GM_ERR_NOCODEVA, cur, tam);
+         }
+         if (R_FAILED(rc)) {
+             free(backing);
+-            s.last_result = rc;
+-            return false;
++            return fail("map-code-memory", rc, cur, tam);
+         }
+ 
+         /* The code alias starts without write access; it has to be opened. */
+@@ -840,8 +878,7 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
+             svcUnmapProcessCodeMemory(Proc(), reinterpret_cast<u64>(shadow),
+                                       reinterpret_cast<u64>(backing), tam);
+             free(backing);
+-            s.last_result = rc;
+-            return false;
++            return fail("set-permission", rc, cur, tam);
+         }
+ 
+         /*

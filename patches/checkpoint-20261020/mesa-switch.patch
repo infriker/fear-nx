@@ -1,0 +1,776 @@
+diff --git a/Docker.rust b/Docker.rust
+index 2405f300d5255662673f7e0bd15ec12520b4f25b..13a35e41b7f11e5611c02884f1e38d90dcfe6659 100644
+--- a/Docker.rust
++++ b/Docker.rust
+@@ -1,4 +1,4 @@
+-FROM devkitpro/devkita64:latest
++FROM devkitpro/devkita64:20260219
+ 
+ # Pre-install all required packages
+ RUN apt-get update && \
+@@ -25,13 +25,13 @@ RUN cd /tmp && \
+     git clone --depth 1 --branch vulkan-sdk-1.3.290.0 https://github.com/KhronosGroup/SPIRV-Headers.git SPIRV-Tools/external/spirv-headers && \
+     cd SPIRV-Tools && mkdir build && cd build && \
+     cmake .. -DCMAKE_INSTALL_PREFIX=/usr/local -DCMAKE_BUILD_TYPE=Release -DSPIRV_SKIP_TESTS=ON && \
+-    make -j$(nproc) && make install && \
++    make -j3 && make install && \
+     rm -rf /tmp/SPIRV-Tools
+ 
+ # Install Rust nightly with rust-src for -Zbuild-std and bindgen for NAK
+ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain nightly && \
+     . $HOME/.cargo/env && \
+-    rustup component add rust-src && \
++    rustup component add rust-src && rustup target add aarch64-unknown-linux-gnu && \
+     cargo install bindgen-cli cbindgen
+ 
+ ENV PATH="/root/.cargo/bin:${PATH}"
+diff --git a/build-switch-p8.sh b/build-switch-p8.sh
+new file mode 100644
+index 0000000000000000000000000000000000000000..22693427c5065e1ef0adbde195a7d2bd873c8bf0
+--- /dev/null
++++ b/build-switch-p8.sh
+@@ -0,0 +1,152 @@
++#!/bin/bash
++set -e
++
++IMAGE_NAME="devkitpro-mesa-rust-aarch64"
++CONTAINER_NAME="mesa-switch-build"
++
++# Build the Docker image if needed.
++if ! docker image inspect "$IMAGE_NAME" >/dev/null 2>&1; then
++    echo "=== Building Docker image ==="
++    docker build -f Docker.rust -t "$IMAGE_NAME" .
++fi
++
++# Start the build container.
++docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
++docker run -d --name "$CONTAINER_NAME" \
++    -v "$(pwd):/project" --workdir "/project" \
++    "$IMAGE_NAME" sleep infinity
++
++run() { docker exec -e MESA_SWITCH_RUST_TARGET=aarch64-unknown-linux-gnu "$CONTAINER_NAME" bash -c "$1"; }
++
++# Install cross-build wrappers for bindgen and Rust compiler probes.
++run '
++mkdir -p /usr/local/libexec
++cp /project/bindgen-switch-wrapper.sh /usr/local/libexec/bindgen
++cp /project/rustc-switch-wrapper.sh /usr/local/libexec/rustc
++# bindgen-switch-wrapper.sh resolves the shim as $SCRIPT_DIR/bindgen-atomic-shim.h,
++# so it has to live next to the installed wrapper.
++cp /project/bindgen-atomic-shim.h /usr/local/libexec/bindgen-atomic-shim.h
++chmod +x /usr/local/libexec/bindgen /usr/local/libexec/rustc
++sed -i 's/\r$//' /usr/local/libexec/bindgen /usr/local/libexec/rustc
++'
++
++# Preserve the Meson path recorded in build.ninja for later regeneration.
++run '
++MESON_BIN="$(command -v meson || true)"
++if [ -z "$MESON_BIN" ]; then
++    echo "ERROR: meson not found in container PATH" >&2
++    exit 1
++fi
++mkdir -p /usr/local/bin
++if [ "$MESON_BIN" != "/usr/local/bin/meson" ]; then
++    ln -sf "$MESON_BIN" /usr/local/bin/meson
++fi
++'
++
++# Install this checkout's Nouveau headers for consumers and bindgen.
++run '
++cp /project/src/gallium/winsys/nouveau/drm/nouveau.h \
++    /opt/devkitpro/portlibs/switch/include/
++cp /project/src/nouveau/headers/nv_device_info.h \
++    /opt/devkitpro/portlibs/switch/include/
++'
++
++# Alias Debian's full-version Clang headers to the major path mesa_clc uses.
++run '
++if [ ! -d /usr/lib/llvm-15/lib/clang/15/include ]; then
++    ln -sf /usr/lib/llvm-15/lib/clang/15.0.6/include /usr/lib/llvm-15/lib/clang/15/include
++fi
++'
++
++# Rust std requires -lrt -ldl -lutil. Supply placeholder archives;
++# src/nouveau/vulkan/rust_switch_stubs.c provides compatibility symbols.
++run '
++if [ ! -f /opt/devkitpro/portlibs/switch/lib/libdl.a ]; then
++    cd /tmp
++    echo "void __mesa_switch_stub_lib(void) {}" > stub_posix.c
++    /opt/devkitpro/devkitA64/bin/aarch64-none-elf-gcc -c stub_posix.c -o stub_posix.o
++    for L in dl rt util; do
++        /opt/devkitpro/devkitA64/bin/aarch64-none-elf-ar rcs \
++            /opt/devkitpro/portlibs/switch/lib/lib${L}.a stub_posix.o
++    done
++fi
++'
++
++# Build native host tools.
++echo "=== Building native host tools (mesa_clc, vtn_bindgen2) ==="
++run '
++cd /project && meson setup builddir-native --wipe \
++    -Dvulkan-drivers= \
++    -Dgallium-drivers= \
++    -Dshader-cache=true \
++    -Dplatforms= \
++    -Dglx=disabled \
++    -Degl=disabled \
++    -Dopengl=false \
++    -Dgles1=disabled \
++    -Dgles2=disabled \
++    -Dtools=[] \
++    -Dllvm=enabled \
++    -Dmesa-clc=enabled \
++    -Dprecomp-compiler=enabled \
++    -Dinstall-mesa-clc=true
++'
++run 'ninja -j3 -C /project/builddir-native src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2'
++
++# Configure the cross build.
++echo "=== Configuring cross build (Switch + nouveau + nouveau_vk) ==="
++run '
++export PATH="/usr/local/libexec:/project/builddir-native/src/compiler/clc:/project/builddir-native/src/compiler/spirv:$PATH"
++cd /project && meson setup builddir-switch --wipe \
++    --cross-file switch_cross_file.txt \
++    --native-file p8-native.txt \
++    --buildtype=release \
++    -Doptimization=1 \
++    -Db_lto=false \
++    -Db_ndebug=true \
++    -Dvulkan-drivers=nouveau \
++    -Dgallium-drivers=nouveau \
++    -Dshader-cache=true \
++    -Dgallium-rusticl=false \
++    -Dplatforms=switch \
++    -Dglx=disabled \
++    -Degl=disabled \
++    -Dopengl=false \
++    -Dgles1=disabled \
++    -Dgles2=disabled \
++    -Dllvm=disabled \
++    -Dshared-glapi=disabled \
++    -Dshared-llvm=disabled \
++    -Dmesa-clc=system \
++    -Dprecomp-compiler=system \
++    -Dcpp_rtti=false
++'
++
++# Build Switch archives.
++echo "=== Building Mesa for Switch ==="
++run '
++export PATH="/usr/local/libexec:/project/builddir-native/src/compiler/clc:/project/builddir-native/src/compiler/spirv:$PATH"
++ninja -j3 -C /project/builddir-switch \
++    src/nouveau/vulkan/libnvk.a \
++    src/nouveau/vulkan/libvulkan.a \
++    src/vulkan/util/libvulkan_util.a \
++    src/compiler/nir/libnir.a \
++    src/compiler/libcompiler.a \
++    src/compiler/spirv/libvtn.a \
++    src/util/libxmlconfig.a \
++    src/nouveau/compiler/libnak.a \
++    src/nouveau/compiler/libnak_rs.a \
++    src/nouveau/nil/libnil.a \
++    src/nouveau/nil/liblibnil_format_table.a \
++    src/nouveau/mme/libnouveau_mme.a \
++    src/nouveau/winsys/libnouveau_ws.a \
++    src/nouveau/headers/libnvidia_headers_c.a \
++    src/compiler/rust/libcompiler_c_helpers.a \
++    src/util/libmesa_util.a \
++    src/util/libmesa_util_simd.a \
++    src/util/blake3/libblake3.a \
++    src/c11/impl/libmesa_util_c11.a
++'
++
++echo "=== Build complete ==="
++docker stop "$CONTAINER_NAME"
+diff --git a/p8-native.txt b/p8-native.txt
+new file mode 100644
+index 0000000000000000000000000000000000000000..2c23966b0a28ab6c0d01f1d02e4eb99e789aa089
+--- /dev/null
++++ b/p8-native.txt
+@@ -0,0 +1,2 @@
++[binaries]
++rust = '/root/.cargo/bin/rustc'
+diff --git a/rustc-switch-wrapper.sh b/rustc-switch-wrapper.sh
+index 008e20db5cb6a003d5db3c0ad7cd69e9ad2a3226..e5884be339c025297b6e8739622773d282f2229d 100755
+--- a/rustc-switch-wrapper.sh
++++ b/rustc-switch-wrapper.sh
+@@ -35,6 +35,14 @@ for arg in "$@"; do
+         *sanity_check_for_rust.rs*|*sanitycheckrs.rs*) RUST_TARGET= ;;
+     esac
+ done
++# Proc macros run inside the compiler, on the build machine: never cross-compile them.
++prev=
++for arg in "$@"; do
++    if [ "$prev" = "--crate-type" ] && [ "$arg" = "proc-macro" ]; then
++        RUST_TARGET=
++    fi
++    prev=$arg
++done
+ 
+ if [ -n "$RUST_TARGET" ]; then
+     exec "$RUSTC_BIN" --target="$RUST_TARGET" "$@"
+diff --git a/src/nouveau/compiler/nak/opt_instr_sched_common.rs b/src/nouveau/compiler/nak/opt_instr_sched_common.rs
+index 2d8be486f6d0ff28616707f7e1e1c6386388d2c4..ae3e1241647271f0f1ccd25c677afb5333e41741 100644
+--- a/src/nouveau/compiler/nak/opt_instr_sched_common.rs
++++ b/src/nouveau/compiler/nak/opt_instr_sched_common.rs
+@@ -289,7 +289,15 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
+         | Op::Tld4(_)
+         | Op::Tmml(_)
+         | Op::Txd(_)
+-        | Op::Txq(_) => 32,
++        | Op::Txq(_) => {
++            // Tegra X1 (GM20B) shares LPDDR4 with the CPU: a texture miss
++            // costs hundreds of cycles, not 32. A larger estimate makes the
++            // pre-pass separate each fetch from its first use and keep more
++            // in flight. Only scheduling priority changes; the dependency
++            // barriers come from calc_instr_deps. From nfsmw-nx's Mesa patch
++            // (MIT).
++            if sm.sm() < 70 { 200 } else { 32 }
++        }
+ 
+         // Surface ops
+         Op::SuLd(_)
+@@ -314,7 +322,11 @@ pub fn estimate_variable_latency(sm: &ShaderModelInfo, op: &Op) -> u32 {
+         | Op::Ipa(_)
+         | Op::CCtl(_)
+         | Op::LdTram(_)
+-        | Op::MemBar(_) => 32,
++        | Op::MemBar(_) => {
++            // Global loads from the shared LPDDR4 likewise take far longer
++            // than 32 cycles on GM20B (see the texture ops above).
++            if sm.sm() < 70 { 200 } else { 32 }
++        }
+ 
+         // Control-flow ops
+         Op::WarpSync(_) => 16,
+diff --git a/src/nouveau/compiler/nak_nir.c b/src/nouveau/compiler/nak_nir.c
+index beb01b1d9db523b0a5f6c9cdc8b7549f9e7f2e7a..b23fee112bb23eea0e99e38063ade0bea22006d3 100644
+--- a/src/nouveau/compiler/nak_nir.c
++++ b/src/nouveau/compiler/nak_nir.c
+@@ -203,8 +203,14 @@ nak_optimize_nir(nir_shader *nir, const struct nak_compiler *nak)
+       LOOP_OPT(nir, nir_opt_dce);
+       LOOP_OPT(nir, nir_opt_cse);
+ 
++      /* Before Volta NAK has no if-to-predicate pass, so every if that
++       * survives NIR is a real SSY/BRA/SYNC. Flatten small ones as ANV and
++       * RADV do (limit 8). From nfsmw-nx's Mesa patch (MIT); watch
++       * NVK_SHADER_STATS for local-memory spills if this ever raises register
++       * pressure too far.
++       */
+       nir_opt_peephole_select_options peephole_select_options = {
+-         .limit = 0,
++         .limit = nak->sm < 70 ? 8 : 0,
+          .discard_ok = true,
+       };
+       LOOP_OPT_NOT_IDEMPOTENT(nir, nir_opt_peephole_select,
+diff --git a/src/nouveau/horizon/nouveau_horizon.h b/src/nouveau/horizon/nouveau_horizon.h
+index faea7b739c6855b34579d8611c181310771dbc0e..a0fd4e3dfad6b4c819213eddb5b66b21135db347 100644
+--- a/src/nouveau/horizon/nouveau_horizon.h
++++ b/src/nouveau/horizon/nouveau_horizon.h
+@@ -222,6 +222,15 @@ enum nouveau_horizon_channel_priority {
+    NOUVEAU_HORIZON_CHANNEL_PRIORITY_HIGH,
+ };
+ 
++/* Engine classes that a client may submit on a Horizon channel. */
++enum nouveau_horizon_engine_mask {
++   NOUVEAU_HORIZON_ENGINE_COPY    = 1u << 0,
++   NOUVEAU_HORIZON_ENGINE_2D      = 1u << 1,
++   NOUVEAU_HORIZON_ENGINE_3D      = 1u << 2,
++   NOUVEAU_HORIZON_ENGINE_M2MF    = 1u << 3,
++   NOUVEAU_HORIZON_ENGINE_COMPUTE = 1u << 4,
++};
++
+ enum nouveau_horizon_mapped_completion_mode {
+    NOUVEAU_HORIZON_MAPPED_COMPLETION_DISABLED,
+ 
+@@ -235,6 +244,11 @@ enum nouveau_horizon_mapped_completion_mode {
+ struct nouveau_horizon_channel_create_info {
+    enum nouveau_horizon_channel_priority priority;
+ 
++   /* Engine objects to bind before the client's first packet. The channel's
++    * internal cache/fence packets always use the 3D engine on subchannel 0.
++    */
++   uint32_t engine_mask;
++
+    /* Mapped progress avoids native polling ioctls; blocking waits and
+     * fault detection still use syncpoints. Enable only for a validated
+     * GM20B 3D channel bound on subchannel zero. Other layouts must use
+diff --git a/src/nouveau/horizon/nouveau_horizon_channel.c b/src/nouveau/horizon/nouveau_horizon_channel.c
+index e0fa51f6bcd68bc1b3f14ffeaed18bf353afb670..3b90fd259323f4fe75a7bff95524cf803159db99 100644
+--- a/src/nouveau/horizon/nouveau_horizon_channel.c
++++ b/src/nouveau/horizon/nouveau_horizon_channel.c
+@@ -810,9 +810,10 @@ nouveau_horizon_channel_reserve_entries_locked(
+ {
+    const uint32_t total_order_entry =
+       channel->device->total_order_channels ? 1 : 0;
++   const uint32_t bootstrap_entries = channel->bind_engines_emitted ? 0 : 1;
+    const uint64_t required =
+       (uint64_t)channel->gpu_channel.num_entries + entries + tail_entries +
+-      NOUVEAU_HORIZON_GPFIFO_FINAL_SKID + total_order_entry;
++      NOUVEAU_HORIZON_GPFIFO_FINAL_SKID + total_order_entry + bootstrap_entries;
+    if (required > GPFIFO_QUEUE_SIZE)
+       return NOUVEAU_HORIZON_ERROR_NO_SPACE;
+    return NOUVEAU_HORIZON_SUCCESS;
+@@ -836,7 +837,9 @@ nouveau_horizon_channel_append_locked(
+    enum nouveau_horizon_status status;
+ 
+    if (consume_reserved) {
+-      status = channel->gpu_channel.num_entries + 1 + tail_entries <=
++      const uint32_t bootstrap_entries = channel->bind_engines_emitted ? 0 : 1;
++      status = channel->gpu_channel.num_entries + 1 + tail_entries +
++                  bootstrap_entries <=
+                   GPFIFO_QUEUE_SIZE ?
+                   NOUVEAU_HORIZON_SUCCESS :
+                   NOUVEAU_HORIZON_ERROR_NO_SPACE;
+@@ -847,6 +850,31 @@ nouveau_horizon_channel_append_locked(
+    if (status != NOUVEAU_HORIZON_SUCCESS)
+       return status;
+ 
++   /* The channel's own cache-acquire and fence packets use 3D subchannel 0,
++    * while the client may use additional subchannels for copy/compute work.
++    * Bind all requested engines in one lazy entry before any packet is
++    * submitted. Keep this lazy so mapped-completion setup still sees an
++    * empty queue.
++    */
++   if (!channel->bind_engines_emitted) {
++      const Result bind_rc = nvGpuChannelAppendEntry(
++         &channel->gpu_channel,
++         channel->builtin_addr + 4ull * channel->bind_engines_offset_words,
++         channel->bind_engines_words, GPFIFO_ENTRY_NOT_MAIN, 0);
++      if (R_FAILED(bind_rc)) {
++         if (channel->device->enable_timing)
++            channel->stats.submit_failures++;
++         nouveau_horizon_channel_latch_error(
++            channel, NOUVEAU_HORIZON_ERROR_DEVICE_LOST, bind_rc);
++         nouveau_horizon_channel_check_error_locked(channel);
++         return channel->error.status;
++      }
++      channel->bind_engines_emitted = true;
++      channel->pending_command_bytes +=
++         (uint64_t)channel->bind_engines_words * sizeof(uint32_t);
++      channel->pending_dwords += channel->bind_engines_words;
++   }
++
+    const Result rc = nvGpuChannelAppendEntry(&channel->gpu_channel,
+                                               addr, command_count,
+                                               flags, 0);
+@@ -952,7 +980,6 @@ nouveau_horizon_channel_append_waits_locked(
+    const uint32_t command_count = nouveau_horizon_gm20b_build_waits(
+       commands, wait_count, waits);
+ 
+-   const uint32_t original_entries = channel->gpu_channel.num_entries;
+    status = nouveau_horizon_channel_append_locked(
+       channel, nouveau_horizon_channel_wait_slice_addr(channel, slice),
+       command_count,
+@@ -961,12 +988,17 @@ nouveau_horizon_channel_append_waits_locked(
+    if (status != NOUVEAU_HORIZON_SUCCESS)
+       return status;
+ 
+-   if (prepend && original_entries > 0) {
++   if (prepend && channel->gpu_channel.num_entries > 1) {
++      /* append_locked may have inserted the one-time 3D binding too. The
++       * requested wait is always last, regardless of that extra entry.
++       * These FIFO waits do not require a bound 3D engine.
++       */
++      const uint32_t wait_index = channel->gpu_channel.num_entries - 1;
+       const nvioctl_gpfifo_entry wait_entry =
+-         channel->gpu_channel.entries[original_entries];
++         channel->gpu_channel.entries[wait_index];
+       memmove(&channel->gpu_channel.entries[1],
+               &channel->gpu_channel.entries[0],
+-              original_entries * sizeof(channel->gpu_channel.entries[0]));
++              wait_index * sizeof(channel->gpu_channel.entries[0]));
+       channel->gpu_channel.entries[0] = wait_entry;
+    }
+ 
+@@ -1542,6 +1574,33 @@ nouveau_horizon_channel_create(
+    uint32_t *commands = channel->builtin_cpu +
+       NOUVEAU_HORIZON_WAIT_SLICE_COUNT *
+          NOUVEAU_HORIZON_WAIT_SLICE_WORDS;
++   channel->bind_engines_offset_words = commands - channel->builtin_cpu;
++
++   const struct nv_device_info *dev_info =
++      nouveau_horizon_device_get_info(device);
++#define BIND_ENGINE(subchannel, class_id) do { \
++      *commands++ = 0x20010000u | ((uint32_t)(subchannel) << 13); \
++      *commands++ = (class_id); \
++   } while (0)
++
++   /* Horizon's built-in cache/fence packets require 3D even on a copy-only
++    * context. Bind every additional engine only when the client requested it.
++    */
++   BIND_ENGINE(0, dev_info->cls_eng3d);
++   const uint32_t engine_mask =
++      create_info != NULL ? create_info->engine_mask : 0;
++   if (engine_mask & NOUVEAU_HORIZON_ENGINE_COMPUTE)
++      BIND_ENGINE(1, dev_info->cls_compute);
++   if (engine_mask & NOUVEAU_HORIZON_ENGINE_M2MF)
++      BIND_ENGINE(2, dev_info->cls_m2mf);
++   if (engine_mask & NOUVEAU_HORIZON_ENGINE_2D)
++      BIND_ENGINE(3, dev_info->cls_eng2d);
++   if (engine_mask & NOUVEAU_HORIZON_ENGINE_COPY)
++      BIND_ENGINE(4, dev_info->cls_copy);
++#undef BIND_ENGINE
++
++   channel->bind_engines_words = (uint32_t)(commands -
++      (channel->builtin_cpu + channel->bind_engines_offset_words));
+    channel->cache_acquire_offset_words = commands - channel->builtin_cpu;
+    channel->cache_acquire_words =
+       nouveau_horizon_gm20b_build_cache_acquire(commands);
+diff --git a/src/nouveau/horizon/nouveau_horizon_private.h b/src/nouveau/horizon/nouveau_horizon_private.h
+index 1af98bb99627c3e62112a0d9b502fe35dff2325c..ee0aec41fc609ebdc7a842e1d887418274985a0c 100644
+--- a/src/nouveau/horizon/nouveau_horizon_private.h
++++ b/src/nouveau/horizon/nouveau_horizon_private.h
+@@ -182,6 +182,7 @@ struct nouveau_horizon_channel {
+    bool quarantined;
+    bool pending_work;
+    bool cache_acquire_emitted;
++   bool bind_engines_emitted;
+    bool last_fence_valid;
+    bool last_fence_cpu_visible;
+    bool lost;
+@@ -196,6 +197,8 @@ struct nouveau_horizon_channel {
+    uint32_t *builtin_cpu;
+    uint64_t builtin_addr;
+ 
++   uint32_t bind_engines_offset_words;
++   uint32_t bind_engines_words;
+    uint32_t cache_acquire_offset_words;
+    uint32_t cache_acquire_words;
+    uint32_t cache_acquire_sync_offset_words;
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.c b/src/nouveau/vulkan/nvk_cmd_buffer.c
+index 60ae745ace7e3c8b6d952c2c5d954aa0eb338ebb..1b089a2cfc88d89b2319504889ffbcc8067553f2 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.c
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.c
+@@ -644,6 +644,9 @@ nvk_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+                        const VkCommandBuffer *pCommandBuffers)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+ 
+    if (commandBufferCount == 0)
+       return;
+@@ -1768,6 +1771,29 @@ nvk_cmd_buffer_get_cbuf_addr(struct nvk_cmd_buffer *cmd,
+    }
+ 
+    case NVK_CBUF_TYPE_UBO_DESC: {
++#ifdef HAVE_SWITCH_PLATFORM
++      /* Before Turing, a UBO whose descriptor is only in memory is bound by
++       * an MME macro reading an indirect GPFIFO segment: two GPFIFO entries
++       * and a no-prefetch front-end stall per binding. With ~1500 draws a
++       * frame that filled the 2048-entry GPFIFO, stalled every kickoff and
++       * finally lost the device. Unless the set allows update-after-bind,
++       * Vulkan forbids changing it while a command buffer using it may run,
++       * so the descriptor read now is the one the GPU would read.
++       */
++      if (desc->sets[cbuf->desc_set].type == NVK_DESCRIPTOR_SET_TYPE_SET) {
++         const struct nvk_descriptor_set *set = desc->sets[cbuf->desc_set].set;
++         if (set != NULL && set->map != NULL &&
++             !(set->layout->flags &
++               VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT) &&
++             cbuf->desc_offset + sizeof(union nvk_buffer_descriptor) <= set->size_B) {
++            union nvk_buffer_descriptor set_desc;
++            memcpy(&set_desc, (const char *)set->map + cbuf->desc_offset,
++                   sizeof(set_desc));
++            *addr_out = nvk_ubo_descriptor_addr(pdev, set_desc);
++            return true;
++         }
++      }
++#endif
+       if (desc->sets[cbuf->desc_set].type != NVK_DESCRIPTOR_SET_TYPE_PUSH)
+          return false;
+ 
+diff --git a/src/nouveau/vulkan/nvk_cmd_buffer.h b/src/nouveau/vulkan/nvk_cmd_buffer.h
+index 0c6a5fd811bda1f8886993d5de8d86959f31f16d..268d83f8a86db3eb8cf9cae2c2d116cc8eda4078 100644
+--- a/src/nouveau/vulkan/nvk_cmd_buffer.h
++++ b/src/nouveau/vulkan/nvk_cmd_buffer.h
+@@ -223,6 +223,16 @@ struct nvk_graphics_state {
+    /* Used for meta save/restore */
+    VkDeviceAddressRangeKHR vb0;
+ 
++#ifdef HAVE_SWITCH_PLATFORM
++   /* Before Turing the draw macro writes the draw parameters (base vertex,
++    * base instance, draw and view index) into cb0 unconditionally, four
++    * constant buffer updates per draw. True when this command buffer's last
++    * draw left all of them zero, so a draw with zero parameters can skip the
++    * macro and its cb0 writes.
++    */
++   bool switch_draw_params_zero;
++#endif
++
+    /* Needed by vk_command_buffer::dynamic_graphics_state */
+    struct vk_vertex_input_state _dynamic_vi;
+    struct vk_sample_locations_state _dynamic_sl;
+diff --git a/src/nouveau/vulkan/nvk_cmd_draw.c b/src/nouveau/vulkan/nvk_cmd_draw.c
+index 0cbdd883a64d8ec2e2ad946d1a0a0045a8698ef4..756dc69eccfb7bbab2cc7d4a5c0ed943356ad6cf 100644
+--- a/src/nouveau/vulkan/nvk_cmd_draw.c
++++ b/src/nouveau/vulkan/nvk_cmd_draw.c
+@@ -824,6 +824,10 @@ void
+ nvk_cmd_buffer_begin_graphics(struct nvk_cmd_buffer *cmd,
+                               const VkCommandBufferBeginInfo *pBeginInfo)
+ {
++#ifdef HAVE_SWITCH_PLATFORM
++   /* Whatever an earlier command buffer left in cb0 is unknown here. */
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+    const struct nvk_device *dev = nvk_cmd_buffer_device(cmd);
+    if (cmd->vk.level == VK_COMMAND_BUFFER_LEVEL_PRIMARY) {
+       struct nv_push *p = nvk_cmd_buffer_push(cmd, 9);
+@@ -4963,6 +4967,36 @@ nvk_mme_build_draw(struct mme_builder *b,
+       nvk_mme_unspill(b, DRAW_IDX, draw_index);
+ }
+ 
++#ifdef HAVE_SWITCH_PLATFORM
++/* A draw that can be issued without the draw macro: the parameters it would
++ * write are all zero and already are, and there is no multiview loop.  The
++ * nouveau GL driver issues direct draws on these GPUs the same way.
++ */
++static bool
++nvk_switch_direct_draw_ok(struct nvk_cmd_buffer *cmd, uint32_t instance_count,
++                          int32_t first_vertex_or_offset, uint32_t first_instance)
++{
++   return nvk_cmd_buffer_3d_cls(cmd) < PASCAL_B &&
++          instance_count == 1 && first_vertex_or_offset == 0 &&
++          first_instance == 0 &&
++          cmd->state.gfx.render.view_mask == 0 &&
++          cmd->state.gfx.switch_draw_params_zero;
++}
++
++static uint32_t
++nvk_switch_direct_begin(void)
++{
++   uint32_t begin;
++   V_NVC197_BEGIN(begin, {
++      .primitive_id = PRIMITIVE_ID_FIRST,
++      .instance_id = INSTANCE_ID_FIRST,
++      .split_mode = SPLIT_MODE_NORMAL_BEGIN_NORMAL_END,
++      .instance_iterate_enable = false,
++   });
++   return begin;
++}
++#endif
++
+ void
+ nvk_mme_draw(struct mme_builder *b)
+ {
+@@ -4984,6 +5018,20 @@ nvk_CmdDraw(VkCommandBuffer commandBuffer,
+ 
+    nvk_cmd_flush_gfx_state(cmd);
+ 
++#ifdef HAVE_SWITCH_PLATFORM
++   if (nvk_switch_direct_draw_ok(cmd, instanceCount, firstVertex, firstInstance)) {
++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
++      P_MTHD(p, NV9097, BEGIN);
++      P_INLINE_DATA(p, nvk_switch_direct_begin());
++      P_MTHD(p, NV9097, SET_VERTEX_ARRAY_START);
++      P_NV9097_SET_VERTEX_ARRAY_START(p, 0);
++      P_NV9097_DRAW_VERTEX_ARRAY(p, vertexCount);
++      P_MTHD(p, NV9097, END);
++      P_INLINE_DATA(p, 0);
++      return;
++   }
++#endif
++
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 6);
+    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW));
+    P_INLINE_DATA(p, 0 /* draw_index */);
+@@ -4991,6 +5039,10 @@ nvk_CmdDraw(VkCommandBuffer commandBuffer,
+    P_INLINE_DATA(p, instanceCount);
+    P_INLINE_DATA(p, firstVertex);
+    P_INLINE_DATA(p, firstInstance);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero =
++      firstVertex == 0 && firstInstance == 0 && cmd->state.gfx.render.view_mask == 0;
++#endif
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -5002,6 +5054,9 @@ nvk_CmdDrawMultiEXT(VkCommandBuffer commandBuffer,
+                     uint32_t stride)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+ 
+    if (unlikely(!drawCount || !pVertexInfo->vertexCount || !instanceCount))
+       return;
+@@ -5162,6 +5217,20 @@ nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+ 
+    nvk_cmd_flush_gfx_state(cmd);
+ 
++#ifdef HAVE_SWITCH_PLATFORM
++   if (nvk_switch_direct_draw_ok(cmd, instanceCount, vertexOffset, firstInstance)) {
++      struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
++      P_MTHD(p, NV9097, BEGIN);
++      P_INLINE_DATA(p, nvk_switch_direct_begin());
++      P_MTHD(p, NV9097, SET_INDEX_BUFFER_F);
++      P_NV9097_SET_INDEX_BUFFER_F(p, firstIndex);
++      P_NV9097_DRAW_INDEX_BUFFER(p, indexCount);
++      P_MTHD(p, NV9097, END);
++      P_INLINE_DATA(p, 0);
++      return;
++   }
++#endif
++
+    struct nv_push *p = nvk_cmd_buffer_push(cmd, 7);
+    P_1INC(p, NV9097, CALL_MME_MACRO(NVK_MME_DRAW_INDEXED));
+    P_INLINE_DATA(p, 0 /* draw_index */);
+@@ -5170,6 +5239,10 @@ nvk_CmdDrawIndexed(VkCommandBuffer commandBuffer,
+    P_INLINE_DATA(p, firstIndex);
+    P_INLINE_DATA(p, vertexOffset);
+    P_INLINE_DATA(p, firstInstance);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero =
++      vertexOffset == 0 && firstInstance == 0 && cmd->state.gfx.render.view_mask == 0;
++#endif
+ }
+ 
+ VKAPI_ATTR void VKAPI_CALL
+@@ -5182,6 +5255,9 @@ nvk_CmdDrawMultiIndexedEXT(VkCommandBuffer commandBuffer,
+                            const int32_t *pVertexOffset)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+ 
+    if (unlikely(!drawCount || !pIndexInfo->indexCount || !instanceCount))
+       return;
+@@ -5249,6 +5325,9 @@ nvk_CmdDrawIndirect2KHR(VkCommandBuffer commandBuffer,
+                         const VkDrawIndirect2InfoKHR* pInfo)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+    uint64_t stride = pInfo->addressRange.stride;
+ 
+    if (unlikely(!pInfo->drawCount))
+@@ -5363,6 +5442,9 @@ nvk_CmdDrawIndexedIndirect2KHR(VkCommandBuffer commandBuffer,
+                                const VkDrawIndirect2InfoKHR* pInfo)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+    uint64_t stride = pInfo->addressRange.stride;
+ 
+    /* From the Vulkan 1.3.238 spec:
+@@ -5467,6 +5549,9 @@ nvk_CmdDrawIndirectCount2KHR(VkCommandBuffer commandBuffer,
+                              const VkDrawIndirectCount2InfoKHR* pInfo)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+ 
+    /* TODO: Indirect count draw pre-Turing */
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+@@ -5522,6 +5607,9 @@ nvk_CmdDrawIndexedIndirectCount2KHR(VkCommandBuffer commandBuffer,
+                                     const VkDrawIndirectCount2InfoKHR* pInfo)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+ 
+    /* TODO: Indexed indirect count draw pre-Turing */
+    assert(nvk_cmd_buffer_3d_cls(cmd) >= TURING_A);
+@@ -5634,6 +5722,9 @@ nvk_CmdDrawIndirectByteCount2EXT(VkCommandBuffer commandBuffer,
+                                  uint32_t vertexStride)
+ {
+    VK_FROM_HANDLE(nvk_cmd_buffer, cmd, commandBuffer);
++#ifdef HAVE_SWITCH_PLATFORM
++   cmd->state.gfx.switch_draw_params_zero = false;
++#endif
+ 
+    if (unlikely(!instanceCount))
+       return;
+diff --git a/src/nouveau/vulkan/nvk_shader.c b/src/nouveau/vulkan/nvk_shader.c
+index e63104958c075dd143f168bd11774109fa56bfb2..8428b92354fca419bb7033e5a4c19a991b9f9967 100644
+--- a/src/nouveau/vulkan/nvk_shader.c
++++ b/src/nouveau/vulkan/nvk_shader.c
+@@ -83,6 +83,13 @@ nvk_physical_device_compiler_flags(const struct nvk_physical_device *pdev)
+       | (use_edb_buffer_views ? 1 << 13 : 0)
+       | (instance->drirc.misc.ssbo_align_4b ? 1 << 14 : 0)
+       | (UINT64_C(10) << 16) /* Compiler ABI revision. */
++#ifdef HAVE_SWITCH_PLATFORM
++      /* Revision of the Switch NAK scheduling changes. On Horizon the build
++       * id is the package version, so without this the pipeline cache kept
++       * serving binaries compiled before them. Bump with every NAK change.
++       */
++      | (UINT64_C(1) << 24)
++#endif
+       | (nak_flags << 48);
+ }
+ 
+diff --git a/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_dev.c b/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_dev.c
+index 39bf895a14f7b278b0f8757b7c23ae8fd50e5502..4a046567ef6e303e896e6d3becccef7b1138aee6 100644
+--- a/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_dev.c
++++ b/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_dev.c
+@@ -1180,6 +1180,23 @@ nvkmd_switch_ctx_init_zcull(struct nvkmd_switch_ctx *ctx)
+       ctx->channel, nouveau_horizon_va_get_addr(ctx->zcull_va));
+ }
+ 
++static uint32_t
++nvkmd_switch_horizon_engine_mask(enum nvkmd_engines engines)
++{
++   uint32_t mask = 0;
++   if (engines & NVKMD_ENGINE_COPY)
++      mask |= NOUVEAU_HORIZON_ENGINE_COPY;
++   if (engines & NVKMD_ENGINE_2D)
++      mask |= NOUVEAU_HORIZON_ENGINE_2D;
++   if (engines & NVKMD_ENGINE_3D)
++      mask |= NOUVEAU_HORIZON_ENGINE_3D;
++   if (engines & NVKMD_ENGINE_M2MF)
++      mask |= NOUVEAU_HORIZON_ENGINE_M2MF;
++   if (engines & NVKMD_ENGINE_COMPUTE)
++      mask |= NOUVEAU_HORIZON_ENGINE_COMPUTE;
++   return mask;
++}
++
+ static VkResult
+ nvkmd_switch_dev_create_ctx(struct nvkmd_dev *_dev,
+                             struct vk_object_base *log_obj,
+@@ -1198,6 +1215,7 @@ nvkmd_switch_dev_create_ctx(struct nvkmd_dev *_dev,
+    if (engines != NVKMD_ENGINE_BIND) {
+       const struct nouveau_horizon_channel_create_info create_info = {
+          .priority = NOUVEAU_HORIZON_CHANNEL_PRIORITY_MEDIUM,
++         .engine_mask = nvkmd_switch_horizon_engine_mask(engines),
+          .mapped_completion_mode =
+             (engines & NVKMD_ENGINE_3D) &&
+             debug_get_bool_option("NVK_SWITCH_MAPPED_COMPLETION", true) ?
+diff --git a/src/util/os_misc.c b/src/util/os_misc.c
+index 4eb0fd98843af844b2121d8da0181e121a05754c..87d79ab39da84ee47483afdef72223040165ae19 100644
+--- a/src/util/os_misc.c
++++ b/src/util/os_misc.c
+@@ -483,6 +483,17 @@ os_get_available_system_memory(uint64_t *size)
+    const uintptr_t heap_end = (uintptr_t)fake_heap_end;
+ 
+    if (heap_start && heap_end > heap_start) {
++      /* mallinfo walks the whole newlib heap under its lock, and VMA asks for
++       * the budget every few dozen allocations: in a game creating textures
++       * as it streams, that was several percent of the thread recording draws.
++       * A value up to 100 ms old is as good for a budget.
++       */
++      static uint64_t cached_size, cached_tick;
++      const uint64_t now = armGetSystemTick();
++      if (cached_tick && now - cached_tick < armGetSystemTickFreq() / 10) {
++         *size = cached_size;
++         return true;
++      }
+       const uint64_t heap_size = heap_end - heap_start;
+       const struct mallinfo allocator = mallinfo();
+       const uint64_t arena = MIN2((uint64_t)allocator.arena, heap_size);
+@@ -494,6 +505,8 @@ os_get_available_system_memory(uint64_t *size)
+        * Counting both also makes the value recover when BO storage is freed.
+        */
+       *size = heap_size - arena + reusable;
++      cached_size = *size;
++      cached_tick = now;
+       return true;
+    }
+ 

@@ -1,0 +1,2746 @@
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index 2cfd93f..f5cfb57 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -15,6 +15,7 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <memory>
++#include <map>
+ #include <unordered_map>
+ #include <vector>
+ 
+@@ -542,10 +543,16 @@ class TextureCache {
+     const uint32_t end = start + pitch_texels * max_height * 4;
+     Texture* found = nullptr;
+     uint32_t overlapping = 0;
+-    for (const auto& entry : textures_) {
+-      const TextureKey& key = entry.first;
+-      const uint32_t texture_start = uint32_t(key.base_page) << 12;
+-      const uint32_t texture_size = entry.second->GetGuestBaseSize();
++    // Only the textures that can reach the range: walking every texture for
++    // each of the ~30 resolves a frame was most of the forwarding's CPU cost.
++    const uint32_t scan_from =
++        start > textures_max_guest_base_size_ ? start - textures_max_guest_base_size_ : 0;
++    for (auto it = textures_by_address_.lower_bound(scan_from);
++         it != textures_by_address_.end() && it->first < end; ++it) {
++      Texture* const texture = it->second;
++      const TextureKey& key = texture->key();
++      const uint32_t texture_start = it->first;
++      const uint32_t texture_size = texture->GetGuestBaseSize();
+       if (!texture_size || texture_start >= end || start >= texture_start + texture_size) {
+         continue;
+       }
+@@ -556,7 +563,7 @@ class TextureCache {
+           key.endianness == endian && !key.signed_separate && !key.scaled_resolve &&
+           uint32_t(key.pitch) * 32 == pitch_texels && key.width_minus_1 < max_width &&
+           key.height_minus_1 < max_height) {
+-        found = entry.second.get();
++        found = texture;
+       }
+     }
+     // Anything else reading this memory would miss the forwarded resolve.
+@@ -690,6 +697,19 @@ class TextureCache {
+   uint64_t current_submission_time_ = 0;
+ 
+   std::unordered_map<TextureKey, std::unique_ptr<Texture>, TextureKey::Hasher> textures_;
++  // The same textures by the physical address of their base level, for range
++  // lookups; kept in step with textures_.
++  std::multimap<uint32_t, Texture*> textures_by_address_;
++  uint32_t textures_max_guest_base_size_ = 0;
++  void UnindexTextureAddress(Texture* texture) {
++    auto range = textures_by_address_.equal_range(uint32_t(texture->key().base_page) << 12);
++    for (auto it = range.first; it != range.second; ++it) {
++      if (it->second == texture) {
++        textures_by_address_.erase(it);
++        return;
++      }
++    }
++  }
+ 
+   uint64_t textures_total_host_memory_usage_ = 0;
+ 
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index 4e9133b..b6c4c4c 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -11,7 +11,9 @@
+  */
+ 
+ #include <cstdint>
++#include <map>
+ #include <mutex>
++#include <unordered_map>
+ #include <utility>
+ #include <vector>
+ 
+@@ -120,8 +122,26 @@ class SharedMemory {
+   //
+   // `write_seq_out`, when given, receives the page write sequence this upload
+   // was stamped with - see MaxWriteSeq. Only written on success.
++  // Brackets many UploadRangeUnwatched calls whose copies may be ordered
++  // among themselves freely (they write the same guest bytes where they
++  // overlap): one barrier for all of them instead of one each.
++  virtual void BeginUnwatchedUploadBatch() {}
++  virtual void EndUnwatchedUploadBatch() {}
++  // allow_hoist: the copy may run at the start of the current submission
++  // instead of here, if no GPU command recorded so far in the submission
++  // touches those bytes (see MarkTouched), so it needs no barrier of its own.
+   bool UploadRangeUnwatched(uint32_t guest_offset, uint32_t size, const void* host_src,
+-                            uint64_t* write_seq_out = nullptr);
++                            uint64_t* write_seq_out = nullptr, bool allow_hoist = false);
++
++  // Byte ranges of the buffer that GPU commands recorded in the current
++  // submission read or write, kept while upload hoisting is on. A hoisted copy
++  // executes before all of them, which only reorders nothing observable when
++  // none of them touches its bytes.
++  void EnableUploadHoisting(bool enable) { hoist_uploads_ = enable; }
++  bool upload_hoisting_enabled() const { return hoist_uploads_; }
++  void ResetSubmissionTouches() { touched_ranges_.clear(); }
++  void MarkTouched(uint32_t start, uint32_t length);
++  bool IsTouched(uint32_t start, uint32_t length) const;
+ 
+   // The highest page write sequence over [start, start + length), or 0 if
+   // nothing has ever been written there.
+@@ -228,7 +248,7 @@ class SharedMemory {
+   // simply routes every caller to the emulated path on backends that have no
+   // native residency path.
+   virtual bool UploadRangeUnwatchedImpl(uint32_t guest_offset, uint32_t size,
+-                                        const void* host_src);
++                                        const void* host_src, bool to_submission_start);
+  private:
+   memory::Memory& memory_;
+ 
+@@ -278,7 +298,29 @@ class SharedMemory {
+   std::vector<uint64_t> page_hash_;
+   std::vector<uint32_t> page_checked_epoch_;
+   std::vector<uint8_t> page_stable_;
++  // SampledPageHash of each page that reached the longest check interval.
++  std::vector<uint64_t> page_sample_hash_;
++  // page_stable_ value of a page the GPU wrote whose baseline hash is not
++  // taken yet.
++  static constexpr uint8_t kPageHashBaselinePending = 0xFF;
++  uint64_t SampledPageHash(uint32_t page) const;
++  // Per 64 pages: the frame in which the whole block was last walked.
++  std::vector<uint32_t> block_checked_epoch_;
+   std::vector<uint32_t> hash_changed_pages_;
++  bool hoist_uploads_ = false;
++  // [start, end) pairs, sorted, disjoint and merged. A vector rather than a
++  // map: a node allocation per range went through newlib's global malloc lock
++  // and was an eighth of the command processor thread.
++  std::vector<std::pair<uint32_t, uint32_t>> touched_ranges_;
++  // Ranges already hashed in the current frame, by start: the same vertex and
++  // index buffers are requested by hundreds of draws a frame, and walking
++  // their pages again only to find each one already checked cost more than
++  // the checks themselves.
++  struct HashValidatedRange {
++    uint32_t epoch;
++    uint32_t length;
++  };
++  std::unordered_map<uint32_t, HashValidatedRange> hash_validated_ranges_;
+   uint32_t num_system_page_flags_ = 0;
+ 
+   static std::pair<uint32_t, uint32_t> MemoryInvalidationCallbackThunk(
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index ee9955c..c82caf7 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -166,8 +166,17 @@ class VulkanCommandProcessor : public CommandProcessor {
+     kCount,
+   };
+   void GpuOpBegin();
++  // Names the code responsible for the barrier batch being queued, for the
++  // barrier source report; the first tag of a batch wins.
++  void TagBarrierBatch(uintptr_t tag) {
++    if (!barrier_batch_tag_) {
++      barrier_batch_tag_ = tag;
++    }
++  }
+   void GpuOpEnd(GpuOp op);
+   void GpuOpEndDraw(uint64_t shader_pair_key, uint32_t vertex_count, uint32_t surface_info);
++  // A transfer draw, also reported in the per-pair cost list under `key`.
++  void GpuOpEndTransfer(GpuOp op, uint64_t key, uint32_t vertex_count);
+   // gpu_force_1x_msaa: clears the sample count of the current surface.
+   void ForceSingleSampleSurface();
+ 
+@@ -177,6 +186,12 @@ class VulkanCommandProcessor : public CommandProcessor {
+     assert_true(submission_open_);
+     return deferred_command_buffer_;
+   }
++  // Shared memory copies that run before everything else in the submission
++  // (gpu_hoist_vertex_uploads), between two barriers of their own.
++  DeferredCommandBuffer& upload_prologue() {
++    assert_true(submission_open_);
++    return upload_prologue_;
++  }
+ 
+   bool submission_open() const { return submission_open_; }
+   uint64_t GetCurrentSubmission() const {
+@@ -607,6 +622,7 @@ class VulkanCommandProcessor : public CommandProcessor {
+   std::vector<CommandBuffer> command_buffers_writable_;
+   std::deque<std::pair<uint64_t, CommandBuffer>> command_buffers_submitted_;
+   DeferredCommandBuffer deferred_command_buffer_;
++  DeferredCommandBuffer upload_prologue_;
+ 
+   std::vector<VkSparseMemoryBind> sparse_memory_binds_;
+   std::vector<SparseBufferBind> sparse_buffer_binds_;
+@@ -808,6 +824,21 @@ class VulkanCommandProcessor : public CommandProcessor {
+   uint32_t gpu_op_count_ = 0;
+   uint32_t gpu_op_slot_count_[kMaxFramesInFlight] = {};
+   GpuOp gpu_op_kind_[kMaxFramesInFlight][kGpuOpMaxPerFrame] = {};
++  // What was recorded between the previous timed operation and each one, so
++  // the untimed GPU time can be attributed.
++  static constexpr uint8_t kGpuGapBarrier = 1;
++  static constexpr uint8_t kGpuGapRenderPass = 2;
++  static constexpr uint8_t kGpuGapPipeline = 4;
++  static constexpr uint8_t kGpuGapDescriptors = 8;
++  uint8_t gpu_op_gap_flags_ = 0;
++  uint32_t draws_since_submission_ = 0;
++  static constexpr uint32_t kSubmissionTimestampSlots = 64;
++  VkQueryPool submission_timestamp_pool_ = VK_NULL_HANDLE;
++  uint64_t submission_timestamps_read_ = 0;
++  uint64_t submission_last_end_ = 0;
++  uintptr_t barrier_batch_tag_ = 0;
++  std::unordered_map<uintptr_t, uint32_t> barrier_batch_counts_;
++  uint8_t gpu_op_gap_[kMaxFramesInFlight][kGpuOpMaxPerFrame] = {};
+   // For kGuestDraw operations: the shader pair, vertex count and surface.
+   struct GpuOpDrawInfo {
+     uint64_t shader_pair_key;
+@@ -846,6 +877,18 @@ class VulkanCommandProcessor : public CommandProcessor {
+     uint32_t host_index = UINT32_MAX;
+     bool valid = false;
+   } active_occlusion_query_;
++  // occlusion_query_async: queries whose results the GPU has not produced
++  // yet, and the latest result seen per guest address, which the guest gets
++  // at once when a query ends instead of the command processor waiting for
++  // the GPU to go idle.
++  struct PendingOcclusionQuery {
++    uint32_t host_index;
++    uint32_t sample_count_address;
++    uint64_t submission;
++  };
++  std::vector<PendingOcclusionQuery> pending_occlusion_queries_;
++  std::unordered_map<uint32_t, uint64_t> occlusion_last_results_;
++  void CollectCompletedOcclusionQueries();
+   struct VertexBufferState {
+     uint32_t address = UINT32_MAX;
+     uint32_t size = UINT32_MAX;
+diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
+index c9ca07a..3508ecd 100644
+--- a/include/rex/graphics/vulkan/deferred_command_buffer.h
++++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
+@@ -30,6 +30,7 @@ class DeferredCommandBuffer {
+ 
+   void Reset();
+   void Execute(VkCommandBuffer command_buffer);
++  bool empty() const { return command_stream_.empty(); }
+ 
+   // render_pass_begin->pNext of all barriers must be null.
+   void CmdVkBeginRenderPass(const VkRenderPassBeginInfo* render_pass_begin,
+diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
+index 7332663..e300b9a 100644
+--- a/include/rex/graphics/vulkan/pipeline_cache.h
++++ b/include/rex/graphics/vulkan/pipeline_cache.h
+@@ -450,6 +450,8 @@ class VulkanPipelineCache {
+   std::filesystem::path driver_cache_path_;
+   std::atomic<uint64_t> driver_cache_generation_{0};
+   uint64_t driver_cache_saved_generation_ = 0;
++  // Serialized size of the cache as last loaded or saved.
++  size_t driver_cache_saved_size_ = 0;
+   std::chrono::steady_clock::time_point driver_cache_save_time_{};
+ #endif
+ 
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index 22f422f..dfdc8bd 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -19,6 +19,7 @@
+ 
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/pipeline/render_target/cache.h>
++#include <rex/graphics/pipeline/shader/interpreter.h>
+ #include <rex/graphics/vulkan/shared_memory.h>
+ #include <rex/graphics/vulkan/texture_cache.h>
+ #include <rex/graphics/xenos.h>
+@@ -113,6 +114,12 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   // shader may discard samples or samples textures (an image, whose rectangle
+   // need not cover the scissor), which rules the draw out as a full overwrite.
+   void SetDrawPixelShaderMayKill(bool may_kill) { draw_pixel_shader_may_kill_ = may_kill; }
++  // Whether the pixel shader samples textures (it then draws an image, which
++  // may be smaller than the scissor) and whether it may discard pixels.
++  void SetDrawPixelShaderTraits(bool samples_textures, bool kills) {
++    draw_pixel_shader_samples_textures_ = samples_textures;
++    draw_pixel_shader_kills_ = kills;
++  }
+ 
+   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+               uint32_t normalized_color_mask, const Shader& vertex_shader) override;
+@@ -822,7 +829,13 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   // never need to be transferred into them.
+   uint32_t GetDrawOverwrittenRenderTargets(reg::RB_DEPTHCONTROL normalized_depth_control,
+                                            uint32_t normalized_color_mask,
+-                                           Transfer::Rectangle& rect_out) const;
++                                           Transfer::Rectangle& rect_out,
++                                           const Shader* vertex_shader);
++  // Whether the current rectangle-list draw's one rectangle, with its vertex
++  // shader run on the CPU, covers every sample of [x0, x1) x [y0, y1).
++  bool RectangleCoversPixels(const Shader& vertex_shader, int32_t x0, int32_t y0, int32_t x1,
++                             int32_t y1);
++  ShaderInterpreter rectangle_interpreter_;
+ 
+   // Resolve forwarding (gpu_resolve_to_texture): writes a simple color
+   // resolve straight into the texture that reads its destination, instead of
+@@ -830,7 +843,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   // layout and reloading the texture.
+   bool TryForwardResolve(const draw_util::ResolveInfo& resolve_info,
+                          VulkanTextureCache& texture_cache);
+-  VkPipeline GetResolveForwardPipeline(bool is_depth, bool multisampled);
++  // storage_set_layout: VK_NULL_HANDLE for the variant writing the staging
++  // buffer, or the texture cache's storage image set layout for the one writing
++  // the texture itself (color only).
++  VkPipeline GetResolveForwardPipeline(bool is_depth, bool multisampled,
++                                       VkDescriptorSetLayout storage_set_layout = VK_NULL_HANDLE);
+ 
+   VkPipeline GetDumpPipeline(DumpPipelineKey key);
+   VkPipeline GetDirectResolvePipeline(DirectResolvePipelineKey key);
+@@ -898,6 +915,11 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   std::vector<Transfer> cutout_remaining_transfers_;
+   // [is_depth][multisampled]
+   VkPipeline resolve_forward_pipelines_[2][2] = {};
++  // [multisampled], writing color straight into the texture's storage view.
++  VkPipeline resolve_forward_image_pipelines_[2] = {};
++  VkPipelineLayout resolve_forward_image_pipeline_layout_ = VK_NULL_HANDLE;
++  // Why the last TryForwardResolve returned false, for the log.
++  const char* forward_reject_reason_ = nullptr;
+   VkBuffer resolve_forward_buffer_ = VK_NULL_HANDLE;
+   VkDeviceMemory resolve_forward_buffer_memory_ = VK_NULL_HANDLE;
+   static constexpr VkDeviceSize kResolveForwardBufferSize = 4 * 1024 * 1024;
+@@ -924,6 +946,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   // touches it.
+   uint32_t stencil_bits_written_ = 0;
+   bool draw_pixel_shader_may_kill_ = true;
++  bool draw_pixel_shader_samples_textures_ = true;
++  bool draw_pixel_shader_kills_ = true;
+   // While PerformTransfersAndResolveClears runs for a draw: which render
+   // targets it overwrites, and where (see GetDrawOverwrittenRenderTargets).
+   uint32_t draw_overwritten_render_targets_ = 0;
+diff --git a/include/rex/graphics/vulkan/shared_memory.h b/include/rex/graphics/vulkan/shared_memory.h
+index 233eac2..3e2653b 100644
+--- a/include/rex/graphics/vulkan/shared_memory.h
++++ b/include/rex/graphics/vulkan/shared_memory.h
+@@ -55,8 +55,14 @@ class VulkanSharedMemory : public SharedMemory {
+ 
+   bool UploadRanges(const std::vector<std::pair<uint32_t, uint32_t>>& upload_page_ranges) override;
+ 
+-  bool UploadRangeUnwatchedImpl(uint32_t guest_offset, uint32_t size,
+-                                const void* host_src) override;
++  bool UploadRangeUnwatchedImpl(uint32_t guest_offset, uint32_t size, const void* host_src,
++                                bool to_submission_start) override;
++
++ public:
++  void BeginUnwatchedUploadBatch() override;
++  void EndUnwatchedUploadBatch() override { unwatched_upload_batch_ = false; }
++
++ protected:
+ 
+  private:
+   void GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
+@@ -72,6 +78,7 @@ class VulkanSharedMemory : public SharedMemory {
+ 
+   Usage last_usage_;
+   std::pair<uint32_t, uint32_t> last_written_range_;
++  bool unwatched_upload_batch_ = false;
+ 
+   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
+   std::vector<VkBufferCopy> upload_regions_;
+diff --git a/include/rex/graphics/vulkan/texture_cache.h b/include/rex/graphics/vulkan/texture_cache.h
+index 8502a2f..8aae509 100644
+--- a/include/rex/graphics/vulkan/texture_cache.h
++++ b/include/rex/graphics/vulkan/texture_cache.h
+@@ -136,9 +136,21 @@ class VulkanTextureCache final : public TextureCache {
+   // there is one, pushes a barrier making its image a transfer destination,
+   // marks it up to date (its guest memory will not receive this resolve),
+   // and returns the image and its size; otherwise VK_NULL_HANDLE.
++  //
++  // With storage_set_out, a texture created for it (gpu_resolve_forward_storage)
++  // is made a compute shader storage write target instead, and storage_set_out
++  // receives a descriptor set with its R32_UINT storage view, so the resolve can
++  // be written into it without a staging copy. Otherwise storage_set_out is
++  // VK_NULL_HANDLE and the texture is a transfer destination as above.
+   VkImage BeginResolveForward(uint32_t base_address, uint32_t max_width, uint32_t max_height,
+                               uint32_t pitch_texels, xenos::TextureFormat format,
+-                              xenos::Endian endian, uint32_t& width_out, uint32_t& height_out);
++                              xenos::Endian endian, uint32_t& width_out, uint32_t& height_out,
++                              VkDescriptorSet* storage_set_out = nullptr);
++  // Set 0 of the resolve forwarding pipelines writing into textures directly;
++  // VK_NULL_HANDLE when gpu_resolve_forward_storage is off.
++  VkDescriptorSetLayout resolve_forward_storage_set_layout() const {
++    return resolve_forward_storage_set_layout_;
++  }
+   void UseScaledResolveBufferForRead();
+   void UseScaledResolveBufferForWrite(uint64_t written_start_scaled,
+                                       uint64_t written_length_scaled);
+@@ -203,6 +215,9 @@ class VulkanTextureCache final : public TextureCache {
+       kTransferDestination,
+       kGuestShaderSampled,
+       kSwapSampled,
++      // Written by a compute shader through its storage view (resolve
++      // forwarding).
++      kStorageWrite,
+     };
+ 
+     // Takes ownership of the image and its memory.
+@@ -223,6 +238,13 @@ class VulkanTextureCache final : public TextureCache {
+     }
+ 
+     VkImageView GetView(bool is_signed, uint32_t host_swizzle, bool is_array = true);
++
++    // Created with storage usage and an R32_UINT view format for resolve
++    // forwarding.
++    bool storage_capable() const { return storage_capable_; }
++    void set_storage_capable() { storage_capable_ = true; }
++    // The descriptor set with the R32_UINT storage view, created on first use.
++    VkDescriptorSet GetStorageDescriptorSet();
+     VkImageView GetOrCreate3DAs2DImageView(bool is_signed, uint32_t host_swizzle);
+ 
+    private:
+@@ -287,6 +309,9 @@ class VulkanTextureCache final : public TextureCache {
+     std::unique_ptr<VulkanTexture> texture_3d_as_2d_;
+     VkImageView image_view_3d_as_2d_unsigned_ = VK_NULL_HANDLE;
+     VkImageView image_view_3d_as_2d_signed_ = VK_NULL_HANDLE;
++    bool storage_capable_ = false;
++    VkImageView storage_view_ = VK_NULL_HANDLE;
++    VkDescriptorSet storage_descriptor_set_ = VK_NULL_HANDLE;
+   };
+ 
+   struct VulkanTextureBinding {
+@@ -353,6 +378,10 @@ class VulkanTextureCache final : public TextureCache {
+   // on Windows versions before 10, may have an allocation count limit as low as
+   // 4096.
+   VmaAllocator vma_allocator_ = VK_NULL_HANDLE;
++  // gpu_resolve_forward_storage: one storage image descriptor per texture
++  // written by resolve forwarding, freed with the texture.
++  VkDescriptorSetLayout resolve_forward_storage_set_layout_ = VK_NULL_HANDLE;
++  VkDescriptorPool resolve_forward_storage_pool_ = VK_NULL_HANDLE;
+ 
+   static const HostFormatPair kBestHostFormats[64];
+   static const HostFormatPair kHostFormatGBGRUnaligned;
+diff --git a/include/rex/ui/vulkan/functions/device_1_0.inc b/include/rex/ui/vulkan/functions/device_1_0.inc
+index d875220..1b2a35d 100644
+--- a/include/rex/ui/vulkan/functions/device_1_0.inc
++++ b/include/rex/ui/vulkan/functions/device_1_0.inc
+@@ -70,6 +70,7 @@ XE_UI_VULKAN_FUNCTION(vkDestroySemaphore)
+ XE_UI_VULKAN_FUNCTION(vkDestroyShaderModule)
+ XE_UI_VULKAN_FUNCTION(vkEndCommandBuffer)
+ XE_UI_VULKAN_FUNCTION(vkFlushMappedMemoryRanges)
++XE_UI_VULKAN_FUNCTION(vkFreeDescriptorSets)
+ XE_UI_VULKAN_FUNCTION(vkFreeMemory)
+ XE_UI_VULKAN_FUNCTION(vkGetBufferMemoryRequirements)
+ XE_UI_VULKAN_FUNCTION(vkGetDeviceQueue)
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index 5fe61c6..676b94e 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -119,6 +119,11 @@ target_include_directories(rexgpu-xenos PRIVATE
+ )
+ 
+ target_compile_options(rexgpu-xenos PRIVATE -Wno-unused-variable)
++if(REXGLUE_PLATFORM_SWITCH)
++    # Line tables only, for symbolizing the profiler's stack samples to source
++    # lines. The NRO takes only the loadable segments, so it does not grow.
++    target_compile_options(rexgpu-xenos PRIVATE -g1)
++endif()
+ 
+ rex_target_pch(rexgpu-xenos
+     <mutex>
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 5ea9610..697f838 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -9,7 +9,15 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/platform.h>
++#if REX_PLATFORM_SWITCH
++extern "C" {
++#include <switch/kernel/svc.h>
++}
++#endif
+ #include <algorithm>
++#include <chrono>
++#include <unordered_map>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -35,6 +43,9 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/user_module.h>
+ 
++REXCVAR_DEFINE_INT32(switch_cp_core, -1, "GPU",
++                     "Switch: keep the command processor thread on this core (0-2); -1 leaves it "
++                     "to the scheduler");
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+ 
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+@@ -383,6 +394,17 @@ void CommandProcessor::SetDesiredSwapPostEffect(SwapPostEffect swap_post_effect)
+ }
+ 
+ void CommandProcessor::WorkerThreadMain() {
++#if REX_PLATFORM_SWITCH
++  {
++    // This thread is the busiest in the process and shares cores 0-2 with the
++    // guest's. On one core of its own it is not migrated around them.
++    const int32_t core = REXCVAR_GET(switch_cp_core);
++    if (core >= 0 && core <= 2) {
++      const Result result = svcSetThreadCoreMask(CUR_THREAD_HANDLE, core, UINT32_C(1) << core);
++      REXGPU_INFO("Command processor thread on core {}: result {:08X}", core, uint32_t(result));
++    }
++  }
++#endif
+   if (!SetupContext()) {
+     rex::FatalError("Unable to setup command processor internal state");
+     return;
+@@ -1445,6 +1467,46 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+     }
+   } while (!matched);
+ 
++#if REX_PLATFORM_SWITCH
++  {
++    // What the command processor waits for, and how long in total: the top
++    // few addresses every ~10 seconds, with whether the value comes from a
++    // register or memory and the last reference compared against.
++    struct WaitStat {
++      uint64_t ns = 0;
++      uint32_t count = 0;
++      uint32_t ref = 0, mask = 0, func = 0;
++      bool memory = false;
++    };
++    static std::unordered_map<uint32_t, WaitStat> wait_stats;
++    static auto report_time = std::chrono::steady_clock::now();
++    const auto now = std::chrono::steady_clock::now();
++    WaitStat& stat = wait_stats[poll_reg_addr];
++    stat.ns += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now - wait_start).count());
++    ++stat.count;
++    stat.ref = ref;
++    stat.mask = mask;
++    stat.func = wait_info & 7;
++    stat.memory = is_memory;
++    if (now - report_time > std::chrono::seconds(10)) {
++      report_time = now;
++      std::vector<std::pair<uint64_t, uint32_t>> order;
++      for (const auto& entry : wait_stats) {
++        order.emplace_back(entry.second.ns, entry.first);
++      }
++      std::sort(order.begin(), order.end(), std::greater<>());
++      for (size_t i = 0; i < order.size() && i < 4; ++i) {
++        const WaitStat& w = wait_stats[order[i].second];
++        REXGPU_INFO("WAIT_REG_MEM over 10 s: {} {:08X} waited {:.0f} ms in {} waits (ref {:08X} "
++                    "mask {:08X} func {})",
++                    w.memory ? "memory" : "register", order[i].second, double(w.ns) / 1e6,
++                    w.count, w.ref, w.mask, w.func);
++      }
++      wait_stats.clear();
++    }
++  }
++#endif
++
+   return true;
+ }
+ 
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index e87a583..fdb4700 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -61,6 +61,11 @@ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+ }
+ }  // namespace
+ 
++REXCVAR_DEFINE_INT32(guest_vblank_hz, 0, "GPU",
++                     "Guest vblank rate in Hz instead of the video mode's refresh rate; 0 = the "
++                     "video mode's")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace rex::graphics {
+ 
+ // Nvidia Optimus/AMD PowerXpress support.
+@@ -156,6 +161,12 @@ X_STATUS GraphicsSystem::SetupGuestGpu(runtime::FunctionDispatcher* function_dis
+         system::X_VIDEO_MODE video_mode;
+         kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+         double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
++        // A faster guest vblank than the video mode's: the title's flips land
++        // on vblanks, so a frame that just misses one waits for the next, and
++        // at 60 Hz that turned 52 ms of work into a 67 ms frame.
++        if (REXCVAR_GET(guest_vblank_hz) > 0) {
++          refresh_rate_hz = double(REXCVAR_GET(guest_vblank_hz));
++        }
+         uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
+         uint64_t vsync_interval_ticks =
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
+index 6eabcd3..983d0be 100644
+--- a/src/graphics/pipeline/shader/spirv_translator.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator.cpp
+@@ -27,6 +27,11 @@
+ #include <rex/math.h>
+ #include <rex/string/buffer.h>
+ 
++REXCVAR_DEFINE_BOOL(gpu_implicit_lod_sampling, false, "GPU",
++                    "In pixel shaders, sample 2D and cube textures with an implicit LOD and a "
++                    "bias instead of explicit gradients scaled by the fetch constant LOD bias")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ REXCVAR_DEFINE_BOOL(gpu_specialize_texture_signs, false, "GPU",
+                     "Compile each pipeline for the signedness and gamma of the textures bound "
+                     "when it is created, instead of selecting them at run time in every fetch")
+diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+index 82e6437..eab973f 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -24,6 +24,7 @@
+ 
+ #include <rex/cvar.h>
+ REXCVAR_DECLARE(bool, gpu_specialize_texture_signs);
++REXCVAR_DECLARE(bool, gpu_implicit_lod_sampling);
+ 
+ namespace rex::graphics {
+ 
+@@ -1475,7 +1476,19 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+         // k2D.
+         // 3D vectors for k3DOrStacked, kCube.
+         spv::Id gradients_h = spv::NoResult, gradients_v = spv::NoResult;
+-        if (use_computed_lod) {
++        // gpu_implicit_lod_sampling: in pixel shaders whose LOD comes from the
++        // screen-space derivatives, scaling those derivatives by 2^lod is the
++        // same as adding lod to the implicit LOD. Sampling with a bias skips
++        // the per-fetch derivatives and the gradient sample instruction, which
++        // is several times slower than a plain sample on the Switch's Maxwell
++        // GPU. 3D and stacked textures keep the gradients: their layer
++        // filtering is decided from them.
++        const bool implicit_lod = use_computed_lod && REXCVAR_GET(gpu_implicit_lod_sampling) &&
++                                  is_pixel_shader() &&
++                                  !instr.attributes.use_register_gradients &&
++                                  (instr.dimension == xenos::FetchOpDimension::k2D ||
++                                   instr.dimension == xenos::FetchOpDimension::kCube);
++        if (use_computed_lod && !implicit_lod) {
+           // TODO(Triang3l): Gradient exponent adjustment is currently not done
+           // in getCompTexLOD, so not doing it here too for now. Apply the
+           // gradient exponent biases from the word 4 of the fetch constant in
+@@ -1636,9 +1649,13 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+ 
+         // Sample the texture.
+         spv::ImageOperandsMask image_operands_mask =
+-            use_computed_lod ? spv::ImageOperandsGradMask : spv::ImageOperandsLodMask;
++            implicit_lod       ? spv::ImageOperandsBiasMask
++            : use_computed_lod ? spv::ImageOperandsGradMask
++                               : spv::ImageOperandsLodMask;
+         spv::Id sample_result_unsigned, sample_result_signed;
+-        if (!use_computed_lod) {
++        if (implicit_lod) {
++          texture_parameters.bias = lod;
++        } else if (!use_computed_lod) {
+           texture_parameters.lod = lod;
+         }
+         if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
+@@ -1858,7 +1875,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+           sample_result_signed =
+               if_data_is_3d.createMergePhi(sample_result_signed_3d, sample_result_signed_stacked);
+         } else {
+-          if (use_computed_lod) {
++          if (use_computed_lod && !implicit_lod) {
+             texture_parameters.gradX = gradients_h;
+             texture_parameters.gradY = gradients_v;
+           }
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 8e06f69..2e9004d 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -126,6 +126,11 @@ REXCVAR_DEFINE_BOOL(pre_mask_resolve_l2_block, true, "GPU",
+ //     "96 MB, and with 3x3, it will be 360 + 216 MB.",
+ //     "GPU");
+ 
++#include <rex/platform.h>
++#if REX_PLATFORM_SWITCH
++extern "C" void RexSwitchPerfCount(unsigned id);
++#endif
++
+ namespace rex::graphics {
+ 
+ const TextureCache::LoadShaderInfo TextureCache::load_shader_info_[kLoadShaderCount] = {
+@@ -309,7 +314,11 @@ void TextureCache::CompletedSubmissionUpdated(uint64_t completed_submission_inde
+     assert_true(found_texture_it != textures_.end());
+     if (found_texture_it != textures_.end()) {
+       assert_true(found_texture_it->second.get() == texture);
++      UnindexTextureAddress(texture);
+       textures_.erase(found_texture_it);
++#if REX_PLATFORM_SWITCH
++      RexSwitchPerfCount(76);
++#endif
+       // `texture` is invalid now.
+     }
+   }
+@@ -495,8 +504,12 @@ void TextureCache::RequestTextures(uint32_t used_texture_mask) {
+ 
+   // Update the texture keys and the textures.
+   uint32_t bindings_changed = 0;
+-  std::vector<PendingTextureLoad> pending_texture_loads;
+-  std::vector<PendingSharedMemoryRange> pending_shared_memory_ranges;
++  // Reused between draws: two heap allocations per draw went through newlib's
++  // global malloc lock, which the guest threads contend for.
++  thread_local std::vector<PendingTextureLoad> pending_texture_loads;
++  thread_local std::vector<PendingSharedMemoryRange> pending_shared_memory_ranges;
++  pending_texture_loads.clear();
++  pending_shared_memory_ranges.clear();
+   auto queue_pending_texture_load = [&](Texture* texture) {
+     if (texture == nullptr) {
+       return;
+@@ -795,6 +808,7 @@ void TextureCache::WatchCallback(const std::unique_lock<std::recursive_mutex>& g
+ 
+ void TextureCache::DestroyAllTextures(bool from_destructor) {
+   ResetTextureBindings(from_destructor);
++  textures_by_address_.clear();
+   textures_.clear();
+   COUNT_profile_set("gpu/texture_cache/textures", 0);
+ }
+@@ -912,6 +926,12 @@ TextureCache::Texture* TextureCache::FindOrCreateTexture(TextureKey key) {
+     }
+     assert_true(new_texture->key() == key);
+     texture = textures_.emplace(key, std::move(new_texture)).first->second.get();
++    textures_by_address_.emplace(uint32_t(key.base_page) << 12, texture);
++#if REX_PLATFORM_SWITCH
++    RexSwitchPerfCount(75);
++#endif
++    textures_max_guest_base_size_ =
++        std::max(textures_max_guest_base_size_, texture->GetGuestBaseSize());
+   }
+   COUNT_profile_set("gpu/texture_cache/textures", textures_.size());
+   texture->LogAction("Created");
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index 4fe1457..4c12fa9 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -70,6 +70,8 @@ void SharedMemory::InitializeCommon() {
+     page_hash_.assign(pages, 0);
+     page_checked_epoch_.assign(pages, 0);
+     page_stable_.assign(pages, 0);
++    block_checked_epoch_.assign((pages + 63) / 64, 0);
++    page_sample_hash_.assign(pages, 0);
+     hash_changed_pages_.reserve(1024);
+   }
+   upload_seq_ = 0;
+@@ -310,6 +312,8 @@ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
+   uint32_t page_first = start >> page_size_log2_;
+   uint32_t page_last = end >> page_size_log2_;
+ 
++  MarkTouched(start, length);
++
+   // Trigger modification callbacks so, for instance, resolved data is loaded to
+   // the texture.
+   FireWatches(page_first, page_last, true);
+@@ -370,10 +374,20 @@ void SharedMemory::MakeRangeValid(uint32_t start, uint32_t length, bool written_
+     // No watch: the pages are checked by content instead (HashValidateRange).
+     const uint32_t page_bytes = uint32_t(1) << page_size_log2_;
+     for (uint32_t page = valid_page_first; page <= valid_page_last; ++page) {
+-      page_hash_[page] =
+-          XXH3_64bits(memory().TranslatePhysical(page << page_size_log2_), page_bytes);
++      if (written_by_gpu) {
++        // What the GPU wrote is not in guest memory, so the hash is only a
++        // baseline for noticing later CPU writes. It is taken when something
++        // first asks for the page: a resolve nothing reads (one full screen a
++        // frame here) was hashed for nothing. Two samples of the page stand in
++        // meanwhile, so memory the CPU reuses before then is still noticed.
++        page_hash_[page] = SampledPageHash(page);
++        page_stable_[page] = kPageHashBaselinePending;
++      } else {
++        page_hash_[page] =
++            XXH3_64bits(memory().TranslatePhysical(page << page_size_log2_), page_bytes);
++        page_stable_[page] = 0;
++      }
+       page_checked_epoch_[page] = frame_epoch_;
+-      page_stable_[page] = 0;
+     }
+     return;
+   }
+@@ -446,6 +460,13 @@ void SharedMemory::UnlinkWatchRange(WatchRange* range) {
+   watch_range_first_free_ = range;
+ }
+ 
++uint64_t SharedMemory::SampledPageHash(uint32_t page) const {
++  const uint8_t* bytes =
++      reinterpret_cast<const uint8_t*>(memory().TranslatePhysical(page << page_size_log2_));
++  const uint32_t half = uint32_t(1) << (page_size_log2_ - 1);
++  return XXH3_64bits(bytes, 64) ^ (XXH3_64bits(bytes + half, 64) * UINT64_C(0x9E3779B97F4A7C15));
++}
++
+ void SharedMemory::HashValidateRange(uint32_t start, uint32_t length) {
+   if (!hash_validation_ || !length || start >= kBufferSize) {
+     return;
+@@ -454,10 +475,40 @@ void SharedMemory::HashValidateRange(uint32_t start, uint32_t length) {
+   const uint32_t page_first = start >> page_size_log2_;
+   const uint32_t page_last = (start + length - 1) >> page_size_log2_;
+   const uint32_t page_bytes = uint32_t(1) << page_size_log2_;
++  HashValidatedRange& validated = hash_validated_ranges_[start];
++  if (validated.epoch == frame_epoch_ && validated.length >= length) {
++    // Every page in it was checked this frame, or skipped by the backoff,
++    // exactly as walking it again would find.
++#if REX_PLATFORM_SWITCH
++    RexSwitchPerfAdd(58, page_last - page_first + 1);
++#endif
++    return;
++  }
++  if (validated.epoch != frame_epoch_) {
++    validated.epoch = frame_epoch_;
++    validated.length = 0;
++  }
++  validated.length = std::max(validated.length, length);
++  uint32_t pages_deferred = 0, pages_checked = 0;
+   hash_changed_pages_.clear();
+   // Hashed without the global lock: reading guest memory needs none, and the
+   // guest threads contend for it. A write racing the read is caught next check.
+-  for (uint32_t page = page_first; page <= page_last; ++page) {
++  for (uint32_t page = page_first; page <= page_last;) {
++    // A whole 64-page block inside the range that was already walked this
++    // frame would give the same answer page by page: every page in it was
++    // checked or deferred for this frame. The same large vertex buffers are
++    // requested from many different starts per frame, which the per-range
++    // memo above does not catch, and walking them again page by page was
++    // most of this function's cost.
++    if (!(page & 63) && page_last - page >= 63) {
++      uint32_t& block_epoch = block_checked_epoch_[page >> 6];
++      if (block_epoch == frame_epoch_) {
++        pages_deferred += 64;
++        page += 64;
++        continue;
++      }
++      block_epoch = frame_epoch_;
++    }
+     // Invalid pages are hashed too. clear_memory_page_state (on by default)
+     // drops the valid bit of every CPU-uploaded page at the end of each frame
+     // without firing watches; skipping those pages meant nothing was hashed
+@@ -465,33 +516,60 @@ void SharedMemory::HashValidateRange(uint32_t start, uint32_t length) {
+     // frames, streamed images) never learned it was outdated. page_hash_ still
+     // holds the contents last uploaded, which is what the texture was built
+     // from.
++    if (page_stable_[page] == kPageHashBaselinePending) {
++      const bool cpu_wrote = SampledPageHash(page) != page_hash_[page];
++      page_hash_[page] =
++          XXH3_64bits(memory().TranslatePhysical(page << page_size_log2_), page_bytes);
++      page_stable_[page] = 0;
++      page_checked_epoch_[page] = frame_epoch_;
++      if (cpu_wrote) {
++        hash_changed_pages_.push_back(page);
++      }
++      ++pages_checked;
++      ++page;
++      continue;
++    }
+     const uint32_t interval =
+         hash_backoff_ ? uint32_t(1) << std::min<uint32_t>(page_stable_[page], 5) : 1;
+     if (frame_epoch_ - page_checked_epoch_[page] < interval) {
+-#if REX_PLATFORM_SWITCH
+-      RexSwitchPerfCount(58);
+-#endif
++      ++pages_deferred;
++      ++page;
+       continue;
+     }
+-#if REX_PLATFORM_SWITCH
+-    RexSwitchPerfCount(57);
+-#endif
++    ++pages_checked;
+     page_checked_epoch_[page] = frame_epoch_;
++    // A page unchanged through every check up to the longest interval is
++    // checked by two small samples instead, with a full hash on one check in
++    // eight: textures are rewritten whole when they change, and the full hash
++    // of every bound texture's pages was an eighth of this thread in busy
++    // scenes.
++    if (page_stable_[page] >= 5 && ((page + (frame_epoch_ >> 5)) & 7) != 0 &&
++        SampledPageHash(page) == page_sample_hash_[page]) {
++      ++page;
++      continue;
++    }
+     const uint64_t hash =
+         XXH3_64bits(memory().TranslatePhysical(page << page_size_log2_), page_bytes);
+     if (hash == page_hash_[page]) {
+       if (page_stable_[page] < 5) {
+         ++page_stable_[page];
+       }
+-      continue;
++      if (page_stable_[page] >= 5) {
++        page_sample_hash_[page] = SampledPageHash(page);
++      }
++    } else {
++      page_hash_[page] = hash;
++      page_stable_[page] = 0;
++      hash_changed_pages_.push_back(page);
+     }
+-    page_hash_[page] = hash;
+-    page_stable_[page] = 0;
+-    hash_changed_pages_.push_back(page);
++    ++page;
++  }
+ #if REX_PLATFORM_SWITCH
+-    RexSwitchPerfCount(59);
++  // Once per range: a counter per page was a measurable share of the walk.
++  RexSwitchPerfAdd(57, pages_checked);
++  RexSwitchPerfAdd(58, pages_deferred);
++  RexSwitchPerfAdd(59, hash_changed_pages_.size());
+ #endif
+-  }
+   if (hash_changed_pages_.empty()) {
+     return;
+   }
+@@ -512,7 +590,10 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+   }
+ 
+   // Some texture or buffer is empty, for example - safe to draw in this case.
+-  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
++  // Reused: a heap allocation per draw goes through newlib's global malloc
++  // lock, which the guest threads contend for.
++  thread_local std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
++  merged_ranges.clear();
+   merged_ranges.reserve(count);
+   for (size_t i = 0; i < count; ++i) {
+     uint32_t start = ranges[i].first;
+@@ -556,6 +637,7 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si
+     if (!EnsureHostGpuMemoryAllocated(range.first, range.second)) {
+       return false;
+     }
++    MarkTouched(range.first, range.second);
+     HashValidateRange(range.first, range.second);
+   }
+ 
+@@ -658,8 +740,50 @@ bool SharedMemory::RequestRange(uint32_t start, uint32_t length) {
+   return RequestRanges(&range, 1);
+ }
+ 
++void SharedMemory::MarkTouched(uint32_t start, uint32_t length) {
++  if (!hoist_uploads_ || !length || start >= kBufferSize) {
++    return;
++  }
++  uint32_t end = start + std::min(length, kBufferSize - start);
++  // First range ending at or after start: the only candidates to merge with.
++  auto first = std::lower_bound(
++      touched_ranges_.begin(), touched_ranges_.end(), start,
++      [](const std::pair<uint32_t, uint32_t>& range, uint32_t value) {
++        return range.second < value;
++      });
++  if (first != touched_ranges_.end() && first->first <= start && first->second >= end) {
++    // Already inside one range: by far the most common case.
++    return;
++  }
++  auto last = first;
++  while (last != touched_ranges_.end() && last->first <= end) {
++    start = std::min(start, last->first);
++    end = std::max(end, last->second);
++    ++last;
++  }
++  if (first == last) {
++    touched_ranges_.insert(first, std::make_pair(start, end));
++    return;
++  }
++  first->first = start;
++  first->second = end;
++  touched_ranges_.erase(std::next(first), last);
++}
++
++bool SharedMemory::IsTouched(uint32_t start, uint32_t length) const {
++  const uint32_t end = start + length;
++  auto it = std::upper_bound(
++      touched_ranges_.begin(), touched_ranges_.end(), start,
++      [](uint32_t value, const std::pair<uint32_t, uint32_t>& range) {
++        return value < range.second;
++      });
++  // it: the first range ending after start.
++  return it != touched_ranges_.end() && it->first < end;
++}
++
+ bool SharedMemory::UploadRangeUnwatched(uint32_t guest_offset, uint32_t size,
+-                                        const void* host_src, uint64_t* write_seq_out) {
++                                        const void* host_src, uint64_t* write_seq_out,
++                                        bool allow_hoist) {
+   if (!size) {
+     return true;
+   }
+@@ -675,7 +799,10 @@ bool SharedMemory::UploadRangeUnwatched(uint32_t guest_offset, uint32_t size,
+   }
+   // Deliberately no MakeRangeValid: the range stays exactly as valid, or as
+   // invalid, as it was, and no watch is armed for it.
+-  if (!UploadRangeUnwatchedImpl(guest_offset, size, host_src)) {
++  const bool hoist = allow_hoist && hoist_uploads_ && !IsTouched(guest_offset, size);
++  // Read by the draw that asked for it, hoisted or not.
++  MarkTouched(guest_offset, size);
++  if (!UploadRangeUnwatchedImpl(guest_offset, size, host_src, hoist)) {
+     // A mid-range staging failure leaves part of the range written, so the
+     // pages are still stamped - the caller drops its claim on this range, but
+     // every other window overlapping it has to notice the bytes moved.
+@@ -694,7 +821,7 @@ bool SharedMemory::UploadRangeUnwatched(uint32_t guest_offset, uint32_t size,
+ }
+ 
+ bool SharedMemory::UploadRangeUnwatchedImpl(uint32_t guest_offset, uint32_t size,
+-                                            const void* host_src) {
++                                            const void* host_src, bool to_submission_start) {
+   return false;
+ }
+ 
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index f963c64..6c98f9b 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -57,6 +57,20 @@
+ #include "native_residency.h"
+ 
+ // Legacy backend compatibility aliases for shared readback controls.
++REXCVAR_DEFINE_UINT32(gpu_submit_every_draws, 0, "GPU/Vulkan",
++                      "End the submission after this many draws so the GPU starts on them while "
++                      "the rest of the frame is recorded; 0 = only where the guest does");
++REXCVAR_DEFINE_BOOL(occlusion_query_async, false, "GPU/Vulkan",
++                    "Give the guest the latest finished occlusion query result when a query ends "
++                    "instead of waiting for the GPU to go idle");
++REXCVAR_DEFINE_BOOL(gpu_timestamp_op_sampling, true, "GPU/Vulkan",
++                    "With gpu_timestamp_queries, also time each operation on one frame in four "
++                    "(serializes those frames)");
++REXCVAR_DEFINE_BOOL(gpu_hoist_vertex_uploads, false, "GPU/Vulkan",
++                    "Run a draw's vertex data copy at the start of its submission when nothing "
++                    "earlier in the submission touches those bytes, instead of right before the "
++                    "draw behind a pipeline barrier")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ REXCVAR_DEFINE_BOOL(gpu_timestamp_queries, false, "GPU",
+                     "Measure GPU time per frame with a pair of Vulkan timestamp queries and "
+                     "publish it as the gpu_frame_us counter. Every other counter here is "
+@@ -99,8 +113,13 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+ 
+ #include <rex/platform.h>
+ #if REX_PLATFORM_SWITCH
++#include <switch/arm/counter.h>
+ // Counters and A/B skips of the Switch profiler (switch_perf.cpp).
+ extern "C" void RexSwitchPerfCount(unsigned id);
++extern "C" void RexSwitchPerfTiron(uint64_t inicio, uint64_t fin);
++// Start of the executable image (libnx linker script), for printing code
++// addresses as offsets.
++extern "C" char __start__;
+ extern "C" void RexSwitchPerfAdd(unsigned id, uint64_t value);
+ extern "C" void RexSwitchPerfMax(unsigned id, uint64_t value);
+ extern "C" bool RexSwitchPerfSkip(unsigned bit);
+@@ -698,6 +717,7 @@ VulkanCommandProcessor::VulkanCommandProcessor(VulkanGraphicsSystem* graphics_sy
+                                                system::KernelState* kernel_state)
+     : CommandProcessor(graphics_system, kernel_state),
+       deferred_command_buffer_(*this),
++      upload_prologue_(*this, 64 * 1024),
+       transient_descriptor_allocator_uniform_buffer_(
+           static_cast<const ui::vulkan::VulkanProvider*>(graphics_system->provider())
+               ->vulkan_device(),
+@@ -1011,6 +1031,7 @@ bool VulkanCommandProcessor::SetupContext() {
+ 
+   shared_memory_ =
+       std::make_unique<VulkanSharedMemory>(*this, *memory_, guest_shader_pipeline_stages_);
++  shared_memory_->EnableUploadHoisting(REXCVAR_GET(gpu_hoist_vertex_uploads));
+   if (!shared_memory_->Initialize()) {
+     REXGPU_ERROR("Failed to initialize shared memory");
+     return false;
+@@ -2421,12 +2442,32 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
+   ++draw_census_swap_ordinal_;
++  CollectCompletedOcclusionQueries();
+   draw_census::MaybeAutoRequest(draw_census_swap_ordinal_);
+   if (shared_memory_) {
+     shared_memory_->OnFrameBoundary();
+   }
+ #if REX_PLATFORM_SWITCH
+   RexSwitchPerfCount(0);
++  {
++    // Frames several times longer than the average: the profiler reports what
++    // every thread was doing inside them, which the averages hide.
++    static uint64_t previous_swap_tick = 0;
++    const uint64_t now_tick = armGetSystemTick();
++    if (previous_swap_tick &&
++        now_tick - previous_swap_tick > armGetSystemTickFreq() * 3 / 20) {
++      RexSwitchPerfTiron(previous_swap_tick, now_tick);
++    }
++    if (previous_swap_tick) {
++      // Frame intervals in 60 Hz vblanks (rounded): 80 = 1, 81 = 2, 82 = 3,
++      // 83 = 4, 84 = 5 or more.
++      const uint64_t vblanks =
++          ((now_tick - previous_swap_tick) * 60 + armGetSystemTickFreq() / 2) /
++          armGetSystemTickFreq();
++      RexSwitchPerfCount(80 + unsigned(std::min<uint64_t>(std::max<uint64_t>(vblanks, 1), 5) - 1));
++    }
++    previous_swap_tick = now_tick;
++  }
+   // Once per frame: pages the fault handler stopped watching because they were
+   // read over and over are checked for CPU writes (see xmemory.cpp).
+   memory_->SwitchCheckUnwatchedPages();
+@@ -3168,6 +3209,9 @@ bool VulkanCommandProcessor::PushBufferMemoryBarrier(
+       src_queue_family_index == dst_queue_family_index) {
+     return false;
+   }
++  if (!barrier_batch_tag_) {
++    barrier_batch_tag_ = uintptr_t(__builtin_return_address(0));
++  }
+ 
+   // Separate different barriers for overlapping buffer ranges into different
+   // pipeline barrier commands.
+@@ -3219,6 +3263,9 @@ bool VulkanCommandProcessor::PushImageMemoryBarrier(
+       old_layout == new_layout && src_queue_family_index == dst_queue_family_index) {
+     return false;
+   }
++  if (!barrier_batch_tag_) {
++    barrier_batch_tag_ = uintptr_t(__builtin_return_address(0));
++  }
+ 
+   // Separate different barriers for overlapping image subresource ranges into
+   // different pipeline barrier commands.
+@@ -3291,6 +3338,10 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+     return false;
+   }
+   EndRenderPass();
++  // Which code queued the first barrier of each batch that reaches the GPU:
++  // on NVK every batch drains the whole pipeline.
++  ++barrier_batch_counts_[barrier_batch_tag_];
++  barrier_batch_tag_ = 0;
+   for (auto it = pending_barriers_.cbegin(); it != pending_barriers_.cend(); ++it) {
+     auto it_next = std::next(it);
+     bool is_last = it_next == pending_barriers_.cend();
+@@ -3298,6 +3349,7 @@ bool VulkanCommandProcessor::SubmitBarriers(bool force_end_render_pass) {
+     // if there are no buffer or image memory barriers in the last pipeline
+     // barriers, the offsets may be equal to the sizes of the vectors.
+     rex::perf::IncrementCounter(rex::perf::CounterId::kVkPipelineBarriers);
++    gpu_op_gap_flags_ |= kGpuGapBarrier;
+     deferred_command_buffer_.CmdVkPipelineBarrier(
+         it->src_stage_mask ? it->src_stage_mask : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+         it->dst_stage_mask ? it->dst_stage_mask : VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0, 0,
+@@ -3390,6 +3442,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+                                                   VK_SUBPASS_CONTENTS_INLINE);
+   }
+   rex::perf::IncrementCounter(rex::perf::CounterId::kRenderPassBegins);
++  gpu_op_gap_flags_ |= kGpuGapRenderPass;
+   in_render_pass_ = true;
+ }
+ 
+@@ -3483,6 +3536,7 @@ void VulkanCommandProcessor::SubmitBarriersAndEnterRenderTargetCacheRenderPass(
+                                                   VK_SUBPASS_CONTENTS_INLINE);
+   }
+   rex::perf::IncrementCounter(rex::perf::CounterId::kRenderPassBegins);
++  gpu_op_gap_flags_ |= kGpuGapRenderPass;
+   in_render_pass_ = true;
+ }
+ 
+@@ -4253,6 +4307,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       pixel_shader &&
+       (pixel_shader->kills_pixels() || !pixel_shader->texture_bindings().empty() ||
+        pixel_shader->uses_texture_fetch_instruction_results()));
++  render_target_cache_->SetDrawPixelShaderTraits(
++      pixel_shader && (!pixel_shader->texture_bindings().empty() ||
++                       pixel_shader->uses_texture_fetch_instruction_results()),
++      pixel_shader && pixel_shader->kills_pixels());
+   if (!render_target_cache_->Update(is_rasterization_done, normalized_depth_control,
+                                     normalized_color_mask, *vertex_shader)) {
+     return draw_fail("render_target_update");
+@@ -4287,6 +4345,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     return draw_fail("pipeline_lookup");
+   }
+   if (current_guest_graphics_pipeline_ != pipeline) {
++    gpu_op_gap_flags_ |= kGpuGapPipeline;
+     deferred_command_buffer_.CmdVkBindPipeline(VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
+     current_guest_graphics_pipeline_ = pipeline;
+     current_external_graphics_pipeline_ = VK_NULL_HANDLE;
+@@ -4404,6 +4463,27 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       vfetch_bits_remaining &= ~(uint32_t(1) << j);
+       uint32_t vfetch_index = i * 32 + j;
+       uint64_t vfetch_bit = uint64_t(1) << (vfetch_index & 63);
++      // Read by this draw however it is made resident, including from the
++      // fetch constant cache below: a copy hoisted to the start of the
++      // submission later must not change what it reads. Marked on leaving
++      // this iteration, after this binding's own copy was decided.
++      struct TouchOnExit {
++        SharedMemory* shared_memory = nullptr;
++        uint32_t start = 0, length = 0;
++        ~TouchOnExit() {
++          if (shared_memory && length) {
++            shared_memory->MarkTouched(start, length);
++          }
++        }
++      } touch_on_exit;
++      if (shared_memory_->upload_hoisting_enabled()) {
++        const xenos::xe_gpu_vertex_fetch_t touched_fetch = regs.GetVertexFetch(vfetch_index);
++        if (touched_fetch.type == xenos::FetchConstantType::kVertex) {
++          touch_on_exit.shared_memory = shared_memory_.get();
++          touch_on_exit.start = touched_fetch.address << 2;
++          touch_on_exit.length = touched_fetch.size << 2;
++        }
++      }
+       bool vfetch_cached = (vertex_buffers_in_sync_[vfetch_index >> 6] & vfetch_bit) != 0;
+       if (!census && vfetch_cached && !native_residency_->VerifyBypassesCallerCache()) {
+         continue;
+@@ -4707,6 +4787,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     {
+       GpuOpBegin();
+       deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
++#if REX_PLATFORM_SWITCH
++      // A/B lap: the same draw again with no state change in between, to
++      // tell the cost of the draws from the cost of the state they change.
++      if (RexSwitchPerfSkip(256)) {
++        deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1,
++                                           0, 0);
++      }
++#endif
+       GpuOpEndDraw(draw_cost_key, primitive_processing_result.host_draw_vertex_count,
+                    regs[XE_GPU_REG_RB_SURFACE_INFO]);
+     }
+@@ -4750,6 +4838,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+       GpuOpBegin();
+       deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count,
+                                                 1, 0, 0, 0);
++#if REX_PLATFORM_SWITCH
++      if (RexSwitchPerfSkip(256)) {
++        deferred_command_buffer_.CmdVkDrawIndexed(
++            primitive_processing_result.host_draw_vertex_count, 1, 0, 0, 0);
++      }
++#endif
+       GpuOpEndDraw(draw_cost_key, primitive_processing_result.host_draw_vertex_count,
+                    regs[XE_GPU_REG_RB_SURFACE_INFO]);
+     }
+@@ -4767,8 +4861,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
+   }
+ 
+-  if (IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport)) &&
+-      !memexport_ranges_.empty()) {
++  // Emptiness first: the enabled check looks the cvar up in the registry under
++  // a mutex, with a string allocation, and this runs for every draw.
++  if (!memexport_ranges_.empty() &&
++      IsReadbackMemexportEnabled(REXCVAR_GET(vulkan_readback_memexport))) {
+     uint32_t memexport_total_size = 0;
+     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+       memexport_total_size += memexport_range.size_bytes;
+@@ -4782,6 +4878,16 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+     }
+   }
+ 
++  // The deferred commands only reach the driver, and the GPU, when the
++  // submission ends: the guest ends one about twice a frame, so the GPU
++  // finished the first half and idled while the second was recorded and
++  // replayed. Smaller submissions keep it fed.
++  const uint32_t submit_every_draws = REXCVAR_GET(gpu_submit_every_draws);
++  if (submit_every_draws && ++draws_since_submission_ >= submit_every_draws &&
++      CanEndSubmissionImmediately()) {
++    EndSubmission(false);
++  }
++
+   return true;
+ }
+ 
+@@ -5404,6 +5510,11 @@ bool VulkanCommandProcessor::InitializeOcclusionQueryResources() {
+       } else {
+         timestamp_period_ns_ = double(timestamp_period);
+         timestamp_queries_available_ = true;
++        ts_info.queryCount = 2 * kSubmissionTimestampSlots;
++        if (dfn.vkCreateQueryPool(device, &ts_info, nullptr, &submission_timestamp_pool_) !=
++            VK_SUCCESS) {
++          submission_timestamp_pool_ = VK_NULL_HANDLE;
++        }
+         REXGPU_INFO("gpu_timestamp_queries: enabled, timestampPeriod {} ns",
+                     timestamp_period_ns_);
+       }
+@@ -5469,6 +5580,10 @@ void VulkanCommandProcessor::ShutdownOcclusionQueryResources() {
+     dfn.vkDestroyQueryPool(device, timestamp_query_pool_, nullptr);
+     timestamp_query_pool_ = VK_NULL_HANDLE;
+   }
++  if (submission_timestamp_pool_ != VK_NULL_HANDLE) {
++    dfn.vkDestroyQueryPool(device, submission_timestamp_pool_, nullptr);
++    submission_timestamp_pool_ = VK_NULL_HANDLE;
++  }
+   timestamp_queries_available_ = false;
+   std::memset(timestamp_slot_frame_, 0, sizeof(timestamp_slot_frame_));
+ 
+@@ -5540,6 +5655,9 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
+ 
+   uint32_t host_index = active_occlusion_query_.host_index;
+   active_occlusion_query_ = {};
++#if REX_PLATFORM_SWITCH
++  RexSwitchPerfCount(77);
++#endif
+ 
+   if (!BeginSubmission(true)) {
+     return false;
+@@ -5554,6 +5672,25 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
+                                            sizeof(uint64_t) * host_index, sizeof(uint64_t),
+                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+ 
++  if (REXCVAR_GET(occlusion_query_async)) {
++    // Waiting here for the GPU to finish everything queued split every frame
++    // in two: the GPU idled while the rest of the frame was recorded, and the
++    // command processor idled while the GPU drained. The guest gets the
++    // latest finished result for this query instead, a frame or two old,
++    // which is what visibility effects such as lens flares can live with.
++    CollectCompletedOcclusionQueries();
++    pending_occlusion_queries_.push_back(
++        {host_index, sample_count_address, GetCurrentSubmission()});
++    auto last = occlusion_last_results_.find(sample_count_address);
++    const int32_t fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
++    WriteGuestOcclusionResult(
++        sample_count_address,
++        last != occlusion_last_results_.end()
++            ? last->second
++            : uint64_t(std::max(fake_sample_count, int32_t(0))));
++    return true;
++  }
++
+   if (!EndSubmission(false)) {
+     return false;
+   }
+@@ -5583,6 +5720,41 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
+   return true;
+ }
+ 
++void VulkanCommandProcessor::CollectCompletedOcclusionQueries() {
++  if (pending_occlusion_queries_.empty()) {
++    return;
++  }
++  const uint64_t completed = GetCompletedSubmission();
++  if (pending_occlusion_queries_.front().submission > completed) {
++    return;
++  }
++  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
++  if (!(vulkan_device->memory_types().host_coherent &
++        (uint32_t(1) << occlusion_query_readback_memory_type_))) {
++    VkMappedMemoryRange memory_range = {};
++    memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
++    memory_range.memory = occlusion_query_readback_memory_;
++    memory_range.offset = 0;
++    memory_range.size =
++        std::min(rex::round_up(VkDeviceSize(sizeof(uint64_t) * kMaxOcclusionQueries),
++                               vulkan_device->properties().nonCoherentAtomSize),
++                 occlusion_query_readback_memory_size_);
++    vulkan_device->functions().vkInvalidateMappedMemoryRanges(vulkan_device->device(), 1,
++                                                             &memory_range);
++  }
++  const uint64_t* results = reinterpret_cast<const uint64_t*>(occlusion_query_readback_mapping_);
++  size_t done = 0;
++  while (done < pending_occlusion_queries_.size() &&
++         pending_occlusion_queries_[done].submission <= completed) {
++    const PendingOcclusionQuery& query = pending_occlusion_queries_[done];
++    occlusion_last_results_[query.sample_count_address] =
++        NormalizeOcclusionSamples(results[query.host_index]);
++    ++done;
++  }
++  pending_occlusion_queries_.erase(pending_occlusion_queries_.begin(),
++                                   pending_occlusion_queries_.begin() + done);
++}
++
+ uint64_t VulkanCommandProcessor::NormalizeOcclusionSamples(uint64_t samples) const {
+   if (samples == 0 || !texture_cache_) {
+     return samples;
+@@ -5710,6 +5882,33 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+   submissions_in_flight_fences_.erase(submissions_in_flight_fences_.cbegin(),
+                                       submissions_in_flight_fences_awaited_end);
+   submission_completed_ += fences_awaited;
++#if REX_PLATFORM_SWITCH
++  if (submission_timestamp_pool_ != VK_NULL_HANDLE) {
++    if (submission_timestamps_read_ + kSubmissionTimestampSlots < submission_completed_) {
++      submission_timestamps_read_ = submission_completed_ - kSubmissionTimestampSlots;
++      submission_last_end_ = 0;
++    }
++    while (submission_timestamps_read_ < submission_completed_) {
++      const uint64_t submission = ++submission_timestamps_read_;
++      uint64_t stamps[2];
++      if (dfn.vkGetQueryPoolResults(device, submission_timestamp_pool_,
++                                    2 * uint32_t(submission % kSubmissionTimestampSlots), 2,
++                                    sizeof(stamps), stamps, sizeof(uint64_t),
++                                    VK_QUERY_RESULT_64_BIT) != VK_SUCCESS ||
++          stamps[1] < stamps[0]) {
++        submission_last_end_ = 0;
++        continue;
++      }
++      RexSwitchPerfAdd(78, uint64_t(double(stamps[1] - stamps[0]) * timestamp_period_ns_));
++      if (submission_last_end_ && stamps[0] > submission_last_end_ &&
++          stamps[0] - submission_last_end_ < UINT64_C(1000000000)) {
++        RexSwitchPerfAdd(79, uint64_t(double(stamps[0] - submission_last_end_) *
++                                      timestamp_period_ns_));
++      }
++      submission_last_end_ = stamps[1];
++    }
++  }
++#endif
+ 
+   // Reclaim semaphores.
+   while (!submissions_in_flight_semaphores_.empty()) {
+@@ -5833,6 +6032,9 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+     // the end of the submission (when async pipeline object creation requests
+     // are fulfilled).
+     deferred_command_buffer_.Reset();
++    upload_prologue_.Reset();
++    draws_since_submission_ = 0;
++    shared_memory_->ResetSubmissionTouches();
+ 
+     // Reset cached state of the command buffer.
+     dynamic_viewport_update_needed_ = true;
+@@ -5889,13 +6091,61 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+             const double ns = double(stamps[1] - stamps[0]) * timestamp_period_ns_;
+             rex::perf::SetCounter(rex::perf::CounterId::kGpuFrameUs, int64_t(ns / 1000.0));
+ #if REX_PLATFORM_SWITCH
++            if (!op_count) {
++              // A frame without per-operation timestamps: its GPU time is
++              // what the game really costs, as the timestamps serialize the
++              // sampled frames.
++              RexSwitchPerfCount(72);
++              RexSwitchPerfAdd(73, uint64_t(ns));
++            }
+             if (op_count) {
+               uint64_t op_ns[size_t(GpuOp::kCount)] = {};
++              // The GPU time between one timed operation and the next, by
++              // the most expensive-looking thing recorded in between: what
++              // the frame spends outside draws, copies and dumps.
++              uint64_t previous_end = stamps[0];
++              for (uint32_t i = 0; i < op_count; ++i) {
++                const uint64_t gap_begin = stamps[2 + 2 * i];
++                if (gap_begin > previous_end) {
++                  const uint8_t flags = gpu_op_gap_[slot][i];
++                  unsigned category = 4;
++                  if (flags & kGpuGapBarrier) {
++                    category = 0;
++                  } else if (flags & kGpuGapRenderPass) {
++                    category = 1;
++                  } else if (flags & kGpuGapPipeline) {
++                    category = 2;
++                  } else if (flags & kGpuGapDescriptors) {
++                    category = 3;
++                  }
++                  RexSwitchPerfAdd(61 + category,
++                                   uint64_t(double(gap_begin - previous_end) *
++                                            timestamp_period_ns_));
++                  RexSwitchPerfAdd(66 + category, 1);
++                }
++                if (stamps[3 + 2 * i] > previous_end) {
++                  previous_end = stamps[3 + 2 * i];
++                }
++              }
++              if (stamps[1] > previous_end) {
++                RexSwitchPerfAdd(71, uint64_t(double(stamps[1] - previous_end) *
++                                              timestamp_period_ns_));
++              }
+               for (uint32_t i = 0; i < op_count; ++i) {
+                 const uint64_t begin = stamps[2 + 2 * i], end = stamps[3 + 2 * i];
+                 if (end > begin) {
+                   const uint64_t one_ns = uint64_t(double(end - begin) * timestamp_period_ns_);
+                   op_ns[size_t(gpu_op_kind_[slot][i])] += one_ns;
++                  if (gpu_op_kind_[slot][i] == GpuOp::kTransferDraw ||
++                      gpu_op_kind_[slot][i] == GpuOp::kStencilBitDraw) {
++                    // Listed among the draws by their F-prefixed key, to see
++                    // which ownership transfers cost what.
++                    const GpuOpDrawInfo& info = gpu_op_draw_[slot][i];
++                    GpuDrawCost& cost = gpu_draw_costs_[info.shader_pair_key];
++                    cost.ns += one_ns;
++                    ++cost.draws;
++                    cost.vertices += info.vertex_count;
++                  }
+                   if (gpu_op_kind_[slot][i] == GpuOp::kGuestDraw) {
+                     const GpuOpDrawInfo& info = gpu_op_draw_[slot][i];
+                     GpuDrawCost& cost = gpu_draw_costs_[info.shader_pair_key];
+@@ -5938,7 +6188,10 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+       // the host, and cannot race a still-in-flight frame reading them.
+       // Resetting queries is not free, so the operation pairs are reset only
+       // on the frames that use them.
+-      gpu_op_frame_sampled_ = (frame_current_ % kGpuOpSampleEvery) == 0;
++      // Per-operation timestamps serialize the frames they sample; off, only
++      // the two frame timestamps remain.
++      gpu_op_frame_sampled_ = REXCVAR_GET(gpu_timestamp_op_sampling) &&
++                              (frame_current_ % kGpuOpSampleEvery) == 0;
+       gpu_op_count_ = 0;
+       gpu_op_slot_count_[slot] = 0;
+       deferred_command_buffer_.CmdVkResetQueryPool(
+@@ -6178,7 +6431,40 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
+       return false;
+     }
++    // GPU busy time of every submission: its first and last command. What
++    // lies between one submission's end and the next one's start is time the
++    // GPU spent waiting for work.
++    const uint32_t submission_timestamp_slot =
++        uint32_t(GetCurrentSubmission() % kSubmissionTimestampSlots);
++    if (submission_timestamp_pool_ != VK_NULL_HANDLE) {
++      dfn.vkCmdResetQueryPool(command_buffer.buffer, submission_timestamp_pool_,
++                              2 * submission_timestamp_slot, 2);
++      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                              submission_timestamp_pool_, 2 * submission_timestamp_slot);
++    }
++    if (!upload_prologue_.empty()) {
++      // Vertex data copies hoisted out of the draws that needed them. Nothing
++      // recorded in this submission touches their bytes before them, so one
++      // barrier against earlier submissions and one before everything else
++      // replace one per copy - each of which drained the GPU.
++      VkMemoryBarrier memory_barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
++      memory_barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++      memory_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++      dfn.vkCmdPipelineBarrier(command_buffer.buffer, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
++                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &memory_barrier, 0, nullptr,
++                               0, nullptr);
++      upload_prologue_.Execute(command_buffer.buffer);
++      memory_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
++      memory_barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
++      dfn.vkCmdPipelineBarrier(command_buffer.buffer, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 1, &memory_barrier, 0,
++                               nullptr, 0, nullptr);
++    }
+     deferred_command_buffer_.Execute(command_buffer.buffer);
++    if (submission_timestamp_pool_ != VK_NULL_HANDLE) {
++      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                              submission_timestamp_pool_, 2 * submission_timestamp_slot + 1);
++    }
+     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
+       REXGPU_ERROR("Failed to end a Vulkan command buffer");
+       return false;
+@@ -7619,6 +7905,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+   while (rex::bit_scan_forward(descriptor_sets_remaining, &descriptor_set_index)) {
+     uint32_t descriptor_set_mask_tzcnt =
+         rex::tzcnt(~(descriptor_sets_remaining | ((UINT32_C(1) << descriptor_set_index) - 1)));
++    gpu_op_gap_flags_ |= kGpuGapDescriptors;
+     deferred_command_buffer_.CmdVkBindDescriptorSets(
+         VK_PIPELINE_BIND_POINT_GRAPHICS,
+         current_guest_graphics_pipeline_layout_->GetPipelineLayout(), descriptor_set_index,
+@@ -7766,6 +8053,8 @@ void VulkanCommandProcessor::GpuOpBegin() {
+   // Bottom of pipe: when everything before the operation has finished, so the
+   // pair measures the operation itself rather than the queue ahead of it.
+   const uint32_t slot = uint32_t(frame_current_ % kMaxFramesInFlight);
++  gpu_op_gap_[slot][gpu_op_count_] = gpu_op_gap_flags_;
++  gpu_op_gap_flags_ = 0;
+   deferred_command_buffer_.CmdVkWriteTimestamp(
+       VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamp_query_pool_,
+       slot * kTimestampQueriesPerFrame + 2 + 2 * gpu_op_count_);
+@@ -7792,7 +8081,42 @@ void VulkanCommandProcessor::GpuOpEndDraw(uint64_t shader_pair_key, uint32_t ver
+   GpuOpEnd(GpuOp::kGuestDraw);
+ }
+ 
++void VulkanCommandProcessor::GpuOpEndTransfer(GpuOp op, uint64_t key, uint32_t vertex_count) {
++  if (!gpu_op_frame_sampled_ || gpu_op_count_ >= kGpuOpMaxPerFrame) {
++    return;
++  }
++  const uint32_t slot = uint32_t(frame_current_ % kMaxFramesInFlight);
++  gpu_op_draw_[slot][gpu_op_count_] = {key, vertex_count, 0};
++  GpuOpEnd(op);
++}
++
+ void VulkanCommandProcessor::ReportGpuDrawCosts() {
++  {
++    // Barrier batches per frame by the code that queued their first barrier,
++    // as offsets into the executable (the profiler prints its load address).
++#if REX_PLATFORM_SWITCH
++    const uintptr_t image_base = uintptr_t(&__start__);
++#else
++    const uintptr_t image_base = 0;
++#endif
++    std::vector<std::pair<uint32_t, uintptr_t>> tags;
++    uint64_t total = 0;
++    for (const auto& tag : barrier_batch_counts_) {
++      tags.emplace_back(tag.second, tag.first);
++      total += tag.second;
++    }
++    std::sort(tags.begin(), tags.end(), std::greater<>());
++    const double frames = double(gpu_draw_cost_frames_ * kGpuOpSampleEvery);
++    std::string line;
++    for (size_t k = 0; k < tags.size() && k < 12; ++k) {
++      line += fmt::format(" 0x{:X}:{:.1f}", tags[k].second - image_base,
++                          double(tags[k].first) / frames);
++    }
++    REXGPU_INFO("Barrier batches per frame {:.1f} by first pusher:{}", double(total) / frames,
++                line);
++    barrier_batch_counts_.clear();
++  }
++
+   // Which of the game's passes the GPU spends its time in. The timestamps
+   // around every draw serialize the sampled frames, so the shares, not the
+   // absolute times, are what to trust.
+diff --git a/src/graphics/vulkan/draw_census.cc b/src/graphics/vulkan/draw_census.cc
+index 904b761..73b22b2 100644
+--- a/src/graphics/vulkan/draw_census.cc
++++ b/src/graphics/vulkan/draw_census.cc
+@@ -94,6 +94,17 @@ REXCVAR_DEFINE_INT32(gpu_census_auto_swap, 0, "GPU/Vulkan",
+ 
+ bool HasPendingRequest() { return g_requests_pending.load(std::memory_order_acquire) != 0; }
+ 
++}  // namespace rex::graphics::vulkan::draw_census
++
++// For a button combination on the console, which has no debug console to
++// issue gpu_census_capture from.
++extern "C" void RexSwitchCensusRequest(void) {
++  rex::graphics::vulkan::draw_census::RequestCapture();
++  REXGPU_INFO("draw-census: capture requested from the controller");
++}
++
++namespace rex::graphics::vulkan::draw_census {
++
+ void MaybeAutoRequest(uint64_t guest_swap_ordinal) {
+   const int32_t at = REXCVAR_GET(gpu_census_auto_swap);
+   if (at > 0 && guest_swap_ordinal == uint64_t(at)) {
+diff --git a/src/graphics/vulkan/native_residency.cc b/src/graphics/vulkan/native_residency.cc
+index 8d54d1b..3fc5e87 100644
+--- a/src/graphics/vulkan/native_residency.cc
++++ b/src/graphics/vulkan/native_residency.cc
+@@ -125,6 +125,7 @@ void NativeResidency::PrefetchFrame(memory::Memory& memory, SharedMemory& shared
+   // execute here while the outgoing pass is ending, rather than interleaved
+   // with the next frame's draws. This isolates pass scheduling before barrier
+   // coalescing changes any other variable.
++  bool batch_open = false;
+   for (VertexRange& range : prefetch_ranges_) {
+     Entry* entry_ptr = range.entry;
+     range.entry = nullptr;
+@@ -142,6 +143,23 @@ void NativeResidency::PrefetchFrame(memory::Memory& memory, SharedMemory& shared
+     const void* source = memory.TranslatePhysical<const void*>(range.start);
+     PERF_counter_add(kNativeBytesHashed, range.length);
+     const uint64_t hash = XXH3_64bits(source, range.length);
++    // Still in the buffer from an earlier frame, unchanged in guest memory and
++    // not overwritten in the buffer since: nothing to copy. Most of the
++    // working set is static geometry, which was copied again every frame.
++    if (entry.hash_valid && entry.hash == hash &&
++        entry.upload_seq == shared_memory.MaxWriteSeq(range.start, range.length)) {
++      if (entry.unchanged_prefetches < 255) {
++        ++entry.unchanged_prefetches;
++      }
++      range.hash = hash;
++      range.entry = entry_ptr;
++      continue;
++    }
++    entry.unchanged_prefetches = 0;
++    if (!batch_open) {
++      shared_memory.BeginUnwatchedUploadBatch();
++      batch_open = true;
++    }
+     if (!shared_memory.UploadRangeUnwatched(range.start, range.length, source)) {
+       uint64_t prefetch_record_epoch = entry.prefetch_record_epoch;
+       entry = Entry{};
+@@ -153,6 +171,10 @@ void NativeResidency::PrefetchFrame(memory::Memory& memory, SharedMemory& shared
+     PERF_counter_inc(kNativePrefetchRanges);
+   }
+ 
++  if (batch_open) {
++    shared_memory.EndUnwatchedUploadBatch();
++  }
++
+   // Stamp entries only after every copy. Overlapping vertex windows contain
+   // the same guest bytes in their overlap, and MaxWriteSeq now records the
+   // final batch state rather than making an earlier copy look clobbered by a
+@@ -228,8 +250,9 @@ bool NativeResidency::UploadRange(memory::Memory& memory, SharedMemory& shared_m
+   // shared memory buffer holds guest-endian data and the translated shaders
+   // swizzle what they fetch out of it. Swapping here would swap twice.
+   uint64_t upload_seq = 0;
+-  if (!shared_memory.UploadRangeUnwatched(
+-          start, length, memory.TranslatePhysical<const void*>(start), &upload_seq)) {
++  if (!shared_memory.UploadRangeUnwatched(start, length,
++                                          memory.TranslatePhysical<const void*>(start),
++                                          &upload_seq, /*allow_hoist=*/true)) {
+     // The bytes that did make it are the bytes guest memory holds, so nothing
+     // is stale - but this range is not resident, so drop what is claimed about
+     // it and let the caller ask the emulated path.
+@@ -371,6 +394,14 @@ NativeResidency::VertexRangeResult NativeResidency::RequestVertexRange(memory::M
+     // must prove the bytes are unchanged even when the caller's fetch constant
+     // cache says the range is resident.
+     entry.prefetched = false;
++    // Static geometry: unchanged at the start of the last several frames, so a
++    // second hash this frame would only confirm the first. Rewritten between
++    // the frame start and this draw, it is one frame late, and the next
++    // prefetch copies it.
++    if (!clobbered && entry.hash_valid && entry.unchanged_prefetches >= 8) {
++      PERF_counter_inc(kNativePrefetchHits);
++      return VertexRangeResult::kNative;
++    }
+     PERF_counter_add(kNativeBytesHashed, length);
+     const uint64_t hash = XXH3_64bits(memory.TranslatePhysical<const void*>(start), length);
+     if (!clobbered && entry.hash_valid && hash == entry.hash) {
+diff --git a/src/graphics/vulkan/native_residency.h b/src/graphics/vulkan/native_residency.h
+index 237e665..e6970aa 100644
+--- a/src/graphics/vulkan/native_residency.h
++++ b/src/graphics/vulkan/native_residency.h
+@@ -226,6 +226,10 @@ class NativeResidency {
+     // Set by frame-ahead prefetch and cleared by the first draw that validates
+     // the guest fingerprint. A prefetch is never trusted merely by epoch.
+     bool prefetched = false;
++    // Consecutive frame-start prefetches that found the guest bytes unchanged.
++    // Past a few, the first draw of the frame trusts the prefetch's hash
++    // instead of hashing the range again.
++    uint8_t unchanged_prefetches = 0;
+     // Set by the verify oracle when the fingerprint was proven wrong for this
+     // range: it is then copied on every request, with no dedup, for the rest
+     // of the run.
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index ea0621b..63d39b6 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -474,6 +474,10 @@ void VulkanPipelineCache::InitializeDriverCache(const std::filesystem::path& roo
+     REXGPU_WARN("Switch driver pipeline cache unavailable ({})", int32_t(result));
+   } else {
+     REXGPU_INFO("Switch driver pipeline cache: loaded {} bytes", data.size());
++    size_t loaded_size = 0;
++    if (dfn.vkGetPipelineCacheData(device, driver_cache_, &loaded_size, nullptr) == VK_SUCCESS) {
++      driver_cache_saved_size_ = loaded_size;
++    }
+   }
+ }
+ 
+@@ -491,6 +495,14 @@ void VulkanPipelineCache::SaveDriverCache() {
+     size_t size = 0;
+     if (dfn.vkGetPipelineCacheData(device->device(), driver_cache_, &size, nullptr) !=
+             VK_SUCCESS || size < 32 || size > 64 * 1024 * 1024) return;
++    // Every pipeline creation counts as a change, cache hits included, but
++    // the cache only grows: the same size means nothing new was compiled.
++    // Without this the whole cache, tens of megabytes, was copied and written
++    // to the SD card every 30 seconds of play.
++    if (size == driver_cache_saved_size_) {
++      driver_cache_saved_generation_ = generation;
++      return;
++    }
+     data.resize(size);
+     if (dfn.vkGetPipelineCacheData(device->device(), driver_cache_, &size, data.data()) !=
+         VK_SUCCESS) return;
+@@ -526,6 +538,7 @@ void VulkanPipelineCache::SaveDriverCache() {
+     }
+     if (!error) {
+       driver_cache_saved_generation_ = generation;
++      driver_cache_saved_size_ = data.size();
+       REXGPU_INFO("Switch driver pipeline cache: saved {} bytes", data.size());
+     }
+   }
+@@ -585,6 +598,10 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+     uint32_t magic_api;
+     uint32_t version_swapped;
+   } pipeline_storage_file_header;
++  // An "a+" stream's initial read position is not the start on every C
++  // library; without this the header read can fail and the storage gets
++  // truncated on every launch.
++  rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_SET);
+   if (fread(&pipeline_storage_file_header, sizeof(pipeline_storage_file_header), 1,
+             pipeline_storage_file_) &&
+       pipeline_storage_file_header.magic == pipeline_storage_magic &&
+@@ -636,6 +653,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+         }
+       }
+       pipeline_stored_descriptions.resize(pipeline_storage_kept_count);
++      REXGPU_INFO("VulkanPipelineCache: {} stored pipeline descriptions of {} bytes to create",
++                  pipeline_storage_kept_count, sizeof(PipelineStoredDescription));
+       if (pipeline_storage_skipped_unsupported_count || pipeline_storage_skipped_corrupted_count) {
+         REXGPU_INFO(
+             "VulkanPipelineCache: Pipeline storage filtering kept {} descriptions (skipped {} "
+@@ -667,6 +686,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+   } shader_storage_file_header;
+   // 'XESH'.
+   const uint32_t shader_storage_magic = 0x48534558;
++  rex::filesystem::Seek(shader_storage_file_, 0, SEEK_SET);
+   if (fread(&shader_storage_file_header, sizeof(shader_storage_file_header), 1,
+             shader_storage_file_) &&
+       shader_storage_file_header.magic == shader_storage_magic &&
+@@ -841,6 +861,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+       uint64_t(sizeof(pipeline_storage_file_header) +
+                sizeof(PipelineStoredDescription) * pipeline_stored_descriptions.size()));
+   if (pipeline_stored_descriptions.empty()) {
++    REXGPU_INFO("VulkanPipelineCache: pipeline storage empty or unreadable, starting it anew");
+     rex::filesystem::TruncateStdioFile(pipeline_storage_file_, 0);
+     pipeline_storage_file_header.magic = pipeline_storage_magic;
+     pipeline_storage_file_header.magic_api = pipeline_storage_magic_api;
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 4971b7d..71e7371 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -57,6 +57,10 @@ REXCVAR_DEFINE_BOOL(gpu_skip_transfers_under_clears, false, "GPU/Vulkan",
+                     "Do not transfer previous EDRAM contents into the area a clear-like draw "
+                     "(one rectangle writing every sample unconditionally) is about to replace")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_BOOL(gpu_skip_transfers_under_opaque_rects, false, "GPU/Vulkan",
++                    "Also treat a textured single rectangle as replacing the area under it when "
++                    "its vertex shader, run on the CPU, shows it covers the whole scissor")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ REXCVAR_DEFINE_BOOL(gpu_depth_transfer_copy, false, "GPU/Vulkan",
+                     "Move depth and stencil between render targets of the same format and "
+@@ -221,6 +225,7 @@ VulkanRenderTargetCache::VulkanRenderTargetCache(const RegisterFile& register_fi
+                                                  uint32_t draw_resolution_scale_y,
+                                                  VulkanCommandProcessor& command_processor)
+     : RenderTargetCache(register_file, memory, draw_resolution_scale_x, draw_resolution_scale_y),
++      rectangle_interpreter_(register_file, memory),
+       command_processor_(command_processor) {}
+ 
+ VulkanRenderTargetCache::~VulkanRenderTargetCache() {
+@@ -1020,6 +1025,11 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
+       ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, pipeline);
+     }
+   }
++  for (VkPipeline& pipeline : resolve_forward_image_pipelines_) {
++    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, pipeline);
++  }
++  ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipelineLayout, device,
++                                         resolve_forward_image_pipeline_layout_);
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, resolve_forward_buffer_);
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+                                          resolve_forward_buffer_memory_);
+@@ -1233,12 +1243,26 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+ 
+   // Copying.
+   bool copied = false;
++  bool forward_tried = false;
+   if (resolve_info.copy_dest_extent_length && REXCVAR_GET(gpu_resolve_to_texture) &&
+-      TryForwardResolve(resolve_info, texture_cache)) {
++      (forward_tried = true, forward_reject_reason_ = nullptr,
++       TryForwardResolve(resolve_info, texture_cache))) {
+     copied = true;
+     written_address_out = resolve_info.copy_dest_extent_start;
+     written_length_out = resolve_info.copy_dest_extent_length;
+   } else if (resolve_info.copy_dest_extent_length) {
++    if (forward_tried) {
++      // Which destinations still take the full resolve path, and why; once
++      // each for the first few.
++      static std::unordered_map<uint32_t, uint32_t> reject_logged;
++      if (reject_logged.size() < 64 &&
++          ++reject_logged[resolve_info.copy_dest_base] == 100) {
++        REXGPU_INFO("Resolve to 0x{:08X} ({}x{}, depth {}) not forwarded: {}",
++                    resolve_info.copy_dest_base, resolve_info.coordinate_info.width_div_8 * 8,
++                    resolve_info.height_div_8 * 8, resolve_info.IsCopyingDepth(),
++                    forward_reject_reason_ ? forward_reject_reason_ : "?");
++      }
++    }
+     draw_util::ResolveCopyShaderConstants copy_shader_constants;
+     uint32_t copy_group_count_x, copy_group_count_y;
+     draw_util::ResolveCopyShaderIndex copy_shader =
+@@ -1535,7 +1559,7 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+       draw_overwritten_render_targets_ =
+           REXCVAR_GET(gpu_skip_transfers_under_clears)
+               ? GetDrawOverwrittenRenderTargets(normalized_depth_control, normalized_color_mask,
+-                                                draw_overwritten_rect_)
++                                                draw_overwritten_rect_, &vertex_shader)
+               : 0;
+       PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+                                        depth_and_color_render_targets, last_update_transfers());
+@@ -5553,9 +5577,18 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
+             {
+               command_processor_.GpuOpBegin();
+               command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
+-              command_processor_.GpuOpEnd(transfer_is_stencil_bit
+-                                              ? VulkanCommandProcessor::GpuOp::kStencilBitDraw
+-                                              : VulkanCommandProcessor::GpuOp::kTransferDraw);
++              // F, source base and pitch, destination base and pitch, whether
++              // each is depth: which EDRAM reinterpretation this was.
++              const RenderTargetKey source_key = source_vulkan_rt.key();
++              command_processor_.GpuOpEndTransfer(
++                  transfer_is_stencil_bit ? VulkanCommandProcessor::GpuOp::kStencilBitDraw
++                                          : VulkanCommandProcessor::GpuOp::kTransferDraw,
++                  (UINT64_C(0xF) << 60) | (uint64_t(source_key.base_tiles) << 44) |
++                      (uint64_t(source_key.GetPitchTiles()) << 36) |
++                      (uint64_t(dest_rt_key.base_tiles) << 20) |
++                      (uint64_t(dest_rt_key.GetPitchTiles()) << 12) |
++                      (uint64_t(source_key.is_depth) << 4) | uint64_t(dest_rt_key.is_depth),
++                  transfer_vertex_count);
+             }
+           }
+         }
+@@ -6273,6 +6306,7 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+   // format, so when the conversion is a plain 8888 copy the pixels can go
+   // straight from the render target into that texture.
+   if (GetPath() != Path::kHostRenderTargets || IsDrawResolutionScaled()) {
++    forward_reject_reason_ = "path";
+     return false;
+   }
+   const bool is_depth = resolve_info.IsCopyingDepth();
+@@ -6296,21 +6330,37 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+                    uint32_t(xenos::TextureFormat::k_24_8_FLOAT)) {
+       texture_format = xenos::TextureFormat::k_24_8_FLOAT;
+     } else {
++      forward_reject_reason_ = "depth format";
+       return false;
+     }
+   } else {
+     if (dest_info.copy_dest_format != xenos::ColorFormat::k_8_8_8_8 || edram.format_is_64bpp ||
+         xenos::ColorRenderTargetFormat(edram.format) !=
+             xenos::ColorRenderTargetFormat::k_8_8_8_8) {
++      forward_reject_reason_ = "color format";
+       return false;
+     }
+     texture_format = xenos::TextureFormat::k_8_8_8_8;
+   }
+-  if (dest_info.copy_dest_exp_bias != 0 || dest_info.copy_dest_array ||
+-      uint32_t(dest_info.copy_dest_number) != 0 ||
+-      uint32_t(dest_info.copy_dest_endian) > uint32_t(xenos::Endian::k16in32) ||
+-      dest_coordinates.offset_x_div_8 || dest_coordinates.offset_y_div_8 ||
+-      edram.msaa_samples >= xenos::MsaaSamples::k4X) {
++  // The number format only affects how color is converted; a depth copy is
++  // defined by its texture format alone, and the shadow maps' depth resolves
++  // carry a nonzero one.
++  const char* dest_reject = nullptr;
++  if (dest_info.copy_dest_exp_bias != 0) {
++    dest_reject = "exponent bias";
++  } else if (dest_info.copy_dest_array) {
++    dest_reject = "array destination";
++  } else if (!is_depth && uint32_t(dest_info.copy_dest_number) != 0) {
++    dest_reject = "color number format";
++  } else if (uint32_t(dest_info.copy_dest_endian) > uint32_t(xenos::Endian::k16in32)) {
++    dest_reject = "endianness";
++  } else if (dest_coordinates.offset_x_div_8 || dest_coordinates.offset_y_div_8) {
++    dest_reject = "destination offset";
++  } else if (edram.msaa_samples >= xenos::MsaaSamples::k4X) {
++    dest_reject = "4x MSAA";
++  }
++  if (dest_reject) {
++    forward_reject_reason_ = dest_reject;
+     return false;
+   }
+   // Which host samples to read: 0 = guest sample 0, 1 = guest sample 1,
+@@ -6326,11 +6376,13 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+         break;
+       case xenos::CopySampleSelect::k01:
+         if (is_depth) {
++          forward_reject_reason_ = "sample select";
+           return false;
+         }
+         sample_mode = 2;
+         break;
+       default:
++        forward_reject_reason_ = "sample select";
+         return false;
+     }
+   }
+@@ -6341,11 +6393,13 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
+                                  dump_rectangles_);
+   if (dump_rectangles_.empty()) {
++    forward_reject_reason_ = "no rectangles";
+     return false;
+   }
+   auto* source_rt = static_cast<VulkanRenderTarget*>(dump_rectangles_.front().render_target);
+   for (const ResolveCopyDumpRectangle& rectangle : dump_rectangles_) {
+     if (rectangle.render_target != source_rt) {
++      forward_reject_reason_ = "several render targets";
+       return false;
+     }
+   }
+@@ -6353,6 +6407,7 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+   if (bool(rt_key.is_depth) != is_depth || rt_key.resource_format != edram.format ||
+       (!is_depth && rt_key.Is64bpp()) || rt_key.msaa_samples != edram.msaa_samples ||
+       rt_key.GetPitchTiles() != edram.pitch_tiles) {
++    forward_reject_reason_ = "render target key";
+     return false;
+   }
+   // The resolve rectangle's origin in the render target, in pixels.
+@@ -6372,6 +6427,7 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+       origin_y + resolve_height >
+           GetRenderTargetHeight(rt_key.pitch_tiles_at_32bpp, rt_key.msaa_samples) ||
+       origin_x >= (1u << 13) || origin_y >= (1u << 13)) {
++    forward_reject_reason_ = "outside render target";
+     return false;
+   }
+ 
+@@ -6380,6 +6436,7 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+   const VkPipelineLayout pipeline_layout =
+       is_depth ? dump_pipeline_layout_depth_ : dump_pipeline_layout_color_;
+   if (pipeline == VK_NULL_HANDLE) {
++    forward_reject_reason_ = "no pipeline";
+     return false;
+   }
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+@@ -6392,17 +6449,71 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+           ui::vulkan::util::MemoryPurpose::kDeviceLocal, resolve_forward_buffer_,
+           resolve_forward_buffer_memory_)) {
+     resolve_forward_buffer_ = VK_NULL_HANDLE;
++    forward_reject_reason_ = "staging buffer";
+     return false;
+   }
+ 
++  // Straight into the texture when it was created for that: no staging
++  // buffer, no copy, and one barrier fewer per resolve.
++  const VkDescriptorSetLayout storage_set_layout =
++      is_depth ? VK_NULL_HANDLE : texture_cache.resolve_forward_storage_set_layout();
++  const VkPipeline image_pipeline =
++      storage_set_layout != VK_NULL_HANDLE
++          ? GetResolveForwardPipeline(false, edram.msaa_samples != xenos::MsaaSamples::k1X,
++                                      storage_set_layout)
++          : VK_NULL_HANDLE;
+   uint32_t width = 0, height = 0;
++  VkDescriptorSet storage_set = VK_NULL_HANDLE;
+   const VkImage texture_image = texture_cache.BeginResolveForward(
+       resolve_info.copy_dest_base, resolve_width, resolve_height,
+       dest_coordinates.pitch_aligned_div_32 * 32, texture_format,
+-      xenos::Endian(uint32_t(dest_info.copy_dest_endian)), width, height);
++      xenos::Endian(uint32_t(dest_info.copy_dest_endian)), width, height,
++      image_pipeline != VK_NULL_HANDLE ? &storage_set : nullptr);
+   if (texture_image == VK_NULL_HANDLE) {
++    forward_reject_reason_ = "no single matching texture";
+     return false;
+   }
++  if (storage_set != VK_NULL_HANDLE) {
++    command_processor_.PushImageMemoryBarrier(
++        source_rt->image(), ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT),
++        source_rt->current_stage_mask(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++        source_rt->current_access_mask(), VK_ACCESS_SHADER_READ_BIT,
++        source_rt->current_layout(), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    source_rt->SetUsage(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_READ_BIT,
++                        VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
++    command_processor_.SubmitBarriers(true);
++    DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
++    command_processor_.BindExternalComputePipeline(image_pipeline);
++    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                           resolve_forward_image_pipeline_layout_,
++                                           kDumpDescriptorSetEdram, 1, &storage_set, 0, nullptr);
++    const VkDescriptorSet source_descriptor_set = source_rt->GetDescriptorSetTransferSource();
++    command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
++                                           resolve_forward_image_pipeline_layout_,
++                                           kDumpDescriptorSetSource, 1, &source_descriptor_set, 0,
++                                           nullptr);
++    const uint32_t push_constants[2] = {
++        origin_x | (origin_y << 13) | (uint32_t(dest_info.copy_dest_swap) << 26) |
++            (sample_mode << 27),
++        width | (height << 13),
++    };
++    command_buffer.CmdVkPushConstants(resolve_forward_image_pipeline_layout_,
++                                      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(push_constants),
++                                      push_constants);
++    command_processor_.GpuOpBegin();
++#if REX_PLATFORM_SWITCH
++    if (!RexSwitchPerfSkip(4))
++#endif
++    command_buffer.CmdVkDispatch((width + 7) / 8, (height + 7) / 8, 1);
++    command_processor_.GpuOpEnd(VulkanCommandProcessor::GpuOp::kResolveCopy);
++    // The texture stays a storage write target until a draw samples it; the
++    // texture cache transitions it then.
++#if REX_PLATFORM_SWITCH
++    RexSwitchPerfCount(60);
++    RexSwitchPerfCount(74);
++#endif
++    return true;
++  }
+   if (VkDeviceSize(width) * height * 4 > kResolveForwardBufferSize) {
+     // The texture was already marked up to date; it keeps its old contents
+     // for this frame, which the normal path cannot fix any more either.
+@@ -6464,6 +6575,9 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+   command_buffer.CmdVkPushConstants(pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                     sizeof(push_constants), push_constants);
+   command_processor_.GpuOpBegin();
++#if REX_PLATFORM_SWITCH
++  if (!RexSwitchPerfSkip(4))
++#endif
+   command_buffer.CmdVkDispatch((width + 7) / 8, (height + 7) / 8, 1);
+   command_processor_.GpuOpEnd(VulkanCommandProcessor::GpuOp::kResolveCopy);
+ 
+@@ -6489,11 +6603,39 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+   return true;
+ }
+ 
+-VkPipeline VulkanRenderTargetCache::GetResolveForwardPipeline(bool is_depth, bool multisampled) {
+-  VkPipeline& pipeline = resolve_forward_pipelines_[is_depth][multisampled];
++VkPipeline VulkanRenderTargetCache::GetResolveForwardPipeline(
++    bool is_depth, bool multisampled, VkDescriptorSetLayout storage_set_layout) {
++  const bool to_image = storage_set_layout != VK_NULL_HANDLE;
++  if (to_image && is_depth) {
++    return VK_NULL_HANDLE;
++  }
++  VkPipeline& pipeline = to_image ? resolve_forward_image_pipelines_[multisampled]
++                                  : resolve_forward_pipelines_[is_depth][multisampled];
+   if (pipeline != VK_NULL_HANDLE) {
+     return pipeline;
+   }
++  if (to_image && resolve_forward_image_pipeline_layout_ == VK_NULL_HANDLE) {
++    const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++    VkDescriptorSetLayout set_layouts[kDumpDescriptorSetCount];
++    set_layouts[kDumpDescriptorSetEdram] = storage_set_layout;
++    set_layouts[kDumpDescriptorSetSource] = descriptor_set_layout_sampled_image_;
++    VkPushConstantRange push_constant_range;
++    push_constant_range.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++    push_constant_range.offset = 0;
++    push_constant_range.size = sizeof(uint32_t) * kDumpPushConstantCount;
++    VkPipelineLayoutCreateInfo layout_create_info = {};
++    layout_create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
++    layout_create_info.setLayoutCount = uint32_t(rex::countof(set_layouts));
++    layout_create_info.pSetLayouts = set_layouts;
++    layout_create_info.pushConstantRangeCount = 1;
++    layout_create_info.pPushConstantRanges = &push_constant_range;
++    if (vulkan_device->functions().vkCreatePipelineLayout(
++            vulkan_device->device(), &layout_create_info, nullptr,
++            &resolve_forward_image_pipeline_layout_) != VK_SUCCESS) {
++      resolve_forward_image_pipeline_layout_ = VK_NULL_HANDLE;
++      return VK_NULL_HANDLE;
++    }
++  }
+   SpirvBuilder builder(spv::Spv_1_0, (SpirvShaderTranslator::kSpirvMagicToolId << 16) | 1, nullptr);
+   spv::Id ext_inst_glsl_std_450 = builder.import("GLSL.std.450");
+   builder.addCapability(spv::CapabilityShader);
+@@ -6509,18 +6651,34 @@ VkPipeline VulkanRenderTargetCache::GetResolveForwardPipeline(bool is_depth, boo
+   spv::Id type_float4 = builder.makeVectorType(type_float, 4);
+   std::vector<spv::Id> ids;
+ 
+-  // Set 0: the staging buffer, one packed texel per uint.
+-  ids.push_back(builder.makeRuntimeArray(type_uint));
+-  builder.addDecoration(ids.back(), spv::DecorationArrayStride, sizeof(uint32_t));
+-  spv::Id type_buffer = builder.makeStructType(ids, "XeResolveForwardBuffer");
+-  builder.addMemberName(type_buffer, 0, "texels");
+-  builder.addMemberDecoration(type_buffer, 0, spv::DecorationNonReadable);
+-  builder.addMemberDecoration(type_buffer, 0, spv::DecorationOffset, 0);
+-  builder.addDecoration(type_buffer, spv::DecorationBufferBlock);
+-  spv::Id buffer =
+-      builder.createVariable(spv::NoPrecision, spv::StorageClassUniform, type_buffer, "xe_texels");
+-  builder.addDecoration(buffer, spv::DecorationDescriptorSet, kDumpDescriptorSetEdram);
+-  builder.addDecoration(buffer, spv::DecorationBinding, 0);
++  // Set 0: the staging buffer, one packed texel per uint, or the texture's
++  // R32_UINT storage view.
++  spv::Id type_uint4 = builder.makeVectorType(type_uint, 4);
++  spv::Id storage_image = spv::NoResult;
++  if (to_image) {
++    storage_image = builder.createVariable(
++        spv::NoPrecision, spv::StorageClassUniformConstant,
++        builder.makeImageType(type_uint, spv::Dim2D, false, false, false, 2, spv::ImageFormatR32ui),
++        "xe_texture");
++    builder.addDecoration(storage_image, spv::DecorationDescriptorSet, kDumpDescriptorSetEdram);
++    builder.addDecoration(storage_image, spv::DecorationBinding, 0);
++    builder.addDecoration(storage_image, spv::DecorationNonReadable);
++  }
++  // Not declared next to the storage image: two resources on one binding.
++  spv::Id buffer = spv::NoResult;
++  if (!to_image) {
++    ids.push_back(builder.makeRuntimeArray(type_uint));
++    builder.addDecoration(ids.back(), spv::DecorationArrayStride, sizeof(uint32_t));
++    spv::Id type_buffer = builder.makeStructType(ids, "XeResolveForwardBuffer");
++    builder.addMemberName(type_buffer, 0, "texels");
++    builder.addMemberDecoration(type_buffer, 0, spv::DecorationNonReadable);
++    builder.addMemberDecoration(type_buffer, 0, spv::DecorationOffset, 0);
++    builder.addDecoration(type_buffer, spv::DecorationBufferBlock);
++    buffer = builder.createVariable(spv::NoPrecision, spv::StorageClassUniform, type_buffer,
++                                    "xe_texels");
++    builder.addDecoration(buffer, spv::DecorationDescriptorSet, kDumpDescriptorSetEdram);
++    builder.addDecoration(buffer, spv::DecorationBinding, 0);
++  }
+   // Set 1: the render target.
+   spv::Id source = builder.createVariable(
+       spv::NoPrecision, spv::StorageClassUniformConstant,
+@@ -6654,6 +6812,20 @@ VkPipeline VulkanRenderTargetCache::GetResolveForwardPipeline(bool is_depth, boo
+         swapped, color);
+     spv::Id packed = builder.createUnaryBuiltinCall(type_uint, ext_inst_glsl_std_450,
+                                                     GLSLstd450PackUnorm4x8, color);
++    if (to_image) {
++      ids.clear();
++      ids.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, x));
++      ids.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, y));
++      spv::Id texel_coords = builder.createCompositeConstruct(type_int2, ids);
++      ids.clear();
++      for (int i = 0; i < 4; ++i) {
++        ids.push_back(packed);
++      }
++      spv::Id texel = builder.createCompositeConstruct(type_uint4, ids);
++      std::vector<spv::Id> write_operands{builder.createLoad(storage_image, spv::NoPrecision),
++                                          texel_coords, texel};
++      builder.createNoResultOp(spv::OpImageWrite, write_operands);
++    } else {
+     spv::Id index = builder.createBinOp(spv::OpIAdd, type_uint,
+                                         builder.createBinOp(spv::OpIMul, type_uint, y, width), x);
+     ids.clear();
+@@ -6661,6 +6833,7 @@ VkPipeline VulkanRenderTargetCache::GetResolveForwardPipeline(bool is_depth, boo
+     ids.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, index));
+     builder.createStore(packed, builder.createAccessChain(spv::StorageClassUniform, buffer, ids));
+     }
++    }
+   }
+   inside_if.makeEndIf();
+ 
+@@ -6673,7 +6846,8 @@ VkPipeline VulkanRenderTargetCache::GetResolveForwardPipeline(bool is_depth, boo
+   builder.dump(shader_code);
+   pipeline = ui::vulkan::util::CreateComputePipeline(
+       command_processor_.GetVulkanDevice(),
+-      is_depth ? dump_pipeline_layout_depth_ : dump_pipeline_layout_color_,
++      to_image ? resolve_forward_image_pipeline_layout_
++               : (is_depth ? dump_pipeline_layout_depth_ : dump_pipeline_layout_color_),
+       reinterpret_cast<const uint32_t*>(shader_code.data()), sizeof(uint32_t) * shader_code.size());
+   if (pipeline == VK_NULL_HANDLE) {
+     REXGPU_ERROR("VulkanRenderTargetCache: Failed to create the resolve forwarding pipeline");
+@@ -6700,7 +6874,7 @@ VkPipeline VulkanRenderTargetCache::GetDirectResolvePipeline(DirectResolvePipeli
+ 
+ uint32_t VulkanRenderTargetCache::GetDrawOverwrittenRenderTargets(
+     reg::RB_DEPTHCONTROL normalized_depth_control, uint32_t normalized_color_mask,
+-    Transfer::Rectangle& rect_out) const {
++    Transfer::Rectangle& rect_out, const Shader* vertex_shader) {
+   // Direct3D on the Xbox 360 clears by drawing one screen-space rectangle
+   // over the scissor with depth and stencil forced. Binding the render targets
+   // for that draw is what makes the EDRAM change owner, so without this every
+@@ -6714,7 +6888,15 @@ uint32_t VulkanRenderTargetCache::GetDrawOverwrittenRenderTargets(
+   const RegisterFile& regs = register_file();
+   const auto draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
+   if (draw_initiator.prim_type != xenos::PrimitiveType::kRectangleList ||
+-      draw_initiator.num_indices != 3 || draw_pixel_shader_may_kill_) {
++      draw_initiator.num_indices != 3 || draw_pixel_shader_kills_) {
++    return 0;
++  }
++  // A textured rectangle (post-processing passes draw one over the whole
++  // screen, into memory that held the scene's depth) only counts when its
++  // vertices, not the scissor, show it covers everything; images and video
++  // frames are rectangles smaller than the scissor.
++  const bool textured = draw_pixel_shader_samples_textures_;
++  if (textured && (!REXCVAR_GET(gpu_skip_transfers_under_opaque_rects) || !vertex_shader)) {
+     return 0;
+   }
+   // Alpha test and alpha to coverage act on the pixel shader's color output,
+@@ -6737,6 +6919,13 @@ uint32_t VulkanRenderTargetCache::GetDrawOverwrittenRenderTargets(
+   if (!scissor.extent[0] || !scissor.extent[1]) {
+     return 0;
+   }
++  if (textured &&
++      !RectangleCoversPixels(*vertex_shader, int32_t(scissor.offset[0]),
++                             int32_t(scissor.offset[1]),
++                             int32_t(scissor.offset[0] + scissor.extent[0]),
++                             int32_t(scissor.offset[1] + scissor.extent[1]))) {
++    return 0;
++  }
+   rect_out.x_pixels = scissor.offset[0];
+   rect_out.y_pixels = scissor.offset[1];
+   rect_out.width_pixels = scissor.extent[0];
+@@ -6802,6 +6991,101 @@ uint32_t VulkanRenderTargetCache::GetDrawOverwrittenRenderTargets(
+   return overwritten;
+ }
+ 
++bool VulkanRenderTargetCache::RectangleCoversPixels(const Shader& vertex_shader, int32_t x0,
++                                                    int32_t y0, int32_t x1, int32_t y1) {
++  const RegisterFile& regs = register_file();
++  const auto draw_initiator = regs.Get<reg::VGT_DRAW_INITIATOR>();
++  if (draw_initiator.source_select != xenos::SourceSelect::kAutoIndex ||
++      !vertex_shader.is_ucode_analyzed() ||
++      !ShaderInterpreter::CanInterpretShader(vertex_shader)) {
++    return false;
++  }
++  class PositionSink : public ShaderInterpreter::ExportSink {
++   public:
++    void Export(ucode::ExportRegister export_register, const float* value,
++                uint32_t value_mask) override {
++      if (export_register == ucode::ExportRegister::kVSPosition) {
++        for (uint32_t i = 0; i < 4; ++i) {
++          if (value_mask & (1u << i)) {
++            position[i] = value[i];
++            written |= 1u << i;
++          }
++        }
++      }
++    }
++    float position[4] = {};
++    uint32_t written = 0;
++  };
++  // The same screen-space mapping as the draw extent estimator: optional
++  // division by W, the viewport, the Direct3D half-pixel offset and the window
++  // offset, leaving pixel (x, y) spanning [x, x + 1) x [y, y + 1).
++  const auto vte = regs.Get<reg::PA_CL_VTE_CNTL>();
++  const float scale_x =
++      vte.vport_x_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XSCALE) : 1.0f;
++  const float offset_x =
++      vte.vport_x_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_XOFFSET) : 0.0f;
++  const float scale_y =
++      vte.vport_y_scale_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YSCALE) : 1.0f;
++  const float offset_y =
++      vte.vport_y_offset_ena ? regs.Get<float>(XE_GPU_REG_PA_CL_VPORT_YOFFSET) : 0.0f;
++  float pixel_offset_x = 0.0f, pixel_offset_y = 0.0f;
++  if (regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero) {
++    pixel_offset_x = pixel_offset_y = 0.5f;
++  }
++  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
++    const auto window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
++    pixel_offset_x += float(window_offset.window_x_offset);
++    pixel_offset_y += float(window_offset.window_y_offset);
++  }
++  const uint32_t index_offset = regs.Get<reg::VGT_INDX_OFFSET>().indx_offset;
++  const uint32_t min_index = regs.Get<reg::VGT_MIN_VTX_INDX>().min_indx;
++  const uint32_t max_index = regs.Get<reg::VGT_MAX_VTX_INDX>().max_indx;
++  float xs[3], ys[3];
++  PositionSink sink;
++  rectangle_interpreter_.SetShader(vertex_shader);
++  rectangle_interpreter_.SetExportSink(&sink);
++  bool valid = true;
++  for (uint32_t i = 0; i < 3 && valid; ++i) {
++    const uint32_t vertex_index =
++        std::min(max_index, std::max(min_index, (i + index_offset) & 0xFFFFFF));
++    sink.written = 0;
++    rectangle_interpreter_.temp_registers()[0] = float(vertex_index);
++    rectangle_interpreter_.Execute();
++    if ((sink.written & 0b0011) != 0b0011) {
++      valid = false;
++      break;
++    }
++    float x = sink.position[0], y = sink.position[1];
++    if (!vte.vtx_xy_fmt) {
++      if (!(sink.written & 0b1000) || !(sink.position[3] > 0.0f)) {
++        valid = false;
++        break;
++      }
++      x /= sink.position[3];
++      y /= sink.position[3];
++    }
++    xs[i] = x * scale_x + offset_x + pixel_offset_x;
++    ys[i] = y * scale_y + offset_y + pixel_offset_y;
++    if (!std::isfinite(xs[i]) || !std::isfinite(ys[i])) {
++      valid = false;
++    }
++  }
++  rectangle_interpreter_.SetExportSink(nullptr);
++  if (!valid) {
++    return false;
++  }
++  // Axis-aligned: the three corners use two distinct X and two distinct Y.
++  const float min_x = std::min({xs[0], xs[1], xs[2]}), max_x = std::max({xs[0], xs[1], xs[2]});
++  const float min_y = std::min({ys[0], ys[1], ys[2]}), max_y = std::max({ys[0], ys[1], ys[2]});
++  for (uint32_t i = 0; i < 3; ++i) {
++    if ((xs[i] != min_x && xs[i] != max_x) || (ys[i] != min_y && ys[i] != max_y)) {
++      return false;
++    }
++  }
++  // Whole pixel squares, so every MSAA sample position inside is covered.
++  return min_x <= float(x0) && max_x >= float(x1) && min_y <= float(y0) && max_y >= float(y1);
++}
++
+ void VulkanRenderTargetCache::CopyDepthTransfers(VulkanRenderTarget& dest_rt,
+                                                  const std::vector<Transfer>& transfers,
+                                                  std::vector<Transfer>& remaining_out) {
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index be6d855..2a05f44 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -234,6 +234,8 @@ void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_
+       size = VK_WHOLE_SIZE;
+       last_usage_ = usage;
+     }
++    // Attributed to whoever asked for the usage, not to this function.
++    command_processor_.TagBarrierBatch(uintptr_t(__builtin_return_address(0)));
+     command_processor_.PushBufferMemoryBarrier(
+         buffer_, offset, size, src_stage_mask, dst_stage_mask, src_access_mask, dst_access_mask,
+         VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+@@ -356,15 +358,23 @@ bool VulkanSharedMemory::UploadRanges(
+ }
+ 
+ bool VulkanSharedMemory::UploadRangeUnwatchedImpl(uint32_t guest_offset, uint32_t size,
+-                                                  const void* host_src) {
++                                                  const void* host_src,
++                                                  bool to_submission_start) {
+   // Same ordering discipline as UploadRanges - make the buffer a transfer
+   // destination for the range about to be written and flush the barrier before
+   // recording the copy, so it lands ahead of any draw recorded after this
+   // point. Unlike UploadRanges the range is in bytes rather than in pages, and
+   // nothing is marked valid on the way through.
+-  Use(Usage::kTransferDestination, std::make_pair(guest_offset, size));
+-  command_processor_.SubmitBarriers(true);
+-  DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
++  // Hoisted copies go to the submission's upload prologue, which has its own
++  // barriers around it (VulkanCommandProcessor::EndSubmission): no barrier
++  // here, and the render pass stays open.
++  if (!unwatched_upload_batch_ && !to_submission_start) {
++    Use(Usage::kTransferDestination, std::make_pair(guest_offset, size));
++    command_processor_.SubmitBarriers(true);
++  }
++  DeferredCommandBuffer& command_buffer = to_submission_start
++                                              ? command_processor_.upload_prologue()
++                                              : command_processor_.deferred_command_buffer();
+   uint64_t submission_current = command_processor_.GetCurrentSubmission();
+ 
+   const uint8_t* source = reinterpret_cast<const uint8_t*>(host_src);
+@@ -414,6 +424,15 @@ bool VulkanSharedMemory::UploadRangeUnwatchedImpl(uint32_t guest_offset, uint32_
+   return successful;
+ }
+ 
++void VulkanSharedMemory::BeginUnwatchedUploadBatch() {
++  // The whole buffer is declared written, so the barrier the next reader
++  // inserts in Use covers every copy of the batch. A barrier per copy drained
++  // the GPU about a thousand times a frame in Free Skate.
++  Use(Usage::kTransferDestination, std::make_pair(uint32_t(0), kBufferSize));
++  command_processor_.SubmitBarriers(true);
++  unwatched_upload_batch_ = true;
++}
++
+ void VulkanSharedMemory::GetUsageMasks(Usage usage, VkPipelineStageFlags& stage_mask,
+                                        VkAccessFlags& access_mask) const {
+   switch (usage) {
+diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
+index 4492404..918b5b7 100644
+--- a/src/graphics/vulkan/texture_cache.cpp
++++ b/src/graphics/vulkan/texture_cache.cpp
+@@ -42,6 +42,11 @@ REXCVAR_DEFINE_BOOL(gpu_texture_last_view_cache, false, "GPU/Vulkan",
+                     "Reuse a texture's most recent exactly matching Vulkan image view request");
+ REXCVAR_DEFINE_BOOL(gpu_texture_last_view_cache_stats, false, "GPU/Vulkan",
+                     "Log texture last-view-cache engagement counters");
++REXCVAR_DEFINE_BOOL(gpu_resolve_forward_storage, false, "GPU/Vulkan",
++                    "With gpu_resolve_to_texture, create single-level 2D 8888 textures with "
++                    "storage usage so a forwarded resolve is written straight into them, "
++                    "without a staging buffer and a copy")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
+ #include <rex/platform.h>
+ #if REX_PLATFORM_SWITCH
+@@ -520,6 +525,14 @@ VulkanTextureCache::~VulkanTextureCache() {
+   // textures before destroying VMA.
+   DestroyAllTextures(true);
+ 
++  // After the textures, which free their sets into the pool.
++  if (resolve_forward_storage_pool_ != VK_NULL_HANDLE) {
++    dfn.vkDestroyDescriptorPool(device, resolve_forward_storage_pool_, nullptr);
++  }
++  if (resolve_forward_storage_set_layout_ != VK_NULL_HANDLE) {
++    dfn.vkDestroyDescriptorSetLayout(device, resolve_forward_storage_set_layout_, nullptr);
++  }
++
+   if (vma_allocator_ != VK_NULL_HANDLE) {
+     vmaDestroyAllocator(vma_allocator_);
+   }
+@@ -684,7 +697,11 @@ void VulkanTextureCache::RequestTextures(uint32_t used_texture_mask) {
+ VkImage VulkanTextureCache::BeginResolveForward(uint32_t base_address, uint32_t max_width,
+                                                 uint32_t max_height, uint32_t pitch_texels,
+                                                 xenos::TextureFormat format, xenos::Endian endian,
+-                                                uint32_t& width_out, uint32_t& height_out) {
++                                                uint32_t& width_out, uint32_t& height_out,
++                                                VkDescriptorSet* storage_set_out) {
++  if (storage_set_out) {
++    *storage_set_out = VK_NULL_HANDLE;
++  }
+   auto* found = static_cast<VulkanTexture*>(
+       FindResolveForwardTexture(base_address, max_width, max_height, pitch_texels, format,
+                                 endian));
+@@ -695,13 +712,22 @@ VkImage VulkanTextureCache::BeginResolveForward(uint32_t base_address, uint32_t
+   width_out = key.width_minus_1 + 1;
+   height_out = key.height_minus_1 + 1;
+ 
+-  VulkanTexture::Usage old_usage = found->SetUsage(VulkanTexture::Usage::kTransferDestination);
++  VkDescriptorSet storage_set = VK_NULL_HANDLE;
++  if (storage_set_out && found->storage_capable()) {
++    storage_set = found->GetStorageDescriptorSet();
++  }
++  const VulkanTexture::Usage new_usage = storage_set != VK_NULL_HANDLE
++                                             ? VulkanTexture::Usage::kStorageWrite
++                                             : VulkanTexture::Usage::kTransferDestination;
++  VulkanTexture::Usage old_usage = found->SetUsage(new_usage);
+   VkPipelineStageFlags src_stage_mask, dst_stage_mask;
+   VkAccessFlags src_access_mask, dst_access_mask;
+   VkImageLayout old_layout, new_layout;
+   GetTextureUsageMasks(old_usage, src_stage_mask, src_access_mask, old_layout);
+-  GetTextureUsageMasks(VulkanTexture::Usage::kTransferDestination, dst_stage_mask,
+-                       dst_access_mask, new_layout);
++  GetTextureUsageMasks(new_usage, dst_stage_mask, dst_access_mask, new_layout);
++  if (storage_set_out) {
++    *storage_set_out = storage_set;
++  }
+   command_processor_.PushImageMemoryBarrier(found->image(),
+                                             ui::vulkan::util::InitializeSubresourceRange(),
+                                             src_stage_mask, dst_stage_mask, src_access_mask,
+@@ -1083,6 +1109,24 @@ VkImageView VulkanTextureCache::RequestSwapTexture(uint32_t& width_scaled_out,
+   if (!texture) {
+     return VK_NULL_HANDLE;
+   }
++  {
++    // Which memory the frontbuffer is read from, to match it with the
++    // resolves writing it.
++    static uint32_t logged_bases[4] = {};
++    const uint32_t base = uint32_t(key.base_page) << 12;
++    for (uint32_t& logged : logged_bases) {
++      if (logged == base) {
++        break;
++      }
++      if (!logged) {
++        logged = base;
++        REXGPU_INFO("Swap texture: base 0x{:08X} {}x{} pitch {} format {} endian {} tiled {}",
++                    base, key.GetWidth(), key.GetHeight(), uint32_t(key.pitch),
++                    uint32_t(key.format), uint32_t(key.endianness), uint32_t(key.tiled));
++        break;
++      }
++    }
++  }
+   uint32_t host_swizzle = GuestToHostSwizzle(fetch.swizzle, GetHostFormatSwizzle(key));
+   if (swap_source_needs_rb_swap_out) {
+     auto swizzle_component = [](uint32_t swizzle,
+@@ -1264,15 +1308,36 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
+   image_create_info.queueFamilyIndexCount = 0;
+   image_create_info.pQueueFamilyIndices = nullptr;
+   image_create_info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++  // What a resolve can be forwarded into (see FindResolveForwardTexture).
++  // Every format a view of it can take supports storage on the target
++  // drivers; the R32_UINT one is what the forwarding shader writes through.
++  VkFormat view_formats[3] = {formats[0], formats[1], VK_FORMAT_R32_UINT};
++  uint32_t view_format_count = formats[1] != VK_FORMAT_UNDEFINED ? 2 : 0;
++  const bool storage_capable =
++      resolve_forward_storage_pool_ != VK_NULL_HANDLE &&
++      key.format == xenos::TextureFormat::k_8_8_8_8 &&
++      key.dimension == xenos::DataDimension::k2DOrStacked && key.tiled && !key.packed_mips &&
++      key.mip_max_level == 0 && key.depth_or_array_size_minus_1 == 0 && !key.signed_separate &&
++      !key.scaled_resolve && formats[0] == VK_FORMAT_R8G8B8A8_UNORM &&
++      (formats[1] == VK_FORMAT_UNDEFINED || formats[1] == VK_FORMAT_R8G8B8A8_SNORM);
++  if (storage_capable) {
++    image_create_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
++    image_create_info.flags |= VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
++    if (formats[1] != VK_FORMAT_UNDEFINED) {
++      view_format_count = 3;
++    } else {
++      view_formats[1] = VK_FORMAT_R32_UINT;
++      view_format_count = 2;
++    }
++  }
+   VkImageFormatListCreateInfo image_format_list_create_info;
+-  if (formats[1] != VK_FORMAT_UNDEFINED &&
+-      vulkan_device->extensions().ext_1_2_KHR_image_format_list) {
++  if (view_format_count && vulkan_device->extensions().ext_1_2_KHR_image_format_list) {
+     image_create_info_last->pNext = &image_format_list_create_info;
+     image_create_info_last = reinterpret_cast<VkImageCreateInfo*>(&image_format_list_create_info);
+     image_format_list_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO;
+     image_format_list_create_info.pNext = nullptr;
+-    image_format_list_create_info.viewFormatCount = 2;
+-    image_format_list_create_info.pViewFormats = formats;
++    image_format_list_create_info.viewFormatCount = view_format_count;
++    image_format_list_create_info.pViewFormats = view_formats;
+   }
+ 
+   VmaAllocationCreateInfo allocation_create_info = {};
+@@ -1285,7 +1350,11 @@ std::unique_ptr<TextureCache::Texture> VulkanTextureCache::CreateTexture(Texture
+     return nullptr;
+   }
+ 
+-  return std::unique_ptr<Texture>(new VulkanTexture(*this, key, image, allocation));
++  auto texture = std::make_unique<VulkanTexture>(*this, key, image, allocation);
++  if (storage_capable) {
++    texture->set_storage_capable();
++  }
++  return texture;
+ }
+ 
+ bool VulkanTextureCache::EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled,
+@@ -1952,9 +2021,68 @@ VulkanTextureCache::VulkanTexture::~VulkanTexture() {
+   if (image_view_3d_as_2d_signed_ != VK_NULL_HANDLE) {
+     dfn.vkDestroyImageView(device, image_view_3d_as_2d_signed_, nullptr);
+   }
++  if (storage_descriptor_set_ != VK_NULL_HANDLE) {
++    dfn.vkFreeDescriptorSets(device, vulkan_texture_cache.resolve_forward_storage_pool_, 1,
++                             &storage_descriptor_set_);
++  }
++  if (storage_view_ != VK_NULL_HANDLE) {
++    dfn.vkDestroyImageView(device, storage_view_, nullptr);
++  }
+   vmaDestroyImage(vulkan_texture_cache.vma_allocator_, image_, allocation_);
+ }
+ 
++VkDescriptorSet VulkanTextureCache::VulkanTexture::GetStorageDescriptorSet() {
++  if (storage_descriptor_set_ != VK_NULL_HANDLE) {
++    return storage_descriptor_set_;
++  }
++  const VulkanTextureCache& vulkan_texture_cache =
++      static_cast<const VulkanTextureCache&>(texture_cache());
++  if (!storage_capable_ || vulkan_texture_cache.resolve_forward_storage_pool_ == VK_NULL_HANDLE) {
++    return VK_NULL_HANDLE;
++  }
++  const ui::vulkan::VulkanDevice* const vulkan_device =
++      vulkan_texture_cache.command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  if (storage_view_ == VK_NULL_HANDLE) {
++    VkImageViewCreateInfo view_create_info = {};
++    view_create_info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
++    view_create_info.image = image_;
++    view_create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
++    // The resolve shader stores the packed texel bits as they are.
++    view_create_info.format = VK_FORMAT_R32_UINT;
++    view_create_info.subresourceRange = ui::vulkan::util::InitializeSubresourceRange();
++    if (dfn.vkCreateImageView(device, &view_create_info, nullptr, &storage_view_) != VK_SUCCESS) {
++      storage_view_ = VK_NULL_HANDLE;
++      storage_capable_ = false;
++      return VK_NULL_HANDLE;
++    }
++  }
++  VkDescriptorSetAllocateInfo allocate_info = {};
++  allocate_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO;
++  allocate_info.descriptorPool = vulkan_texture_cache.resolve_forward_storage_pool_;
++  allocate_info.descriptorSetCount = 1;
++  allocate_info.pSetLayouts = &vulkan_texture_cache.resolve_forward_storage_set_layout_;
++  if (dfn.vkAllocateDescriptorSets(device, &allocate_info, &storage_descriptor_set_) !=
++      VK_SUCCESS) {
++    // The pool is full: this texture takes the staging copy path.
++    storage_descriptor_set_ = VK_NULL_HANDLE;
++    return VK_NULL_HANDLE;
++  }
++  VkDescriptorImageInfo image_info = {};
++  image_info.imageView = storage_view_;
++  image_info.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
++  VkWriteDescriptorSet write = {};
++  write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++  write.dstSet = storage_descriptor_set_;
++  write.dstBinding = 0;
++  write.descriptorCount = 1;
++  write.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++  write.pImageInfo = &image_info;
++  dfn.vkUpdateDescriptorSets(device, 1, &write, 0, nullptr);
++  return storage_descriptor_set_;
++}
++
+ VkImageView VulkanTextureCache::VulkanTexture::GetView(bool is_signed, uint32_t host_swizzle,
+                                                        bool is_array) {
+   const bool last_view_cache_enabled = REXCVAR_GET(gpu_texture_last_view_cache);
+@@ -3297,6 +3425,37 @@ bool VulkanTextureCache::Initialize() {
+     max_anisotropy_ = xenos::AnisoFilter::kDisabled;
+   }
+ 
++  if (REXCVAR_GET(gpu_resolve_forward_storage)) {
++    VkDescriptorSetLayoutBinding binding = {};
++    binding.binding = 0;
++    binding.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE;
++    binding.descriptorCount = 1;
++    binding.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
++    VkDescriptorSetLayoutCreateInfo layout_create_info = {};
++    layout_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
++    layout_create_info.bindingCount = 1;
++    layout_create_info.pBindings = &binding;
++    // Pool sized for far more textures than a frame forwards into; a texture
++    // that finds it full falls back to the staging copy.
++    constexpr uint32_t kMaxStorageSets = 1024;
++    VkDescriptorPoolSize pool_size = {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, kMaxStorageSets};
++    VkDescriptorPoolCreateInfo pool_create_info = {};
++    pool_create_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
++    pool_create_info.flags = VK_DESCRIPTOR_POOL_CREATE_FREE_DESCRIPTOR_SET_BIT;
++    pool_create_info.maxSets = kMaxStorageSets;
++    pool_create_info.poolSizeCount = 1;
++    pool_create_info.pPoolSizes = &pool_size;
++    if (dfn.vkCreateDescriptorSetLayout(device, &layout_create_info, nullptr,
++                                        &resolve_forward_storage_set_layout_) != VK_SUCCESS ||
++        dfn.vkCreateDescriptorPool(device, &pool_create_info, nullptr,
++                                   &resolve_forward_storage_pool_) != VK_SUCCESS) {
++      REXGPU_WARN(
++          "VulkanTextureCache: No resolve forwarding storage descriptors; forwarding keeps "
++          "the staging copy");
++      resolve_forward_storage_pool_ = VK_NULL_HANDLE;
++    }
++  }
++
+   return true;
+ }
+ 
+@@ -3367,6 +3526,11 @@ void VulkanTextureCache::GetTextureUsageMasks(VulkanTexture::Usage usage,
+       access_mask = VK_ACCESS_SHADER_READ_BIT;
+       layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+       break;
++    case VulkanTexture::Usage::kStorageWrite:
++      stage_mask = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
++      access_mask = VK_ACCESS_SHADER_WRITE_BIT;
++      layout = VK_IMAGE_LAYOUT_GENERAL;
++      break;
+   }
+ }
+ 
+diff --git a/src/input/switch/switch_input_driver.cpp b/src/input/switch/switch_input_driver.cpp
+index a970012..e0668fe 100644
+--- a/src/input/switch/switch_input_driver.cpp
++++ b/src/input/switch/switch_input_driver.cpp
+@@ -341,6 +341,8 @@ void SwitchInputDriver::Poll(size_t index) {
+  */
+ /* From the profiler (switch_perf.cpp): turns the GPU A/B test lap on and off. */
+ extern "C" void RexSwitchPerfToggleAb(void);
++/* From the draw census (draw_census.cc): captures the next frames. */
++extern "C" void RexSwitchCensusRequest(void);
+ 
+ void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
+   struct Atajo {
+@@ -395,6 +397,17 @@ void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
+   }
+   slot.menu_shortcuts =
+       ab_ahora ? (slot.menu_shortcuts | kBitAb) : (slot.menu_shortcuts & ~kBitAb);
++
++  // L+R+ZR: capture a draw census of the next frames (gpu_census_dir must be
++  // set), to see how a scene is built where it is slow.
++  const uint64_t kBitCensus = uint64_t(1) << 9;
++  const bool census_ahora = modificador && (held & HidNpadButton_ZR) != 0;
++  const bool census_antes = (slot.menu_shortcuts & kBitCensus) != 0;
++  if (census_ahora && !census_antes) {
++    RexSwitchCensusRequest();
++  }
++  slot.menu_shortcuts = census_ahora ? (slot.menu_shortcuts | kBitCensus)
++                                     : (slot.menu_shortcuts & ~kBitCensus);
+ }
+ 
+ SwitchInputDriver::Slot* SwitchInputDriver::FindSlot(DeviceId id) {
+diff --git a/src/ui/switch_perf.cpp b/src/ui/switch_perf.cpp
+index 38256cd..e9a0e95 100644
+--- a/src/ui/switch_perf.cpp
++++ b/src/ui/switch_perf.cpp
+@@ -101,8 +101,8 @@ constexpr u64 kReportSeconds = 10;
+  */
+ constexpr u64 kStartDelayNs = 8000000000ULL;
+ constexpr size_t kMaxSamples = 1 << 15;
+-constexpr size_t kFrames = 10;
+-constexpr unsigned kCounterCount = 61;  // 33 = hot pages unwatched, 34 = unwatch refused,
++constexpr size_t kFrames = 16;
++constexpr unsigned kCounterCount = 85;  // 33 = hot pages unwatched, 34 = unwatch refused,
+                                         // 35 = stencil bit transfer draws, 36 = skipped,
+                                         // 37 = EDRAM tiles dumped for resolves,
+                                         // 38 = frames with GPU operation timing, 39 = their
+@@ -119,6 +119,14 @@ constexpr unsigned kCounterCount = 61;  // 33 = hot pages unwatched, 34 = unwatc
+                                         // 57 = pages hashed, 58 = hash checks deferred by the
+                                         // backoff, 59 = pages found changed by their hash,
+                                         // 60 = resolves written straight into their texture
++                                        // 61-65 = GPU ns between timed operations after a
++                                        // barrier, a render pass change, a pipeline bind, a
++                                        // descriptor bind or none of those; 66-70 = their
++                                        // counts; 71 = ns from the last operation to frame end
++                                        // 72 = frames timed without operation timestamps,
++                                        // 73 = their GPU frame ns
++                                        // 74 = forwarded resolves written without staging
++                                        // 75/76 = textures created/destroyed
+ // In <NRO folder>/logs/rex/ (switch_crash_hooks.c computes it at startup).
+ std::string ReportPath() {
+   return std::string(RexSwitchLogDir()) + "rex_perfil.log";
+@@ -216,6 +224,8 @@ constexpr Mode kModes[] = {
+     {2, "sin transferencias"},
+     {4 | 64, "sin resolves"},
+     {8, "sin cargas de texturas"},
++    {256, "dibujados dobles"},
++    {256 | 128, "dobles con tijera 1x1"},
+     {255, "sin nada"},
+     {0, "normal (vuelta)"},
+ };
+@@ -565,8 +575,10 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+                  delta(15) / frames / 1048576.0, delta(16));
+     std::fprintf(f,
+                  "     hash de paginas por fotograma: %.1f comprobadas, %.1f aplazadas, %.1f "
+-                 "cambiadas | resolves directos a textura: %.1f\n",
+-                 delta(57) / frames, delta(58) / frames, delta(59) / frames, delta(60) / frames);
++                 "cambiadas | resolves directos a textura: %.1f (sin copia intermedia %.1f) | "
++                 "texturas creadas %.2f, destruidas %.2f | consultas de oclusion %.2f\n",
++                 delta(57) / frames, delta(58) / frames, delta(59) / frames, delta(60) / frames,
++                 delta(74) / frames, delta(75) / frames, delta(76) / frames, delta(77) / frames);
+     std::fprintf(f,
+                  "     transferencias evitadas por un borrado: %.1f, color/profundidad: %.1f | "
+                  "transferencias de profundidad hechas como copia: %.1f | "
+@@ -608,6 +620,23 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+                    "profundidad copiada %.1f ms (%.0f%%) | resto %.0f%%\n",
+                    n, total / n / 1e6, ms(40), pct(40), ms(41), pct(41), ms(42), pct(42), ms(45),
+                    pct(45), ms(43), pct(43), ms(44), pct(44), 100.0 * (total - timed) / total);
++      std::fprintf(f,
++                   "     GPU entre operaciones (ms, veces): tras barrera %.1f (%.0f) | cambio de "
++                   "render target %.1f (%.0f) | cambio de pipeline %.1f (%.0f) | descriptores %.1f "
++                   "(%.0f) | nada de eso %.1f (%.0f) | final %.1f\n",
++                   ms(61), delta(66) / n, ms(62), delta(67) / n, ms(63), delta(68) / n, ms(64),
++                   delta(69) / n, ms(65), delta(70) / n, ms(71));
++    }
++    std::fprintf(f, "     fotogramas por vblanks de 60 Hz: 1: %.0f | 2: %.0f | 3: %.0f | 4: %.0f | 5+: %.0f\n",
++                 delta(80), delta(81), delta(82), delta(83), delta(84));
++    if (delta(78) > 0) {
++      // Timestamp units, like the other GPU lines (x1.627 for real time).
++      std::fprintf(f, "     GPU ocupada %.1f ms por fotograma, esperando trabajo entre envios %.1f ms\n",
++                   delta(78) / frames / 1e6, delta(79) / frames / 1e6);
++    }
++    if (delta(72) > 0) {
++      std::fprintf(f, "     GPU sin marcas por operacion (%.0f fotogramas): fotograma %.1f ms\n",
++                   delta(72), delta(73) / delta(72) / 1e6);
+     }
+     std::fprintf(f,
+                  "     dibujados por ancho de superficie: 1600+ %.0f | 1280-1599 %.0f | "
+@@ -639,7 +668,7 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+         auto it = std::upper_bound(v.begin(), v.end(), t, [](u64 x, const VentanaTiron& w) { return x < w.inicio; });
+         return it != v.begin() && t <= (it - 1)->fin;
+       };
+-      std::fprintf(f, "\n== durante los tirones: %u fotogramas de mas de 45 ms (%.0f ms en total) ==\n", nt, ms_total);
++      std::fprintf(f, "\n== durante los tirones: %u fotogramas de mas de 150 ms (%.0f ms en total) ==\n", nt, ms_total);
+       for (size_t i : order) {
+         std::vector<u64> pcs;
+         std::vector<const Sample*> todas;
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 427b2f7..95f68a0 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1899,6 +1899,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+                 swapchain_effect, paint_context_.swapchain_render_pass);
+             if (swapchain_effect_pipeline.swapchain_pipeline == VK_NULL_HANDLE) {
+               guest_output_flow.effect_count = 0;
++            } else {
++              // Never recorded before, so the format check above failed on
++              // every frame: each present waited for the previous one on the
++              // GPU and compiled this pipeline again, a large share of a core.
++              swapchain_effect_pipeline.swapchain_format =
++                  paint_context_.swapchain_render_pass_format;
+             }
+           }
+         }

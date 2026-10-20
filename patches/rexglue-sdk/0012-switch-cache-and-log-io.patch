@@ -1,0 +1,122 @@
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index 11b83be..ba5b39a 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -630,7 +630,9 @@ void XmaContext::Decode(XMA_CONTEXT_DATA* data) {
+                                                       packet_info.current_frame_size_);
+ 
+   if (bits_to_copy == 0) {
+-    REXAPU_ERROR("XmaContext {}: There are no bits to copy!", id());
++    // Benign in Project 8 (about 70 a second while music streams); as an error
++    // it was flushed to the SD card every time.
++    REXAPU_DEBUG("XmaContext {}: There are no bits to copy!", id());
+     SwapInputBuffer(data);
+     return;
+   }
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+index 1645848..b03e357 100644
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -44,6 +44,12 @@ REXCVAR_DEFINE_BOOL(log_verbose, false, "Log", "Enable verbose logging (sets lev
+ 
+ REXCVAR_DEFINE_BOOL(log_noisy, false, "Log", "Enable noisy/high-frequency log macros");
+ 
++REXCVAR_DEFINE_STRING(log_flush_level, "", "Log",
++                      "Level at which every message is flushed to the log file at once; empty "
++                      "keeps the default (info). On the Switch each flush is a synchronous SD "
++                      "write on the logging thread.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ REXCVAR_DEFINE_INT32(log_flush_interval, 0, "Log", "Periodic flush interval in seconds (0 = off)")
+     .range(0, 60)
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+@@ -175,9 +181,14 @@ void InitLoggingEarly() {
+   g_early_initialized = true;
+ }
+ 
+-void InitLogging(const LogConfig& config) {
++void InitLogging(const LogConfig& config_in) {
+   std::lock_guard lock(g_mutex);
+ 
++  LogConfig config = config_in;
++  if (!REXCVAR_GET(log_flush_level).empty()) {
++    config.flush_level = spdlog::level::from_str(REXCVAR_GET(log_flush_level));
++  }
++
+   if (g_initialized) {
+     g_config = config;
+     for (auto& entry : g_registry) {
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 4c38706..af9f160 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -424,21 +424,38 @@ void VulkanPipelineCache::InitializeDriverCache(const std::filesystem::path& roo
+   // Never pass a partial SD write to the driver. The envelope stores a length
+   // and checksum around the exact bytes returned by vkGetPipelineCacheData.
+   // Vulkan itself checks the cache UUID when the driver build changes.
+-  std::vector<uint8_t> data;
+-  if (!driver_cache_path_.empty()) {
+-    if (FILE* file = rex::filesystem::OpenFile(driver_cache_path_, "rb")) {
++  auto read_cache = [](const std::filesystem::path& path) {
++    std::vector<uint8_t> bytes;
++    if (FILE* file = rex::filesystem::OpenFile(path, "rb")) {
+       uint64_t header[3]{};
+       if (fread(header, sizeof(header), 1, file) == 1 &&
+           header[0] == 0x3148434143385052ULL && header[1] >= 32 &&
+           header[1] <= 64 * 1024 * 1024) {
+-        data.resize(size_t(header[1]));
+-        if (fread(data.data(), data.size(), 1, file) != 1 ||
+-            XXH3_64bits(data.data(), data.size()) != header[2]) {
+-          data.clear();
++        bytes.resize(size_t(header[1]));
++        if (fread(bytes.data(), bytes.size(), 1, file) != 1 ||
++            XXH3_64bits(bytes.data(), bytes.size()) != header[2]) {
++          bytes.clear();
+         }
+       }
+       fclose(file);
+     }
++    return bytes;
++  };
++  std::vector<uint8_t> data;
++  if (!driver_cache_path_.empty()) {
++    // The Switch file system does not replace an existing file on rename, so
++    // a save that got as far as the complete temporary file (its checksum
++    // proves that) is newer than the main one: use whichever valid copy holds
++    // more pipelines.
++    data = read_cache(driver_cache_path_);
++    for (const char* suffix : {".tmp", ".old"}) {
++      auto other_path = driver_cache_path_;
++      other_path += suffix;
++      std::vector<uint8_t> other = read_cache(other_path);
++      if (other.size() > data.size()) {
++        data = std::move(other);
++      }
++    }
+   }
+   VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+   info.initialDataSize = data.size();
+@@ -488,8 +505,23 @@ void VulkanPipelineCache::SaveDriverCache() {
+   if (fclose(file) != 0) written = false;
+   // Keep the previous cache intact if writing or replacing it fails.
+   if (written) {
++    // Horizon's file system refuses to rename onto an existing file, which
++    // left every save stranded in the temporary file and each launch loading
++    // the first, small cache. Move the old file aside first.
+     std::error_code error;
+     std::filesystem::rename(temporary, driver_cache_path_, error);
++    if (error) {
++      auto previous = driver_cache_path_;
++      previous += ".old";
++      std::error_code ignored;
++      std::filesystem::remove(previous, ignored);
++      std::filesystem::rename(driver_cache_path_, previous, ignored);
++      error.clear();
++      std::filesystem::rename(temporary, driver_cache_path_, error);
++      if (!error) {
++        std::filesystem::remove(previous, ignored);
++      }
++    }
+     if (!error) {
+       driver_cache_saved_generation_ = generation;
+       REXGPU_INFO("Switch driver pipeline cache: saved {} bytes", data.size());

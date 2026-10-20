@@ -1,0 +1,237 @@
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 0e97704..5e9e2d9 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -160,10 +160,14 @@ class VulkanCommandProcessor : public CommandProcessor {
+     kResolveCopy,
+     kTransferCopy,
+     kRenderTargetDumpMultisampled,
++    // The game's own draws; aggregated per shader pair instead of into a
++    // profiler counter (see GpuOpEndDraw).
++    kGuestDraw,
+     kCount,
+   };
+   void GpuOpBegin();
+   void GpuOpEnd(GpuOp op);
++  void GpuOpEndDraw(uint64_t shader_pair_key, uint32_t vertex_count, uint32_t surface_info);
+ 
+   // Returns the deferred drawing command list for the currently open
+   // submission.
+@@ -795,13 +799,32 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // Read back without VK_QUERY_RESULT_WAIT_BIT: a stall here would change the
+   // thing being measured, so a slot that is not ready yet is simply skipped.
+   // Two for the frame, then a begin/end pair per timed operation.
+-  static constexpr uint32_t kGpuOpMaxPerFrame = 255;
++  static constexpr uint32_t kGpuOpMaxPerFrame = 2048;
+   static constexpr uint32_t kGpuOpSampleEvery = 4;
+   static constexpr uint32_t kTimestampQueriesPerFrame = 2 + 2 * kGpuOpMaxPerFrame;
+   bool gpu_op_frame_sampled_ = false;
+   uint32_t gpu_op_count_ = 0;
+   uint32_t gpu_op_slot_count_[kMaxFramesInFlight] = {};
+   GpuOp gpu_op_kind_[kMaxFramesInFlight][kGpuOpMaxPerFrame] = {};
++  // For kGuestDraw operations: the shader pair, vertex count and surface.
++  struct GpuOpDrawInfo {
++    uint64_t shader_pair_key;
++    uint32_t vertex_count;
++    uint32_t surface_info;
++  };
++  GpuOpDrawInfo gpu_op_draw_[kMaxFramesInFlight][kGpuOpMaxPerFrame] = {};
++  std::vector<uint64_t> gpu_op_stamps_;
++  // Draw GPU time per shader pair over gpu_draw_cost_frames_ sampled frames.
++  struct GpuDrawCost {
++    uint64_t ns = 0;
++    uint64_t draws = 0;
++    uint64_t vertices = 0;
++    uint32_t surface_info = 0;
++  };
++  std::unordered_map<uint64_t, GpuDrawCost> gpu_draw_costs_;
++  uint64_t gpu_draw_cost_frame_ns_ = 0;
++  uint32_t gpu_draw_cost_frames_ = 0;
++  void ReportGpuDrawCosts();
+   VkQueryPool timestamp_query_pool_ = VK_NULL_HANDLE;
+   bool timestamp_queries_available_ = false;
+   double timestamp_period_ns_ = 0.0;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 192bf92..1dba2a1 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -4235,6 +4235,10 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   }
+ 
+   const VulkanPipelineCache::PipelineLayoutProvider* pipeline_layout_provider;
++  // For per-draw GPU timing (gpu_timestamp_queries): which shaders this is.
++  const uint64_t draw_cost_key =
++      (vertex_shader->ucode_data_hash() << 32) ^
++      (pixel_shader ? pixel_shader->ucode_data_hash() & UINT32_MAX : 0);
+   // Set up the render targets - this may perform dispatches and draws.
+   // A shader that samples textures draws an image, not a clear, even as one
+   // rectangle: the rectangle may be smaller than the scissor.
+@@ -4693,7 +4697,12 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ #if REX_PLATFORM_SWITCH
+     if (!RexSwitchPerfSkip(1))
+ #endif
+-    deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
++    {
++      GpuOpBegin();
++      deferred_command_buffer_.CmdVkDraw(primitive_processing_result.host_draw_vertex_count, 1, 0, 0);
++      GpuOpEndDraw(draw_cost_key, primitive_processing_result.host_draw_vertex_count,
++                   regs[XE_GPU_REG_RB_SURFACE_INFO]);
++    }
+   } else {
+     std::pair<VkBuffer, VkDeviceSize> index_buffer;
+     switch (primitive_processing_result.index_buffer_type) {
+@@ -4730,8 +4739,13 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+ #if REX_PLATFORM_SWITCH
+     if (!RexSwitchPerfSkip(1))
+ #endif
+-    deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count, 1,
+-                                              0, 0, 0);
++    {
++      GpuOpBegin();
++      deferred_command_buffer_.CmdVkDrawIndexed(primitive_processing_result.host_draw_vertex_count,
++                                                1, 0, 0, 0);
++      GpuOpEndDraw(draw_cost_key, primitive_processing_result.host_draw_vertex_count,
++                   regs[XE_GPU_REG_RB_SURFACE_INFO]);
++    }
+   }
+ 
+   // Invalidate textures in memexported memory and watch for changes.
+@@ -5857,7 +5871,8 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+         // reset, and one unavailable query fails the whole read.
+         const uint32_t op_count = gpu_op_slot_count_[slot];
+         const uint32_t query_count = 2 + 2 * op_count;
+-        uint64_t stamps[kTimestampQueriesPerFrame] = {};
++        gpu_op_stamps_.resize(kTimestampQueriesPerFrame);
++        uint64_t* stamps = gpu_op_stamps_.data();
+         if (ts_dfn.vkGetQueryPoolResults(
+                 ts_device->device(), timestamp_query_pool_,
+                 slot * kTimestampQueriesPerFrame, query_count, sizeof(uint64_t) * query_count,
+@@ -5873,6 +5888,15 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+                 if (end > begin) {
+                   const uint64_t one_ns = uint64_t(double(end - begin) * timestamp_period_ns_);
+                   op_ns[size_t(gpu_op_kind_[slot][i])] += one_ns;
++                  if (gpu_op_kind_[slot][i] == GpuOp::kGuestDraw) {
++                    const GpuOpDrawInfo& info = gpu_op_draw_[slot][i];
++                    GpuDrawCost& cost = gpu_draw_costs_[info.shader_pair_key];
++                    cost.ns += one_ns;
++                    ++cost.draws;
++                    cost.vertices += info.vertex_count;
++                    cost.surface_info = info.surface_info;
++                    continue;
++                  }
+                   // The shortest single operation of each kind: if even that
+                   // takes milliseconds, the cost is per operation, not per
+                   // sample.
+@@ -5882,9 +5906,13 @@ bool VulkanCommandProcessor::BeginSubmission(bool is_guest_command) {
+               }
+               RexSwitchPerfCount(38);
+               RexSwitchPerfAdd(39, uint64_t(ns));
+-              for (size_t k = 0; k < size_t(GpuOp::kCount); ++k) {
++              for (size_t k = 0; k < size_t(GpuOp::kGuestDraw); ++k) {
+                 RexSwitchPerfAdd(40 + unsigned(k), op_ns[k]);
+               }
++              gpu_draw_cost_frame_ns_ += uint64_t(ns);
++              if (++gpu_draw_cost_frames_ >= 32) {
++                ReportGpuDrawCosts();
++              }
+             }
+ #endif
+           }
+@@ -6472,6 +6500,14 @@ void VulkanCommandProcessor::UpdateDynamicState(const draw_util::ViewportInfo& v
+   scissor_rect.offset.y = int32_t(scissor.offset[1]);
+   scissor_rect.extent.width = scissor.extent[0];
+   scissor_rect.extent.height = scissor.extent[1];
++#if REX_PLATFORM_SWITCH
++  // A/B lap: every draw still runs its state, vertices and setup, but shades
++  // at most one pixel, separating fill cost from per-draw overhead.
++  if (RexSwitchPerfSkip(128)) {
++    scissor_rect.extent.width = std::min(scissor_rect.extent.width, 1u);
++    scissor_rect.extent.height = std::min(scissor_rect.extent.height, 1u);
++  }
++#endif
+   SetScissor(scissor_rect);
+ 
+   if (render_target_cache_->GetPath() == RenderTargetCache::Path::kHostRenderTargets) {
+@@ -7738,4 +7774,49 @@ void VulkanCommandProcessor::GpuOpEnd(GpuOp op) {
+   gpu_op_kind_[slot][gpu_op_count_++] = op;
+ }
+ 
++void VulkanCommandProcessor::GpuOpEndDraw(uint64_t shader_pair_key, uint32_t vertex_count,
++                                          uint32_t surface_info) {
++  if (!gpu_op_frame_sampled_ || gpu_op_count_ >= kGpuOpMaxPerFrame) {
++    return;
++  }
++  const uint32_t slot = uint32_t(frame_current_ % kMaxFramesInFlight);
++  gpu_op_draw_[slot][gpu_op_count_] = {shader_pair_key, vertex_count, surface_info};
++  GpuOpEnd(GpuOp::kGuestDraw);
++}
++
++void VulkanCommandProcessor::ReportGpuDrawCosts() {
++  // Which of the game's passes the GPU spends its time in. The timestamps
++  // around every draw serialize the sampled frames, so the shares, not the
++  // absolute times, are what to trust.
++  std::vector<std::pair<uint64_t, GpuDrawCost>> sorted(gpu_draw_costs_.begin(),
++                                                       gpu_draw_costs_.end());
++  std::sort(sorted.begin(), sorted.end(),
++            [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
++  uint64_t draw_ns = 0, draws = 0;
++  for (const auto& entry : sorted) {
++    draw_ns += entry.second.ns;
++    draws += entry.second.draws;
++  }
++  const double frames = double(gpu_draw_cost_frames_);
++  REXGPU_INFO(
++      "Draw GPU cost over {} sampled frames: frame {:.1f} ms, draws {:.1f} ms in {:.0f} draws "
++      "of {} shader pairs",
++      gpu_draw_cost_frames_, double(gpu_draw_cost_frame_ns_) / frames / 1e6,
++      double(draw_ns) / frames / 1e6, double(draws) / frames, sorted.size());
++  for (size_t i = 0; i < sorted.size() && i < 20; ++i) {
++    const GpuDrawCost& cost = sorted[i].second;
++    const uint32_t pitch = cost.surface_info & 0x3FFF;
++    const uint32_t msaa = 1u << ((cost.surface_info >> 16) & 3);
++    REXGPU_INFO(
++        "  pair {:016X}: {:.2f} ms/frame ({:.0f}%), {:.1f} draws/frame, {:.0f} vertices/draw, "
++        "surface pitch {} {}x",
++        sorted[i].first, double(cost.ns) / frames / 1e6,
++        draw_ns ? 100.0 * double(cost.ns) / double(draw_ns) : 0.0, double(cost.draws) / frames,
++        cost.draws ? double(cost.vertices) / double(cost.draws) : 0.0, pitch, msaa);
++  }
++  gpu_draw_costs_.clear();
++  gpu_draw_cost_frame_ns_ = 0;
++  gpu_draw_cost_frames_ = 0;
++}
++
+ }  // namespace rex::graphics::vulkan
+diff --git a/src/ui/switch_perf.cpp b/src/ui/switch_perf.cpp
+index 2cae648..eda7ebb 100644
+--- a/src/ui/switch_perf.cpp
++++ b/src/ui/switch_perf.cpp
+@@ -210,15 +210,13 @@ struct Mode {
+ };
+ constexpr Mode kModes[] = {
+     {0, "normal"},
++    {128, "dibujados con tijera 1x1"},
+     {1, "sin dibujados"},
+     {2, "sin transferencias"},
+     {4 | 64, "sin resolves"},
+-    {64, "sin volcados de RT (resolves)"},
+-    {4, "sin copias de resolve"},
+     {8, "sin cargas de texturas"},
+-    {16, "sin efecto de presentacion"},
+-    {32, "sin despacho por baldosas"},
+-    {127, "sin nada"},
++    {255, "sin nada"},
++    {0, "normal (vuelta)"},
+ };
+ constexpr size_t kModeCount = sizeof(kModes) / sizeof(kModes[0]);
+ 
+@@ -1161,7 +1159,8 @@ void RexSwitchPerfMax(unsigned id, u64 value) {
+ 
+ /*
+  * Bits: 1 draws, 2 transfers, 4 resolves, 8 texture loads,
+- * 16 presentation effect, 32 tiled dispatch, 64 render target dumps for resolves.
++ * 16 presentation effect, 32 tiled dispatch, 64 render target dumps for resolves,
++ * 128 guest draws clipped to a 1x1 scissor.
+  */
+ bool RexSwitchPerfSkip(unsigned bit) {
+   return (g_skip_mask.load(std::memory_order_relaxed) & bit) != 0;

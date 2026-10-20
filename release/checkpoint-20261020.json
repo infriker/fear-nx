@@ -1,0 +1,39 @@
+{
+  "date": "2026-10-20",
+  "state": "paused at user request",
+  "source": "existing hardware build; no rebuild or new renderer changes",
+  "release_tag": "checkpoint-20261020",
+  "archive": "fear-nx-switch-pass-sync-20261020.zip",
+  "archive_sha256": "0756BB634B99564582FB9F71C1819E7FA5D6A2B51FCED180163969AF9BA83533",
+  "nro_sha256": "C1C96F8D54278AA4C29D926C8D469FB8F735960A9FE892C427160256A5899585",
+  "nro_bytes": 79034565,
+  "config_sha256": "7BFC76402D43DE8E3911D1800B58E647094BB6E0F9DA5B339D17F7FEC6123011",
+  "original_build_manifest": {
+    "nro_sha256": "C1C96F8D54278AA4C29D926C8D469FB8F735960A9FE892C427160256A5899585",
+    "nro_bytes": 79034565,
+    "elf_machine": "AArch64 (183)",
+    "previous_nro_sha256": "CBACDBF01EEA75845ED800553983FDE2324F7B93EAFC5D821879F35013B9CCA6",
+    "config_sha256": "7BFC76402D43DE8E3911D1800B58E647094BB6E0F9DA5B339D17F7FEC6123011",
+    "config_unchanged_from": "switch-lighting-check-20261020 main profile",
+    "source_sha256": {
+      "src\\native\\native_renderer.cpp": "71711790F873144087D90460E0615B5CA29F4ADBDFDB558041D92025595F1F84",
+      "src\\native\\native_textures.cpp": "8204C7832A735880D8671A034331E2690970654655D1340010170BECDB6DC26B",
+      "src\\native\\native_resolve_layout.h": "05C63FF5541816F32DC99A26E0C5BCDB31A9299A6758105D3E238F6ABCDF70C3"
+    },
+    "build_log": "logs/switch-pass-sync-build-20261020.log",
+    "verification": {
+      "switch_arm64_build": "passed",
+      "existing_host_tiled_layout_test": "passed, exit 0; test/header unchanged",
+      "eden_runtime": "inconclusive; stopped at user request; allocation errors before a verified menu",
+      "physical_switch": "user test pending",
+      "lighting_artifacts": "not yet verified fixed",
+      "performance_gain": "not measured"
+    }
+  },
+  "latest_observations": {
+    "physical_switch": "User confirmed menu, campaign and full-screen output; lighting/occlusion artifacts persist.",
+    "performance": "User reports possible improvement; no matched quantitative benchmark.",
+    "eden": "Intermittent frame bursts and display problems remain; separate 2 GiB diagnostic NRO excluded.",
+    "windows_mesa": "Not implemented or built."
+  }
+}

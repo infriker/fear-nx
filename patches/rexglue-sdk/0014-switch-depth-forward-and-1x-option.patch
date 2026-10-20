@@ -1,0 +1,298 @@
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 5e9e2d9..ee9955c 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -168,6 +168,8 @@ class VulkanCommandProcessor : public CommandProcessor {
+   void GpuOpBegin();
+   void GpuOpEnd(GpuOp op);
+   void GpuOpEndDraw(uint64_t shader_pair_key, uint32_t vertex_count, uint32_t surface_info);
++  // gpu_force_1x_msaa: clears the sample count of the current surface.
++  void ForceSingleSampleSurface();
+ 
+   // Returns the deferred drawing command list for the currently open
+   // submission.
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index 435b405..22f422f 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -830,7 +830,7 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   // layout and reloading the texture.
+   bool TryForwardResolve(const draw_util::ResolveInfo& resolve_info,
+                          VulkanTextureCache& texture_cache);
+-  VkPipeline GetResolveForwardPipeline(bool multisampled);
++  VkPipeline GetResolveForwardPipeline(bool is_depth, bool multisampled);
+ 
+   VkPipeline GetDumpPipeline(DumpPipelineKey key);
+   VkPipeline GetDirectResolvePipeline(DirectResolvePipelineKey key);
+@@ -896,7 +896,8 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   std::vector<TransferInvocation> current_transfer_invocations_;
+   std::vector<Transfer> copy_remaining_transfers_;
+   std::vector<Transfer> cutout_remaining_transfers_;
+-  VkPipeline resolve_forward_pipelines_[2] = {};
++  // [is_depth][multisampled]
++  VkPipeline resolve_forward_pipelines_[2][2] = {};
+   VkBuffer resolve_forward_buffer_ = VK_NULL_HANDLE;
+   VkDeviceMemory resolve_forward_buffer_memory_ = VK_NULL_HANDLE;
+   static constexpr VkDeviceSize kResolveForwardBufferSize = 4 * 1024 * 1024;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 1dba2a1..f963c64 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -69,6 +69,12 @@ REXCVAR_DEFINE_BOOL(
+     gpu_texture_descriptor_set_adjacent_reuse, false, "GPU/Vulkan",
+     "EXPERIMENTAL - reuse the immediately preceding exact texture/sampler descriptor set")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++REXCVAR_DEFINE_BOOL(gpu_force_1x_msaa, false, "GPU",
++                    "Render surfaces the game sets up with 2x or 4x MSAA with one sample. "
++                    "Halves the samples of every draw, render target copy and resolve; edges "
++                    "lose their antialiasing")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
+                     "Read render-to-texture results on the CPU")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+@@ -3821,6 +3827,7 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
++  ForceSingleSampleSurface();
+   const RegisterFile& regs = *register_file_;
+   (void)index_buffer_info;
+   auto draw_fail = [&](const char* stage) {
+@@ -5001,6 +5008,7 @@ bool VulkanCommandProcessor::IssueCopy() {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
++  ForceSingleSampleSurface();
+ 
+   if (!BeginSubmission(true)) {
+     return false;
+@@ -7819,4 +7827,17 @@ void VulkanCommandProcessor::ReportGpuDrawCosts() {
+   gpu_draw_cost_frames_ = 0;
+ }
+ 
++void VulkanCommandProcessor::ForceSingleSampleSurface() {
++  // The game's EDRAM layout, planned for 2x, still fits with one sample (it
++  // needs half the tiles), and every consumer of the sample count - render
++  // target keys, pipelines, resolves - reads RB_SURFACE_INFO after this point.
++  // Done at the draw and the copy rather than on the register write because
++  // the bulk register path stores this register without calling
++  // WriteRegister.
++  static const bool force = REXCVAR_GET(gpu_force_1x_msaa);
++  if (force) {
++    register_file_->values[XE_GPU_REG_RB_SURFACE_INFO] &= ~(UINT32_C(3) << 16);
++  }
++}
++
+ }  // namespace rex::graphics::vulkan
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 8acb178..4971b7d 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1015,8 +1015,10 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
+   // already too late.
+   DestroyAllRenderTargets(true);
+ 
+-  for (VkPipeline& pipeline : resolve_forward_pipelines_) {
+-    ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, pipeline);
++  for (auto& pipelines : resolve_forward_pipelines_) {
++    for (VkPipeline& pipeline : pipelines) {
++      ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyPipeline, device, pipeline);
++    }
+   }
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, resolve_forward_buffer_);
+   ui::vulkan::util::DestroyAndNullHandle(dfn.vkFreeMemory, device,
+@@ -6270,23 +6272,44 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+   // Free Skate each destination is read by exactly one texture of the same
+   // format, so when the conversion is a plain 8888 copy the pixels can go
+   // straight from the render target into that texture.
+-  if (GetPath() != Path::kHostRenderTargets || IsDrawResolutionScaled() ||
+-      resolve_info.IsCopyingDepth()) {
++  if (GetPath() != Path::kHostRenderTargets || IsDrawResolutionScaled()) {
+     return false;
+   }
++  const bool is_depth = resolve_info.IsCopyingDepth();
+   const reg::RB_COPY_DEST_INFO dest_info = resolve_info.copy_dest_info;
+   const draw_util::ResolveCopyDestCoordinateInfo dest_coordinates =
+       resolve_info.copy_dest_coordinate_info;
+-  if (dest_info.copy_dest_format != xenos::ColorFormat::k_8_8_8_8 ||
+-      dest_info.copy_dest_exp_bias != 0 || dest_info.copy_dest_array ||
++  const draw_util::ResolveEdramInfo edram =
++      is_depth ? resolve_info.depth_edram_info : resolve_info.color_edram_info;
++  // The texture format the destination is read as. Depth is read as R32
++  // float on the host (texture_cache.cpp), which is what the depth render
++  // target holds, so forwarding it only skips the 24-bit rounding the guest
++  // format would add.
++  xenos::TextureFormat texture_format;
++  if (is_depth) {
++    if (xenos::DepthRenderTargetFormat(edram.format) == xenos::DepthRenderTargetFormat::kD24S8 &&
++        uint32_t(dest_info.copy_dest_format) == uint32_t(xenos::TextureFormat::k_24_8)) {
++      texture_format = xenos::TextureFormat::k_24_8;
++    } else if (xenos::DepthRenderTargetFormat(edram.format) ==
++                   xenos::DepthRenderTargetFormat::kD24FS8 &&
++               uint32_t(dest_info.copy_dest_format) ==
++                   uint32_t(xenos::TextureFormat::k_24_8_FLOAT)) {
++      texture_format = xenos::TextureFormat::k_24_8_FLOAT;
++    } else {
++      return false;
++    }
++  } else {
++    if (dest_info.copy_dest_format != xenos::ColorFormat::k_8_8_8_8 || edram.format_is_64bpp ||
++        xenos::ColorRenderTargetFormat(edram.format) !=
++            xenos::ColorRenderTargetFormat::k_8_8_8_8) {
++      return false;
++    }
++    texture_format = xenos::TextureFormat::k_8_8_8_8;
++  }
++  if (dest_info.copy_dest_exp_bias != 0 || dest_info.copy_dest_array ||
+       uint32_t(dest_info.copy_dest_number) != 0 ||
+       uint32_t(dest_info.copy_dest_endian) > uint32_t(xenos::Endian::k16in32) ||
+-      dest_coordinates.offset_x_div_8 || dest_coordinates.offset_y_div_8) {
+-    return false;
+-  }
+-  const draw_util::ResolveEdramInfo edram = resolve_info.color_edram_info;
+-  if (edram.format_is_64bpp ||
+-      xenos::ColorRenderTargetFormat(edram.format) != xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
++      dest_coordinates.offset_x_div_8 || dest_coordinates.offset_y_div_8 ||
+       edram.msaa_samples >= xenos::MsaaSamples::k4X) {
+     return false;
+   }
+@@ -6302,6 +6325,9 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+         sample_mode = 1;
+         break;
+       case xenos::CopySampleSelect::k01:
++        if (is_depth) {
++          return false;
++        }
+         sample_mode = 2;
+         break;
+       default:
+@@ -6324,9 +6350,9 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+     }
+   }
+   const RenderTargetKey rt_key = source_rt->key();
+-  if (rt_key.is_depth || rt_key.Is64bpp() ||
+-      rt_key.GetColorFormat() != xenos::ColorRenderTargetFormat::k_8_8_8_8 ||
+-      rt_key.msaa_samples != edram.msaa_samples || rt_key.GetPitchTiles() != edram.pitch_tiles) {
++  if (bool(rt_key.is_depth) != is_depth || rt_key.resource_format != edram.format ||
++      (!is_depth && rt_key.Is64bpp()) || rt_key.msaa_samples != edram.msaa_samples ||
++      rt_key.GetPitchTiles() != edram.pitch_tiles) {
+     return false;
+   }
+   // The resolve rectangle's origin in the render target, in pixels.
+@@ -6350,7 +6376,9 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+   }
+ 
+   const VkPipeline pipeline =
+-      GetResolveForwardPipeline(edram.msaa_samples != xenos::MsaaSamples::k1X);
++      GetResolveForwardPipeline(is_depth, edram.msaa_samples != xenos::MsaaSamples::k1X);
++  const VkPipelineLayout pipeline_layout =
++      is_depth ? dump_pipeline_layout_depth_ : dump_pipeline_layout_color_;
+   if (pipeline == VK_NULL_HANDLE) {
+     return false;
+   }
+@@ -6370,7 +6398,7 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+   uint32_t width = 0, height = 0;
+   const VkImage texture_image = texture_cache.BeginResolveForward(
+       resolve_info.copy_dest_base, resolve_width, resolve_height,
+-      dest_coordinates.pitch_aligned_div_32 * 32, xenos::TextureFormat::k_8_8_8_8,
++      dest_coordinates.pitch_aligned_div_32 * 32, texture_format,
+       xenos::Endian(uint32_t(dest_info.copy_dest_endian)), width, height);
+   if (texture_image == VK_NULL_HANDLE) {
+     return false;
+@@ -6401,7 +6429,10 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+ 
+   // Render target: read by the compute shader.
+   command_processor_.PushImageMemoryBarrier(
+-      source_rt->image(), ui::vulkan::util::InitializeSubresourceRange(VK_IMAGE_ASPECT_COLOR_BIT),
++      source_rt->image(),
++      ui::vulkan::util::InitializeSubresourceRange(
++          is_depth ? (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT)
++                   : VK_IMAGE_ASPECT_COLOR_BIT),
+       source_rt->current_stage_mask(), VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+       source_rt->current_access_mask(), VK_ACCESS_SHADER_READ_BIT, source_rt->current_layout(),
+       VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+@@ -6419,18 +6450,18 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
+   command_processor_.BindExternalComputePipeline(pipeline);
+   command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+-                                         dump_pipeline_layout_color_, kDumpDescriptorSetEdram, 1,
++                                         pipeline_layout, kDumpDescriptorSetEdram, 1,
+                                          &buffer_descriptor_set, 0, nullptr);
+   const VkDescriptorSet source_descriptor_set = source_rt->GetDescriptorSetTransferSource();
+   command_buffer.CmdVkBindDescriptorSets(VK_PIPELINE_BIND_POINT_COMPUTE,
+-                                         dump_pipeline_layout_color_, kDumpDescriptorSetSource, 1,
++                                         pipeline_layout, kDumpDescriptorSetSource, 1,
+                                          &source_descriptor_set, 0, nullptr);
+   const uint32_t push_constants[2] = {
+       origin_x | (origin_y << 13) | (uint32_t(dest_info.copy_dest_swap) << 26) |
+           (sample_mode << 27),
+       width | (height << 13),
+   };
+-  command_buffer.CmdVkPushConstants(dump_pipeline_layout_color_, VK_SHADER_STAGE_COMPUTE_BIT, 0,
++  command_buffer.CmdVkPushConstants(pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                     sizeof(push_constants), push_constants);
+   command_processor_.GpuOpBegin();
+   command_buffer.CmdVkDispatch((width + 7) / 8, (height + 7) / 8, 1);
+@@ -6458,8 +6489,8 @@ bool VulkanRenderTargetCache::TryForwardResolve(const draw_util::ResolveInfo& re
+   return true;
+ }
+ 
+-VkPipeline VulkanRenderTargetCache::GetResolveForwardPipeline(bool multisampled) {
+-  VkPipeline& pipeline = resolve_forward_pipelines_[multisampled];
++VkPipeline VulkanRenderTargetCache::GetResolveForwardPipeline(bool is_depth, bool multisampled) {
++  VkPipeline& pipeline = resolve_forward_pipelines_[is_depth][multisampled];
+   if (pipeline != VK_NULL_HANDLE) {
+     return pipeline;
+   }
+@@ -6563,6 +6594,32 @@ VkPipeline VulkanRenderTargetCache::GetResolveForwardPipeline(bool multisampled)
+                                        false, parameters, spv::ImageOperandsMaskNone);
+     };
+     spv::Id color;
++    if (is_depth) {
++      // Depth: the R32 float texel is the depth value itself.
++      spv::Id depth;
++      if (multisampled) {
++        spv::Id sample_0 = fetch(
++            draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_attachments_supported_));
++        spv::Id sample_1 = fetch(
++            draw_util::GetD3D10SampleIndexForGuest2xMSAA(1, msaa_2x_attachments_supported_));
++        depth = builder.createTriOp(
++            spv::OpSelect, type_float4,
++            builder.createBinOp(spv::OpIEqual, type_bool, bits(origin_flags, 27, 2),
++                                builder.makeUintConstant(1)),
++            sample_1, sample_0);
++      } else {
++        depth = fetch(0);
++      }
++      spv::Id packed = builder.createUnaryOp(spv::OpBitcast, type_uint,
++                                             builder.createCompositeExtract(depth, type_float, 0));
++      spv::Id index = builder.createBinOp(
++          spv::OpIAdd, type_uint, builder.createBinOp(spv::OpIMul, type_uint, y, width), x);
++      ids.clear();
++      ids.push_back(builder.makeIntConstant(0));
++      ids.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, index));
++      builder.createStore(packed,
++                          builder.createAccessChain(spv::StorageClassUniform, buffer, ids));
++    } else {
+     if (multisampled) {
+       const uint32_t host_sample_0 =
+           draw_util::GetD3D10SampleIndexForGuest2xMSAA(0, msaa_2x_attachments_supported_);
+@@ -6603,6 +6660,7 @@ VkPipeline VulkanRenderTargetCache::GetResolveForwardPipeline(bool multisampled)
+     ids.push_back(builder.makeIntConstant(0));
+     ids.push_back(builder.createUnaryOp(spv::OpBitcast, type_int, index));
+     builder.createStore(packed, builder.createAccessChain(spv::StorageClassUniform, buffer, ids));
++    }
+   }
+   inside_if.makeEndIf();
+ 
+@@ -6614,7 +6672,8 @@ VkPipeline VulkanRenderTargetCache::GetResolveForwardPipeline(bool multisampled)
+   std::vector<unsigned int> shader_code;
+   builder.dump(shader_code);
+   pipeline = ui::vulkan::util::CreateComputePipeline(
+-      command_processor_.GetVulkanDevice(), dump_pipeline_layout_color_,
++      command_processor_.GetVulkanDevice(),
++      is_depth ? dump_pipeline_layout_depth_ : dump_pipeline_layout_color_,
+       reinterpret_cast<const uint32_t*>(shader_code.data()), sizeof(uint32_t) * shader_code.size());
+   if (pipeline == VK_NULL_HANDLE) {
+     REXGPU_ERROR("VulkanRenderTargetCache: Failed to create the resolve forwarding pipeline");

@@ -1,0 +1,155 @@
+diff --git a/src/ui/switch_perf.cpp b/src/ui/switch_perf.cpp
+index e9a0e95..c4310a7 100644
+--- a/src/ui/switch_perf.cpp
++++ b/src/ui/switch_perf.cpp
+@@ -265,36 +265,80 @@ extern "C" void RexSwitchPerfToggleAb(void) {
+   }
+ }
+ 
++struct MemoryTelemetry {
++  Result process_used_rc = 0;
++  Result process_total_rc = 0;
++  Result system_used_rc = 0;
++  Result system_total_rc = 0;
++  Result resource_limit_rc = 0;
++  Result resource_current_rc = 0;
++  Result resource_max_rc = 0;
++  Result resource_close_rc = 0;
++  u64 process_used_bytes = 0;
++  u64 process_total_bytes = 0;
++  u64 system_used_bytes = 0;
++  u64 system_total_bytes = 0;
++  u64 resource_limit_value = 0;
++  Handle resource_limit_handle = INVALID_HANDLE;
++  s64 resource_current_bytes = 0;
++  s64 resource_max_bytes = 0;
++  bool has_resource_limit = false;
++};
++
+ /*
+- * Horizon limits how much memory a process may map (LimitableResource_Memory). Our
+- * guest memory model maps each chunk several times (the shadow and once per 360
+- * view), so that limit is the real ceiling, not free memory. When it runs out,
+- * even committing 4 KB fails with 2001-0103 (resource exhausted).
++ * Telemetry only: failures to commit guest memory do not by themselves establish
++ * that system RAM or a Horizon resource quota is exhausted. Alias counts are not
++ * a quota measurement.
+  */
+-void LimiteDeMapeo(u64* usado_mb, u64* tope_mb, u64* proceso_mb, u64* total_mb) {
++void LimiteDeMapeo(u64* usado_mb, u64* tope_mb, u64* proceso_mb, u64* total_mb,
++                    MemoryTelemetry* telemetry) {
+   *usado_mb = *tope_mb = *proceso_mb = *total_mb = 0;
+-  u64 v = 0;
+-  if (R_SUCCEEDED(svcGetInfo(&v, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0))) {
+-    *proceso_mb = v >> 20;
++
++  telemetry->process_used_rc =
++      svcGetInfo(&telemetry->process_used_bytes, InfoType_UsedMemorySize, CUR_PROCESS_HANDLE, 0);
++  if (R_SUCCEEDED(telemetry->process_used_rc)) {
++    *proceso_mb = telemetry->process_used_bytes >> 20;
+   }
+-  if (R_SUCCEEDED(svcGetInfo(&v, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0))) {
+-    *total_mb = v >> 20;
++
++  telemetry->process_total_rc =
++      svcGetInfo(&telemetry->process_total_bytes, InfoType_TotalMemorySize, CUR_PROCESS_HANDLE, 0);
++  if (R_SUCCEEDED(telemetry->process_total_rc)) {
++    *total_mb = telemetry->process_total_bytes >> 20;
+   }
+-  Handle reslimit = INVALID_HANDLE;
+-  if (R_FAILED(svcGetInfo(&v, InfoType_ResourceLimit, CUR_PROCESS_HANDLE, 0))) {
++
++  telemetry->system_used_rc =
++      svcGetInfo(&telemetry->system_used_bytes, InfoType_SystemResourceSizeUsed, CUR_PROCESS_HANDLE, 0);
++  telemetry->system_total_rc =
++      svcGetInfo(&telemetry->system_total_bytes, InfoType_SystemResourceSizeTotal, CUR_PROCESS_HANDLE, 0);
++
++  // libnx defines INVALID_HANDLE (0) as the current process for this query.
++  // The returned resource-limit handle is owned by this caller and must be closed.
++  telemetry->resource_limit_rc =
++      svcGetInfo(&telemetry->resource_limit_value, InfoType_ResourceLimit, INVALID_HANDLE, 0);
++  if (R_FAILED(telemetry->resource_limit_rc)) {
+     return;
+   }
+-  reslimit = static_cast<Handle>(v);
+-  s64 actual = 0, tope = 0;
+-  if (R_SUCCEEDED(svcGetResourceLimitCurrentValue(&actual, reslimit, LimitableResource_Memory))) {
+-    *usado_mb = static_cast<u64>(actual) >> 20;
++
++  telemetry->resource_limit_handle = static_cast<Handle>(telemetry->resource_limit_value);
++  if (telemetry->resource_limit_handle == INVALID_HANDLE) {
++    return;
+   }
+-  if (R_SUCCEEDED(svcGetResourceLimitLimitValue(&tope, reslimit, LimitableResource_Memory))) {
+-    *tope_mb = static_cast<u64>(tope) >> 20;
++  telemetry->has_resource_limit = true;
++
++  telemetry->resource_current_rc = svcGetResourceLimitCurrentValue(
++      &telemetry->resource_current_bytes, telemetry->resource_limit_handle, LimitableResource_Memory);
++  if (R_SUCCEEDED(telemetry->resource_current_rc)) {
++    *usado_mb = static_cast<u64>(telemetry->resource_current_bytes) >> 20;
+   }
+-  svcCloseHandle(reslimit);
+-}
+ 
++  telemetry->resource_max_rc = svcGetResourceLimitLimitValue(
++      &telemetry->resource_max_bytes, telemetry->resource_limit_handle, LimitableResource_Memory);
++  if (R_SUCCEEDED(telemetry->resource_max_rc)) {
++    *tope_mb = static_cast<u64>(telemetry->resource_max_bytes) >> 20;
++  }
++
++  telemetry->resource_close_rc = svcCloseHandle(telemetry->resource_limit_handle);
++}
+ u64 g_base = 0, g_text_lo = 0, g_text_hi = 0;
+ Thread g_thread;
+ 
+@@ -412,7 +456,8 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+   }
+ 
+   u64 lim_usado = 0, lim_tope = 0, proc_usado = 0, proc_total = 0;
+-  LimiteDeMapeo(&lim_usado, &lim_tope, &proc_usado, &proc_total);
++  MemoryTelemetry memory_telemetry{};
++  LimiteDeMapeo(&lim_usado, &lim_tope, &proc_usado, &proc_total, &memory_telemetry);
+ 
+   double total_cpu = 0.0;
+   for (size_t i : order) {
+@@ -440,6 +485,39 @@ void Report(u64 elapsed_ticks, u64 tick_freq, u64 counters_last[kCounterCount],
+                                               : "sin probar"),
+                 double(counters_now[20] - counters_last[20]) / seconds,
+                 double(counters_now[19] - counters_last[19]) / seconds);
++  std::fprintf(f,
++               "     svcGetInfo(SystemResourceSizeUsed): rc=0x%08X value=%llu bytes; "
++               "svcGetInfo(SystemResourceSizeTotal): rc=0x%08X value=%llu bytes\n",
++               static_cast<unsigned>(memory_telemetry.system_used_rc),
++               static_cast<unsigned long long>(memory_telemetry.system_used_bytes),
++               static_cast<unsigned>(memory_telemetry.system_total_rc),
++               static_cast<unsigned long long>(memory_telemetry.system_total_bytes));
++  std::fprintf(f,
++               "     process-memory queries: UsedMemorySize rc=0x%08X value=%llu bytes; "
++               "TotalMemorySize rc=0x%08X value=%llu bytes\n",
++               static_cast<unsigned>(memory_telemetry.process_used_rc),
++               static_cast<unsigned long long>(memory_telemetry.process_used_bytes),
++               static_cast<unsigned>(memory_telemetry.process_total_rc),
++               static_cast<unsigned long long>(memory_telemetry.process_total_bytes));
++  if (memory_telemetry.has_resource_limit) {
++    std::fprintf(f,
++                 "     ResourceLimit handle=0 query rc=0x%08X handle=0x%08X; "
++                 "current rc=0x%08X value=%lld bytes; max rc=0x%08X value=%lld bytes; "
++                 "close rc=0x%08X\n",
++                 static_cast<unsigned>(memory_telemetry.resource_limit_rc),
++                 static_cast<unsigned>(memory_telemetry.resource_limit_handle),
++                 static_cast<unsigned>(memory_telemetry.resource_current_rc),
++                 static_cast<long long>(memory_telemetry.resource_current_bytes),
++                 static_cast<unsigned>(memory_telemetry.resource_max_rc),
++                 static_cast<long long>(memory_telemetry.resource_max_bytes),
++                 static_cast<unsigned>(memory_telemetry.resource_close_rc));
++  } else {
++    std::fprintf(f,
++                 "     ResourceLimit handle=0 query rc=0x%08X returned handle=0x%08X; "
++                 "current/max values unavailable\n",
++                 static_cast<unsigned>(memory_telemetry.resource_limit_rc),
++                 static_cast<unsigned>(memory_telemetry.resource_limit_value));
++  }
+   // Work the game sends to the GPU, per presented frame. One screen is
+   // 1280x720 = 921,600 pixels.
+   const auto delta = [&](unsigned id) { return double(counters_now[id] - counters_last[id]); };

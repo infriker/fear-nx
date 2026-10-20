@@ -1,0 +1,208 @@
+diff --git a/src/video_core/macro.cpp b/src/video_core/macro.cpp
+index 606162ba8de2c1f957572984f273a682b2b05f43..1e63f9f98671ebd38f11f55a75cd7ff2c5f56ea1 100644
+--- a/src/video_core/macro.cpp
++++ b/src/video_core/macro.cpp
+@@ -775,11 +775,9 @@ struct MacroJITx64Impl final : public Xbyak::CodeGenerator, public DynamicCached
+         bool has_delayed_pc{};
+         bool zero_reg_skip{};
+         bool skip_dummy_addimmediate{};
+-        bool optimize_for_method_move{};
+         bool enable_asserts{};
+     };
+     OptimizerState optimizer{};
+-    std::optional<Macro::Opcode> next_opcode{};
+     ProgramType program{nullptr};
+     std::array<Xbyak::Label, MAX_CODE_SIZE> labels;
+     std::array<Xbyak::Label, MAX_CODE_SIZE> delay_skip;
+@@ -798,41 +796,15 @@ void MacroJITx64Impl::Execute(Engines::Maxwell3D& maxwell3d, std::span<const u32
+ }
+ 
+ void MacroJITx64Impl::Compile_ALU(Macro::Opcode opcode) {
+-    const bool is_a_zero = opcode.src_a == 0;
+-    const bool is_b_zero = opcode.src_b == 0;
+-    const bool valid_operation = !is_a_zero && !is_b_zero;
+-    [[maybe_unused]] const bool is_move_operation = !is_a_zero && is_b_zero;
+-    const bool has_zero_register = is_a_zero || is_b_zero;
+-    const bool no_zero_reg_skip = opcode.alu_operation == Macro::ALUOperation::AddWithCarry ||
+-                                  opcode.alu_operation == Macro::ALUOperation::SubtractWithBorrow;
+-
+-    Xbyak::Reg32 src_a;
+-    Xbyak::Reg32 src_b;
+-
+-    if (!optimizer.zero_reg_skip || no_zero_reg_skip) {
+-        src_a = Compile_GetRegister(opcode.src_a, RESULT);
+-        src_b = Compile_GetRegister(opcode.src_b, eax);
+-    } else {
+-        if (!is_a_zero) {
+-            src_a = Compile_GetRegister(opcode.src_a, RESULT);
+-        }
+-        if (!is_b_zero) {
+-            src_b = Compile_GetRegister(opcode.src_b, eax);
+-        }
+-    }
+-
+-    bool has_emitted = false;
++    // Always materialize register zero as an actual zero operand. Skipping the
++    // load/operation can leave RESULT or the host carry flag from an earlier
++    // macro instruction, which changes the interpreter's defined ALU result.
++    const Xbyak::Reg32 src_a = Compile_GetRegister(opcode.src_a, RESULT);
++    const Xbyak::Reg32 src_b = Compile_GetRegister(opcode.src_b, eax);
+ 
+     switch (opcode.alu_operation) {
+     case Macro::ALUOperation::Add:
+-        if (optimizer.zero_reg_skip) {
+-            if (valid_operation) {
+-                add(src_a, src_b);
+-            }
+-        } else {
+-            add(src_a, src_b);
+-        }
+-
++        add(src_a, src_b);
+         if (!optimizer.can_skip_carry) {
+             setc(byte[STATE + offsetof(JITState, carry_flag)]);
+         }
+@@ -843,72 +815,34 @@ void MacroJITx64Impl::Compile_ALU(Macro::Opcode opcode) {
+         setc(byte[STATE + offsetof(JITState, carry_flag)]);
+         break;
+     case Macro::ALUOperation::Subtract:
+-        if (optimizer.zero_reg_skip) {
+-            if (valid_operation) {
+-                sub(src_a, src_b);
+-                has_emitted = true;
+-            }
+-        } else {
+-            sub(src_a, src_b);
+-            has_emitted = true;
+-        }
+-        if (!optimizer.can_skip_carry && has_emitted) {
++        sub(src_a, src_b);
++        if (!optimizer.can_skip_carry) {
++            // MME subtraction stores the borrow bit in its carry state.
+             setc(byte[STATE + offsetof(JITState, carry_flag)]);
+         }
+         break;
+     case Macro::ALUOperation::SubtractWithBorrow:
++        // MME SUBB consumes and produces a borrow bit, matching x86 SBB's CF.
+         bt(dword[STATE + offsetof(JITState, carry_flag)], 0);
+         sbb(src_a, src_b);
+         setc(byte[STATE + offsetof(JITState, carry_flag)]);
+         break;
+     case Macro::ALUOperation::Xor:
+-        if (optimizer.zero_reg_skip) {
+-            if (valid_operation) {
+-                xor_(src_a, src_b);
+-            }
+-        } else {
+-            xor_(src_a, src_b);
+-        }
++        xor_(src_a, src_b);
+         break;
+     case Macro::ALUOperation::Or:
+-        if (optimizer.zero_reg_skip) {
+-            if (valid_operation) {
+-                or_(src_a, src_b);
+-            }
+-        } else {
+-            or_(src_a, src_b);
+-        }
++        or_(src_a, src_b);
+         break;
+     case Macro::ALUOperation::And:
+-        if (optimizer.zero_reg_skip) {
+-            if (!has_zero_register) {
+-                and_(src_a, src_b);
+-            }
+-        } else {
+-            and_(src_a, src_b);
+-        }
++        and_(src_a, src_b);
+         break;
+     case Macro::ALUOperation::AndNot:
+-        if (optimizer.zero_reg_skip) {
+-            if (!is_a_zero) {
+-                not_(src_b);
+-                and_(src_a, src_b);
+-            }
+-        } else {
+-            not_(src_b);
+-            and_(src_a, src_b);
+-        }
++        not_(src_b);
++        and_(src_a, src_b);
+         break;
+     case Macro::ALUOperation::Nand:
+-        if (optimizer.zero_reg_skip) {
+-            if (!is_a_zero) {
+-                and_(src_a, src_b);
+-                not_(src_a);
+-            }
+-        } else {
+-            and_(src_a, src_b);
+-            not_(src_a);
+-        }
++        and_(src_a, src_b);
++        not_(src_a);
+         break;
+     default:
+         UNIMPLEMENTED_MSG("Unimplemented ALU operation {}", opcode.alu_operation.Value());
+@@ -925,17 +859,6 @@ void MacroJITx64Impl::Compile_AddImmediate(Macro::Opcode opcode) {
+             return;
+         }
+     }
+-    // Check for redundant moves
+-    if (optimizer.optimize_for_method_move &&
+-        opcode.result_operation == Macro::ResultOperation::MoveAndSetMethod) {
+-        if (next_opcode.has_value()) {
+-            const auto next = *next_opcode;
+-            if (next.result_operation == Macro::ResultOperation::MoveAndSetMethod &&
+-                opcode.dst == next.dst) {
+-                return;
+-            }
+-        }
+-    }
+     if (optimizer.zero_reg_skip && opcode.src_a == 0) {
+         if (opcode.immediate == 0) {
+             xor_(RESULT, RESULT);
+@@ -944,7 +867,7 @@ void MacroJITx64Impl::Compile_AddImmediate(Macro::Opcode opcode) {
+         }
+     } else {
+         auto result = Compile_GetRegister(opcode.src_a, RESULT);
+-        if (opcode.immediate > 2) {
++        if (opcode.immediate > 1) {
+             add(result, opcode.immediate);
+         } else if (opcode.immediate == 1) {
+             inc(result);
+@@ -1000,7 +923,7 @@ void MacroJITx64Impl::Compile_Read(Macro::Opcode opcode) {
+         }
+     } else {
+         auto result = Compile_GetRegister(opcode.src_a, RESULT);
+-        if (opcode.immediate > 2) {
++        if (opcode.immediate > 1) {
+             add(result, opcode.immediate);
+         } else if (opcode.immediate == 1) {
+             inc(result);
+@@ -1149,10 +1072,6 @@ void MacroJITx64Impl::Compile() {
+     // completely skip the entire code path and no emit anything
+     optimizer.skip_dummy_addimmediate = true;
+ 
+-    // SMO tends to emit a lot of unnecessary method moves, we can mitigate this by only emitting
+-    // one if our register isn't "dirty"
+-    optimizer.optimize_for_method_move = true;
+-
+     // Enable run-time assertions in JITted code
+     optimizer.enable_asserts = false;
+ 
+@@ -1161,12 +1080,6 @@ void MacroJITx64Impl::Compile() {
+ 
+     const u32 op_count = static_cast<u32>(code.size());
+     for (u32 i = 0; i < op_count; i++) {
+-        if (i < op_count - 1) {
+-            pc = i + 1;
+-            next_opcode = GetOpCode();
+-        } else {
+-            next_opcode = {};
+-        }
+         pc = i;
+         Compile_NextInstruction();
+     }

@@ -1,0 +1,20 @@
+diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
+index a1a9d1c..32afc35 100644
+--- a/src/core/cvar.cpp
++++ b/src/core/cvar.cpp
+@@ -591,6 +591,15 @@ std::vector<std::string> Init(int argc, char** argv) {
+   CLI::App app{"", ""};
+   app.allow_extras();
+ 
++  // Some Horizon launchers provide no argument vector. CLI11's argc parser
++  // requires argv[0] to contain the program name, even when there are no flags.
++  char fallback_program_name[] = "rex";
++  char* fallback_argv[] = {fallback_program_name, nullptr};
++  if (argc <= 0 || argv == nullptr || argv[0] == nullptr || argv[0][0] == '\0') {
++    argc = 1;
++    argv = fallback_argv;
++  }
++
+   for (auto& entry : GetRegistryStorage()) {
+     if (entry.type == FlagType::Boolean) {
+       app.add_flag_function(

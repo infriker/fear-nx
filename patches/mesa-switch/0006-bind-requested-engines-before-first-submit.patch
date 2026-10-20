@@ -1,0 +1,186 @@
+diff --git a/src/nouveau/horizon/nouveau_horizon.h b/src/nouveau/horizon/nouveau_horizon.h
+--- a/src/nouveau/horizon/nouveau_horizon.h
++++ b/src/nouveau/horizon/nouveau_horizon.h
+@@ -222,6 +222,15 @@
+    NOUVEAU_HORIZON_CHANNEL_PRIORITY_HIGH,
+ };
+ 
++/* Engine classes that a client may submit on a Horizon channel. */
++enum nouveau_horizon_engine_mask {
++   NOUVEAU_HORIZON_ENGINE_COPY    = 1u << 0,
++   NOUVEAU_HORIZON_ENGINE_2D      = 1u << 1,
++   NOUVEAU_HORIZON_ENGINE_3D      = 1u << 2,
++   NOUVEAU_HORIZON_ENGINE_M2MF    = 1u << 3,
++   NOUVEAU_HORIZON_ENGINE_COMPUTE = 1u << 4,
++};
++
+ enum nouveau_horizon_mapped_completion_mode {
+    NOUVEAU_HORIZON_MAPPED_COMPLETION_DISABLED,
+ 
+@@ -234,6 +243,11 @@
+ 
+ struct nouveau_horizon_channel_create_info {
+    enum nouveau_horizon_channel_priority priority;
++
++   /* Engine objects to bind before the client's first packet. The channel's
++    * internal cache/fence packets always use the 3D engine on subchannel 0.
++    */
++   uint32_t engine_mask;
+ 
+    /* Mapped progress avoids native polling ioctls; blocking waits and
+     * fault detection still use syncpoints. Enable only for a validated
+diff --git a/src/nouveau/horizon/nouveau_horizon_private.h b/src/nouveau/horizon/nouveau_horizon_private.h
+--- a/src/nouveau/horizon/nouveau_horizon_private.h
++++ b/src/nouveau/horizon/nouveau_horizon_private.h
+@@ -182,7 +182,7 @@
+    bool quarantined;
+    bool pending_work;
+    bool cache_acquire_emitted;
+-   bool bind_3d_emitted;
++   bool bind_engines_emitted;
+    bool last_fence_valid;
+    bool last_fence_cpu_visible;
+    bool lost;
+@@ -197,7 +197,8 @@
+    uint32_t *builtin_cpu;
+    uint64_t builtin_addr;
+ 
+-   uint32_t bind_3d_offset_words;
++   uint32_t bind_engines_offset_words;
++   uint32_t bind_engines_words;
+    uint32_t cache_acquire_offset_words;
+    uint32_t cache_acquire_words;
+    uint32_t cache_acquire_sync_offset_words;
+diff --git a/src/nouveau/horizon/nouveau_horizon_channel.c b/src/nouveau/horizon/nouveau_horizon_channel.c
+--- a/src/nouveau/horizon/nouveau_horizon_channel.c
++++ b/src/nouveau/horizon/nouveau_horizon_channel.c
+@@ -810,7 +810,7 @@
+ {
+    const uint32_t total_order_entry =
+       channel->device->total_order_channels ? 1 : 0;
+-   const uint32_t bootstrap_entries = channel->bind_3d_emitted ? 0 : 1;
++   const uint32_t bootstrap_entries = channel->bind_engines_emitted ? 0 : 1;
+    const uint64_t required =
+       (uint64_t)channel->gpu_channel.num_entries + entries + tail_entries +
+       NOUVEAU_HORIZON_GPFIFO_FINAL_SKID + total_order_entry + bootstrap_entries;
+@@ -837,7 +837,7 @@
+    enum nouveau_horizon_status status;
+ 
+    if (consume_reserved) {
+-      const uint32_t bootstrap_entries = channel->bind_3d_emitted ? 0 : 1;
++      const uint32_t bootstrap_entries = channel->bind_engines_emitted ? 0 : 1;
+       status = channel->gpu_channel.num_entries + 1 + tail_entries +
+                   bootstrap_entries <=
+                   GPFIFO_QUEUE_SIZE ?
+@@ -850,17 +850,17 @@
+    if (status != NOUVEAU_HORIZON_SUCCESS)
+       return status;
+ 
+-   /* The channel's own cache-acquire and fence packets use 3D subchannel 0
+-    * before the client's context-initialization stream runs. Bind it once
+-    * before any packet is submitted. In particular, Eden does not infer the
+-    * binding from AllocObjCtx and dereferences an unbound engine on 0x4A2.
+-    * Keep this lazy so mapped-completion setup still sees an empty queue.
++   /* The channel's own cache-acquire and fence packets use 3D subchannel 0,
++    * while the client may use additional subchannels for copy/compute work.
++    * Bind all requested engines in one lazy entry before any packet is
++    * submitted. Keep this lazy so mapped-completion setup still sees an
++    * empty queue.
+     */
+-   if (!channel->bind_3d_emitted) {
++   if (!channel->bind_engines_emitted) {
+       const Result bind_rc = nvGpuChannelAppendEntry(
+          &channel->gpu_channel,
+-         channel->builtin_addr + 4ull * channel->bind_3d_offset_words,
+-         2, GPFIFO_ENTRY_NOT_MAIN, 0);
++         channel->builtin_addr + 4ull * channel->bind_engines_offset_words,
++         channel->bind_engines_words, GPFIFO_ENTRY_NOT_MAIN, 0);
+       if (R_FAILED(bind_rc)) {
+          if (channel->device->enable_timing)
+             channel->stats.submit_failures++;
+@@ -869,9 +869,10 @@
+          nouveau_horizon_channel_check_error_locked(channel);
+          return channel->error.status;
+       }
+-      channel->bind_3d_emitted = true;
+-      channel->pending_command_bytes += 2 * sizeof(uint32_t);
+-      channel->pending_dwords += 2;
++      channel->bind_engines_emitted = true;
++      channel->pending_command_bytes +=
++         (uint64_t)channel->bind_engines_words * sizeof(uint32_t);
++      channel->pending_dwords += channel->bind_engines_words;
+    }
+ 
+    const Result rc = nvGpuChannelAppendEntry(&channel->gpu_channel,
+@@ -1573,9 +1574,33 @@
+    uint32_t *commands = channel->builtin_cpu +
+       NOUVEAU_HORIZON_WAIT_SLICE_COUNT *
+          NOUVEAU_HORIZON_WAIT_SLICE_WORDS;
+-   channel->bind_3d_offset_words = commands - channel->builtin_cpu;
+-   *commands++ = 0x20010000; /* SET_OBJECT, subchannel 0, one word */
+-   *commands++ = 0x0000b197; /* MAXWELL_B, GM20B's 3D engine */
++   channel->bind_engines_offset_words = commands - channel->builtin_cpu;
++
++   const struct nv_device_info *dev_info =
++      nouveau_horizon_device_get_info(device);
++#define BIND_ENGINE(subchannel, class_id) do { \
++      *commands++ = 0x20010000u | ((uint32_t)(subchannel) << 13); \
++      *commands++ = (class_id); \
++   } while (0)
++
++   /* Horizon's built-in cache/fence packets require 3D even on a copy-only
++    * context. Bind every additional engine only when the client requested it.
++    */
++   BIND_ENGINE(0, dev_info->cls_eng3d);
++   const uint32_t engine_mask =
++      create_info != NULL ? create_info->engine_mask : 0;
++   if (engine_mask & NOUVEAU_HORIZON_ENGINE_COMPUTE)
++      BIND_ENGINE(1, dev_info->cls_compute);
++   if (engine_mask & NOUVEAU_HORIZON_ENGINE_M2MF)
++      BIND_ENGINE(2, dev_info->cls_m2mf);
++   if (engine_mask & NOUVEAU_HORIZON_ENGINE_2D)
++      BIND_ENGINE(3, dev_info->cls_eng2d);
++   if (engine_mask & NOUVEAU_HORIZON_ENGINE_COPY)
++      BIND_ENGINE(4, dev_info->cls_copy);
++#undef BIND_ENGINE
++
++   channel->bind_engines_words = (uint32_t)(commands -
++      (channel->builtin_cpu + channel->bind_engines_offset_words));
+    channel->cache_acquire_offset_words = commands - channel->builtin_cpu;
+    channel->cache_acquire_words =
+       nouveau_horizon_gm20b_build_cache_acquire(commands);
+diff --git a/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_dev.c b/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_dev.c
+--- a/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_dev.c
++++ b/src/nouveau/vulkan/nvkmd/switch/nvkmd_switch_dev.c
+@@ -1180,6 +1180,23 @@
+       ctx->channel, nouveau_horizon_va_get_addr(ctx->zcull_va));
+ }
+ 
++static uint32_t
++nvkmd_switch_horizon_engine_mask(enum nvkmd_engines engines)
++{
++   uint32_t mask = 0;
++   if (engines & NVKMD_ENGINE_COPY)
++      mask |= NOUVEAU_HORIZON_ENGINE_COPY;
++   if (engines & NVKMD_ENGINE_2D)
++      mask |= NOUVEAU_HORIZON_ENGINE_2D;
++   if (engines & NVKMD_ENGINE_3D)
++      mask |= NOUVEAU_HORIZON_ENGINE_3D;
++   if (engines & NVKMD_ENGINE_M2MF)
++      mask |= NOUVEAU_HORIZON_ENGINE_M2MF;
++   if (engines & NVKMD_ENGINE_COMPUTE)
++      mask |= NOUVEAU_HORIZON_ENGINE_COMPUTE;
++   return mask;
++}
++
+ static VkResult
+ nvkmd_switch_dev_create_ctx(struct nvkmd_dev *_dev,
+                             struct vk_object_base *log_obj,
+@@ -1198,6 +1215,7 @@
+    if (engines != NVKMD_ENGINE_BIND) {
+       const struct nouveau_horizon_channel_create_info create_info = {
+          .priority = NOUVEAU_HORIZON_CHANNEL_PRIORITY_MEDIUM,
++         .engine_mask = nvkmd_switch_horizon_engine_mask(engines),
+          .mapped_completion_mode =
+             (engines & NVKMD_ENGINE_3D) &&
+             debug_get_bool_option("NVK_SWITCH_MAPPED_COMPLETION", true) ?

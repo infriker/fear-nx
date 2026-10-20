@@ -1,0 +1,228 @@
+diff --git a/src/core/guest_memory_switch.cpp b/src/core/guest_memory_switch.cpp
+index 3f6ecb2..551fb7b 100644
+--- a/src/core/guest_memory_switch.cpp
++++ b/src/core/guest_memory_switch.cpp
+@@ -23,6 +23,7 @@ constexpr size_t kPageSize  = 0x1000;
+  * page table.
+  */
+ constexpr size_t kBlockSize = 0x200000;
++constexpr uint32_t kGuestMemoryRangeError = 0xFFFF0003u;
+ 
+ constexpr size_t AlignDown(size_t v, size_t a) { return v & ~(a - 1); }
+ constexpr size_t AlignUp(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
+@@ -91,6 +92,12 @@ struct State {
+     uint8_t* base = nullptr;
+     size_t   size = 0;
+     VirtmemReservation* reservation = nullptr;
++    /* One aligned code-VA arena; each committed shadow lives at arena + guest offset. */
++    uint8_t* shadow_base = nullptr;
++    size_t   shadow_size = 0;
++    void* shadow_reservation_base = nullptr;
++    size_t shadow_reservation_size = 0;
++    VirtmemReservation* shadow_reservation = nullptr;
+ 
+     std::vector<View> views;
+     /* chunks sorted by offset: allows finding the one that covers an offset */
+@@ -662,22 +669,101 @@ uint8_t* RexGmInit(size_t size) {
+         std::fprintf(stderr, "[guest-memory] valid process handle unavailable; refusing mappings\n");
+         return nullptr;
+     }
++    constexpr size_t kArenaPadding = kBlockSize + 2 * kPageSize;
++    const size_t kSizeMax = static_cast<size_t>(-1);
++    if (size == 0 || (size & (kPageSize - 1)) != 0 || size > kSizeMax - kArenaPadding) {
++        REXLOG_ERROR("GuestMemory init rejected invalid guest window size 0x{:X}", size);
++        return nullptr;
++    }
++
+     State& s = S();
+     std::lock_guard<std::mutex> lock(s.mutex);
+     if (s.base) return s.base;
++    if (s.shadow_reservation) {
++        REXLOG_ERROR("GuestMemory init refused: a previous shadow arena remains reserved");
++        return nullptr;
++    }
++
++    const size_t shadow_span_size = size + kBlockSize;
++    const size_t shadow_reservation_size = shadow_span_size + 2 * kPageSize;
++    uint8_t* guest_base = nullptr;
++    VirtmemReservation* guest_reservation = nullptr;
++    uintptr_t raw_shadow_address = 0;
++    uintptr_t aligned_shadow_address = 0;
++    uintptr_t shadow_reservation_address = 0;
++    VirtmemReservation* shadow_reservation = nullptr;
++    const char* failure_stage = "guest-window-find";
+ 
+     virtmemLock();
+-    s.base = static_cast<uint8_t*>(virtmemFindAslr(size, kBlockSize));
+-    if (s.base) s.reservation = virtmemAddReservation(s.base, size);
++    guest_base = static_cast<uint8_t*>(virtmemFindAslr(size, kBlockSize));
++    if (guest_base) {
++        failure_stage = "guest-window-reserve";
++        guest_reservation = virtmemAddReservation(guest_base, size);
++        if (guest_reservation) {
++            failure_stage = "shadow-arena-find";
++            void* raw_shadow = virtmemFindCodeMemory(shadow_span_size, kPageSize);
++            if (raw_shadow) {
++                raw_shadow_address = reinterpret_cast<uintptr_t>(raw_shadow);
++                const uintptr_t address_max = static_cast<uintptr_t>(-1);
++                const bool address_math_fits =
++                    raw_shadow_address >= kPageSize &&
++                    raw_shadow_address <= address_max - shadow_span_size &&
++                    raw_shadow_address <= address_max - (kBlockSize - 1) &&
++                    shadow_reservation_size <= address_max - (raw_shadow_address - kPageSize);
++                if (address_math_fits) {
++                    const uintptr_t raw_shadow_end = raw_shadow_address + shadow_span_size;
++                    aligned_shadow_address =
++                        (raw_shadow_address + kBlockSize - 1) & ~(uintptr_t(kBlockSize) - 1);
++                    const bool aligned_span_fits =
++                        aligned_shadow_address >= raw_shadow_address &&
++                        aligned_shadow_address <= raw_shadow_end &&
++                        size <= raw_shadow_end - aligned_shadow_address;
++                    if (aligned_span_fits) {
++                        failure_stage = "shadow-arena-reserve";
++                        shadow_reservation_address = raw_shadow_address - kPageSize;
++                        shadow_reservation = virtmemAddReservation(
++                            reinterpret_cast<void*>(shadow_reservation_address),
++                            shadow_reservation_size);
++                        if (shadow_reservation) failure_stage = nullptr;
++                    } else {
++                        failure_stage = "shadow-arena-bounds";
++                    }
++                } else {
++                    failure_stage = "shadow-arena-address-overflow";
++                }
++            }
++        }
++    }
++
++    if (failure_stage) {
++        if (shadow_reservation) virtmemRemoveReservation(shadow_reservation);
++        if (guest_reservation) virtmemRemoveReservation(guest_reservation);
++    }
+     virtmemUnlock();
+ 
+-    if (!s.base || !s.reservation) {
+-        s.base = nullptr;
++    if (failure_stage) {
++        REXLOG_ERROR("GuestMemory init failed: stage={} guest_size=0x{:X} shadow_span=0x{:X}",
++                     failure_stage, size, shadow_span_size);
+         return nullptr;
+     }
++
++    s.base = guest_base;
+     s.size = size;
++    s.reservation = guest_reservation;
++    s.shadow_base = reinterpret_cast<uint8_t*>(aligned_shadow_address);
++    s.shadow_size = size;
++    s.shadow_reservation_base = reinterpret_cast<void*>(shadow_reservation_address);
++    s.shadow_reservation_size = shadow_reservation_size;
++    s.shadow_reservation = shadow_reservation;
+     g_size_rapido.store(size, std::memory_order_release);
+     g_base_rapido.store(s.base, std::memory_order_release);
++    REXLOG_INFO(
++        "GuestMemory compact shadow arena: mode=compact base=0x{:X} size=0x{:X} "
++        "raw_base=0x{:X} reserved_base=0x{:X} reserved_span=0x{:X} alignment=0x{:X}; "
++        "addresses are virtual, not RAM",
++        reinterpret_cast<uintptr_t>(s.shadow_base), s.shadow_size, raw_shadow_address,
++        reinterpret_cast<uintptr_t>(s.shadow_reservation_base), s.shadow_reservation_size,
++        kBlockSize);
+     return s.base;
+ }
+ 
+@@ -696,12 +782,18 @@ void RexGmShutdown(void) {
+     s.committed = 0;
+     s.mapped = 0;
+ 
+-    if (s.reservation) {
++    if (s.reservation || s.shadow_reservation) {
+         virtmemLock();
+-        virtmemRemoveReservation(s.reservation);
++        if (s.shadow_reservation) virtmemRemoveReservation(s.shadow_reservation);
++        if (s.reservation) virtmemRemoveReservation(s.reservation);
+         virtmemUnlock();
+         s.reservation = nullptr;
++        s.shadow_reservation = nullptr;
+     }
++    s.shadow_base = nullptr;
++    s.shadow_size = 0;
++    s.shadow_reservation_base = nullptr;
++    s.shadow_reservation_size = 0;
+     s.base = nullptr;
+     s.size = 0;
+     /*
+@@ -828,10 +920,14 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
+         return false;
+     };
+ 
+-    if (!s.base) return fail("uninitialized", 0, offset, length);
++    if (!s.base || !s.shadow_base || !s.shadow_reservation)
++        return fail("uninitialized", 0, offset, length);
++    if (offset > s.size || length > s.size - offset)
++        return fail("range", kGuestMemoryRangeError, offset, length);
+ 
+     const size_t begin = AlignDown(offset, kPageSize);
+     const size_t end   = AlignUp(offset + length, kPageSize);
++    if (end > s.size) return fail("range", kGuestMemoryRangeError, offset, length);
+ 
+     size_t cur = begin;
+     while (cur < end) {
+@@ -856,17 +952,10 @@ bool RexGmCommit(size_t offset, size_t length, RexGmAccess access) {
+         }
+         memset(backing, 0, tam);
+ 
+-        virtmemLock();
+-        void* shadow = virtmemFindCodeMemory(tam, align);
+-        Result rc = shadow ? svcMapProcessCodeMemory(Proc(), reinterpret_cast<u64>(shadow),
+-                                                     reinterpret_cast<u64>(backing), tam)
+-                           : 0;
+-        virtmemUnlock();
+-
+-        if (!shadow) {
+-            free(backing);
+-            return fail("find-code-va", REX_GM_ERR_NOCODEVA, cur, tam);
+-        }
++        /* Keep per-allocation backing and logical commit sizes; only the VA placement is compact. */
++        void* shadow = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(s.shadow_base) + cur);
++        Result rc = svcMapProcessCodeMemory(Proc(), reinterpret_cast<u64>(shadow),
++                                            reinterpret_cast<u64>(backing), tam);
+         if (R_FAILED(rc)) {
+             free(backing);
+             return fail("map-code-memory", rc, cur, tam);
+diff --git a/src/core/guest_memory_switch.h b/src/core/guest_memory_switch.h
+index 1442fbd..f4dcf10 100644
+--- a/src/core/guest_memory_switch.h
++++ b/src/core/guest_memory_switch.h
+@@ -22,9 +22,10 @@
+  * The design
+  *
+  * - The window is virtual space reserved with virtmemAddReservation. Empty.
+- * - Memory is committed in chunks, and each chunk carries its shadow alias: the
+- *   codeAlias that is needed anyway in order to map (see the dance below). That
+- *   alias is always accessible, at a private address.
++ * - Memory is committed in chunks. Each chunk keeps its own heap backing, while
++ *   its code alias is placed at the same offset in one reserved, 2 MB-aligned
++ *   code-VA arena. The arena reserves virtual addresses only; it does not commit
++ *   RAM. The aliases stay accessible at private addresses.
+  * - A chunk committed at a mapping offset is mapped into every view that covers
+  *   that offset, each view on its first access (RexGmFaultIn). That is where the
+  *   360 mirrors come from, for free.
+@@ -35,12 +36,16 @@
+  *
+  * The commit dance, which is not obvious
+  *
+- *   memalign()                     backing, from the newlib heap
+- *   virtmemFindCodeMemory()        free range in the code region
+- *   svcMapProcessCodeMemory()      turns the backing into a code alias
++ *   RexGmInit()                    reserves the guest window and one compact code-VA arena
++ *   memalign()                     backing for each committed chunk, from the newlib heap
++ *   svcMapProcessCodeMemory()      maps the backing at arena + guest offset
+  *   svcSetProcessMemoryPermission  RW permissions on that alias
+  *   svcMapProcessMemory()          mirrors the alias into each view
+  *
++ * virtmemFindCodeMemory() is used once to find the arena. Reserving one stable
++ * code-VA range avoids scattering a code alias for every small commit across the
++ * address space; the backing and logical commit sizes remain per chunk.
++ *
+  * svcMapProcessMemory rejects heap memory as the source: it returns 0xD401
+  * (Kernel/106, InvalidCurrentMemory). The detour through code memory is needed.
+  * And beware: after svcMapProcessCodeMemory the original heap pointer is left

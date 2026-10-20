@@ -1,0 +1,20 @@
+F.E.A.R. NX — saved Switch checkpoint, 2026-10-20
+
+This private prerelease preserves the last existing hardware build. No rebuild
+or additional renderer changes were made for publication.
+
+- Hardware NRO SHA-256: C1C96F8D54278AA4C29D926C8D469FB8F735960A9FE892C427160256A5899585.
+- User confirmed full-screen output, menu and campaign on Switch.
+- Lighting/occlusion artifacts remain; performance improvement is unmeasured.
+- Eden's intermittent display problem remains. Its separate 2 GiB diagnostic
+  NRO is not included. A Windows/Mesa application build was not implemented.
+
+Install: extract the ZIP's switch directory to the SD root, or copy the separate
+fear_nx.nro and fear-nx.toml into sdmc:/switch/fear-nx/. Keep existing game data,
+saves and caches. Use the same full-memory homebrew launch method as before.
+MSAA is off; the supplied configuration does not request an overclock.
+
+The ZIP is unchanged from the last delivered pass-sync package. Its embedded
+test notes predate the user's latest feedback; the current status is above.
+The source commit contains build instructions, source, licenses, and complete
+dependency patches. Original game data and generated C++ are not in Git.
