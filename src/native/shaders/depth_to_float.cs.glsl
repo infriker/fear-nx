@@ -15,7 +15,8 @@ layout(local_size_x = 8, local_size_y = 8) in;
 layout(set = 0, binding = 0) uniform texture2D depth_buffer;
 layout(set = 0, binding = 1, r32f) uniform writeonly image2D dest;
 layout(push_constant) uniform Params {
-  ivec2 origin;
+  ivec2 source_origin;
+  ivec2 dest_origin;
   uvec2 size;
 };
 void main() {
@@ -23,6 +24,7 @@ void main() {
   if (p.x >= size.x || p.y >= size.y) {
     return;
   }
-  ivec2 c = origin + ivec2(p);
-  imageStore(dest, c, vec4(texelFetch(depth_buffer, c, 0).r));
+  ivec2 source_pixel = source_origin + ivec2(p);
+  ivec2 dest_pixel = dest_origin + ivec2(p);
+  imageStore(dest, dest_pixel, vec4(texelFetch(depth_buffer, source_pixel, 0).r));
 }

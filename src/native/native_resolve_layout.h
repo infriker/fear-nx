@@ -103,4 +103,32 @@ inline std::optional<CopyRegion> MakeCopyRegion(Point tile_origin, uint32_t sour
   return CopyRegion{source_x, source_y, destination_x, destination_y, width, height};
 }
 
+// One guest surface, addressed either at its base or at a validated tile origin.
+// This plans a direct RT -> shared destination write, not an image composition.
+struct SharedWrite {
+  uint32_t root_address = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+  Point origin;
+  CopyRegion region;
+};
+
+inline std::optional<SharedWrite> PlanSharedWrite(
+    uint32_t address, uint32_t pitch, uint32_t height, Point origin,
+    bool window_mapping_valid, uint32_t source_x, uint32_t source_y,
+    uint32_t width, uint32_t copy_height, uint32_t source_width, uint32_t source_height) {
+  // Only the verified 32-bit tiled address layout is supported here.
+  if (!window_mapping_valid || !address || (address & 4095u) || !pitch || !height ||
+      pitch > 8192 || height > 8192 || (pitch & 31u)) return std::nullopt;
+  auto offset = TileAddressOffset(origin, pitch, height, 2);
+  if (!offset || address < *offset) return std::nullopt;
+  const uint32_t root = address - *offset;
+  const uint64_t span = uint64_t(pitch) * ((uint64_t(height) + 31u) & ~uint64_t(31u)) * 4;
+  if (!root || uint64_t(root) + span > 0x20000000ull) return std::nullopt;
+  auto region = MakeCopyRegion(origin, source_x, source_y, width, copy_height,
+                               source_width, source_height, pitch, height);
+  if (!region) return std::nullopt;
+  return SharedWrite{root, pitch, height, origin, *region};
+}
+
 }  // namespace fear_nx::native::resolve_layout
