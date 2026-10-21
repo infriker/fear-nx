@@ -48,6 +48,7 @@ target_compile_options(fear_nx_recomp PRIVATE
 
 set(FEAR_HOST_SOURCES
     src/main.cpp
+    src/input/gyro_input.cpp
     src/native/native_system.cpp
     src/native/native_renderer.cpp
     src/native/native_textures.cpp

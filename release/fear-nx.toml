@@ -12,6 +12,15 @@ native_trace_output = true
 
 [input]
 xbox_layout = false
+# Gyro is on by default and works only while aiming.
+# To disable: L + R + D-pad Right -> Input -> uncheck input_gyro_enabled
+# -> Save to config, or set gyro_enabled = false below.
+# Uses the actual weapon aim state, including toggle aim and alternate layouts.
+gyro_enabled = true
+gyro_sensitivity = 1.0
+gyro_smoothing_ms = 16.0
+gyro_deadzone_dps = 0.15
+gyro_invert_y = false
 
 [audio]
 switch_bomba = false

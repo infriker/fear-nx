@@ -57,7 +57,12 @@ therefore refer to the same letters on your controller.
 
 To use Xbox button positions, set `xbox_layout = true` under `[input]` in
 `fear-nx.toml`: Switch B becomes Xbox A, A becomes B, Y becomes X and X becomes Y.
-Gyroscope aiming is planned and is not available in this release.
+
+Gyroscope aiming is **on by default** and works only while aiming. To turn it
+off, open the port settings with **L + R + D-pad Right**, select **Input**,
+uncheck **input_gyro_enabled**, then choose **Save to config**. Alternatively,
+set `gyro_enabled = false` under `[input]` in `fear-nx.toml`. Existing saved
+preferences are preserved. See [gyro settings](docs/gyro-aiming.md).
 
 ## Settings and performance
 
@@ -74,7 +79,6 @@ while its pipeline compiles; compiled pipelines are cached on the SD card.
 
 ## Planned features
 
-- [ ] Gyroscope aiming.
 - [ ] Performance improvements, focusing on demanding scenes and slow motion.
 
 ## Known issues
@@ -122,6 +126,8 @@ The installer and application check this hash. Other revisions are rejected.
 - [danfromtico / mesa-switch](https://github.com/danfromtico/mesa-switch),
   NaGaa95 and the Mesa/NVK/NAK contributors.
 - [devkitPro](https://devkitpro.org/) and [switchbrew/libnx](https://github.com/switchbrew/libnx).
+- [Wemino / EchoPatch](https://github.com/Wemino/EchoPatch) — the reference
+  for aim-only gyro camera integration.
 - [The Simpsons NX](https://github.com/R-drg/the-simpsons-game-nx) — an early
   reference for the Switch port structure.
 

@@ -18,6 +18,7 @@
 #endif
 
 #include "native/native_system.h"
+#include "input/gyro_input.h"
 
 class FearNxApp final : public rex::ReXApp {
  public:
@@ -31,12 +32,23 @@ class FearNxApp final : public rex::ReXApp {
 
  protected:
   void OnPreSetup(rex::RuntimeConfig& config) override {
+    config.input_factory = REX_INPUT_BACKEND(fear_nx::input::CreateInputSystem);
     // The app-owned Xenos Vulkan renderer is the Switch default. A config
     // override may select the SDK's reference Xenos backend for diagnosis.
     if (fear_nx::native::Enabled()) {
       config.graphics = fear_nx::native::CreateGraphicsSystem();
     }
   }
+
+  void OnPostLoadXexImage() override {
+    fear_nx::input::VerifyGyroHooks(runtime()->virtual_membase());
+  }
+
+  void OnWindowFocusChanged(bool focused) override {
+    fear_nx::input::SetGyroFocus(focused);
+  }
+
+  void OnShutdown() override { fear_nx::input::ShutdownGyro(); }
 
   void OnConfigurePaths(rex::PathConfig& paths) override {
 #if REX_PLATFORM_SWITCH
