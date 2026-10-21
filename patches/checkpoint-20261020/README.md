@@ -9,7 +9,7 @@ The existing dependency indexes and worktrees were not modified.
 To restore a dependency, clone its recorded origin in a separate directory,
 check out its `base_commit`, and apply its single snapshot patch:
 
-```powershell
+```text
 git -C <checkout> apply --index <absolute-path-to-snapshot.patch>
 git -C <checkout> submodule update --init --recursive
 ```
@@ -19,6 +19,8 @@ tree hash exactly matched the captured working source tree. Submodule revisions
 are recorded in the manifest. Ignored build outputs, game data and logs are not
 part of these patches. Build instructions remain in `docs/building.md` and
 `docs/driver-build.md`; use the numbered-patch workflow OR this complete snapshot,
-not both. The numbered SDK series can be checked with `bootstrap-sdk.ps1`.
+not both.
 
-For the current ReXGlue runtime use `../native-vulkan/` and `scripts/bootstrap-native-sdk.ps1`. This older directory remains the complete driver/emulator snapshot reference.
+For the current ReXGlue runtime use [the native snapshot](../native-vulkan/)
+and its [setup instructions](../../docs/building.md#1-prepare-the-sdk).
+This older directory remains the complete driver/emulator snapshot reference.

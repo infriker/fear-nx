@@ -7,4 +7,3 @@ CMakeLists.txt text eol=lf
 Dockerfile* text eol=lf
 *.cpp text eol=lf
 *.h text eol=lf
-*.ps1 text eol=crlf

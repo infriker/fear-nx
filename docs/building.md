@@ -6,42 +6,66 @@ route if you only want to play.
 
 ## Requirements
 
-- Windows with PowerShell 7 and Git.
+- Windows with Git and Python 3 available on `PATH`.
 - Docker Desktop with its Linux engine running.
-- ReXGlue Windows CLI **0.10.0** for code generation.
+- ReXGlue Windows CLI **0.10.0** for code generation. Add its directory to
+  `PATH`, or replace `rexglue` below with the full executable path.
 - Your extracted Xbox 360 game, including the supported `default.xex`.
 - Disk space for generated C++, dependencies and ARM64 build output.
 
+Run the commands below from the repository root. Stop if a command fails.
+The Docker examples use `D:/fear-nx` as the absolute host checkout path;
+replace it with your own path. Paths inside the container remain `/project`.
+
 ## 1. Prepare the SDK
 
-From the repository root:
+Use a new SDK checkout for these commands. Keep an existing modified SDK
+separately rather than checking out another revision over your changes.
 
-```powershell
-pwsh -File scripts/bootstrap-native-sdk.ps1
+```text
+python -c "import hashlib,json; from pathlib import Path; p=Path('patches/native-vulkan'); m=json.loads((p/'manifest.json').read_text()); assert hashlib.sha256((p/m['patch']).read_bytes()).hexdigest()==m['sha256'], 'SDK patch checksum mismatch'"
+git clone --no-checkout https://github.com/rexglue/rexglue-sdk.git third_party/rexglue-sdk
+git -C third_party/rexglue-sdk checkout --detach c94f5ebdcb3c9d1a460ca48e04f9758448f8d518
+git -C third_party/rexglue-sdk apply --check ../../patches/native-vulkan/rexglue-sdk.patch
+git -C third_party/rexglue-sdk apply --index ../../patches/native-vulkan/rexglue-sdk.patch
+git -C third_party/rexglue-sdk submodule update --init --recursive
+git -C third_party/rexglue-sdk write-tree
+git -C third_party/rexglue-sdk submodule status --recursive
 ```
 
-This restores the complete source snapshot in `patches/native-vulkan` onto
-ReXGlue commit `c94f5ebdcb3c9d1a460ca48e04f9758448f8d518` and initializes the
-recorded submodules. An existing edited SDK is accepted only if it matches the
-snapshot; the script does not reset it. Use `-SdkPath` for another destination
-and `-VerifyOnly` to check an existing checkout.
+`write-tree` must print `c7fb3c0f1a588b268115bf0dceb24f0c26eb1ae0`.
+Compare the submodule paths and commit IDs with `recursive_submodules` in
+`patches/native-vulkan/manifest.json`. A `-`, `+` or `U` status prefix indicates
+an uninitialized, mismatched or conflicted submodule; resolve it before building.
 
-The numbered patches and the older checkpoint SDK snapshot are retained as
-source history. Do not apply them on top of this complete snapshot.
+This applies the complete source snapshot in `patches/native-vulkan` to the
+pinned ReXGlue base. The numbered patches and the older checkpoint SDK snapshot
+are retained as source history. Do not apply them on top of this snapshot.
 
 ## 2. Generate the game translation
 
-```powershell
-pwsh -File scripts/generate.ps1 -GameXex 'D:/MyGame/default.xex' -ReXGlueExe 'C:/Tools/rexglue/bin/rexglue.exe'
+Create the `assets/` directory and copy your supported Xbox 360 executable to
+`assets/default.xex`. Validate it before generation:
+
+```text
+rexglue --version
+python -c "import hashlib; from pathlib import Path; h=hashlib.sha256(Path('assets/default.xex').read_bytes()).hexdigest(); assert h=='e7fccdf6dd57bb58d10efbdd0b2ca567b8cece5b6a3fc696c7fca879aaea2792', 'Unsupported default.xex: '+h; print(h)"
 ```
 
-The script validates the XEX and CLI version, stages the executable in
-`assets/default.xex`, and generates `generated/default/`. Code generation must
-finish before CMake configuration. It does not copy the `Game/` data directory.
+The CLI version must be **0.10.0**. Generate using a local manifest copy because
+ReXGlue writes SDK metadata into the manifest it receives:
+
+```text
+python -c "from pathlib import Path; Path('fear_xbox360_manifest.local.toml').write_bytes(Path('fear_xbox360_manifest.toml').read_bytes())"
+rexglue codegen fear_xbox360_manifest.local.toml
+```
+
+Check that `generated/default/sources.cmake` exists. Code generation must finish
+before CMake configuration. It does not copy the `Game/` data directory.
 
 ## 3. Prepare the toolchain and driver
 
-```powershell
+```text
 docker build -t fear-nx-switch:devkitpro-20260219-clang19 -f tools/switch/Dockerfile tools/switch
 ```
 
@@ -50,13 +74,13 @@ Build the driver using [driver-build.md](driver-build.md). The full build needs
 
 ## 4. Compile and package the NRO
 
-```powershell
-pwsh -File scripts/build-switch.ps1 -Jobs 4
+```text
+docker run --rm --mount "type=bind,source=D:/fear-nx,target=/project" -w /project fear-nx-switch:devkitpro-20260219-clang19 cmake -S . -B out/switch -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=/project/tools/switch/toolchain.cmake -DREXSDK_DIR=/project/third_party/rexglue-sdk -DREXGLUE_SWITCH_NVK_SDK=/project/sdk/nvk -DREXGLUE_SWITCH_COMPILE_ONLY=OFF
+docker run --rm --mount "type=bind,source=D:/fear-nx,target=/project" -w /project fear-nx-switch:devkitpro-20260219-clang19 cmake --build out/switch --parallel 4 --target fear_nx
 ```
 
 Outputs include `out/switch/fear_nx` (AArch64 ELF), `fear_nx.nacp` and
-`fear_nx.nro`. `-ConfigureOnly` stops after configuration; `-CompileOnly` builds
-objects without producing a runnable NRO. Both options are for development.
+`fear_nx.nro`. For configuration only, stop after the first command.
 
 Copy the NRO and `release/fear-nx.toml` into `sdmc:/switch/fear-nx/`, then place
 your executable and extracted `Game/` under its `game/` subdirectory.
@@ -67,7 +91,7 @@ See [installation](installing.md) for the full layout.
 `scripts/package-release.py` packages an existing NRO with the configuration
 and notices. It never reads or packages the original game files.
 
-```powershell
+```text
 python scripts/package-release.py --nro out/switch/fear_nx.nro --output dist/public-release
 ```
 

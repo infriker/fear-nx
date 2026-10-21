@@ -34,3 +34,8 @@
 __pycache__/
 
 *.pyc
+
+# Local PowerShell development helpers
+*.ps1
+*.psm1
+*.psd1
