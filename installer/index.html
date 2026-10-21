@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Install F.E.A.R. NX for Nintendo Switch using your own Xbox 360 game. Your files stay in your browser.">
+  <meta name="theme-color" content="#101014">
+  <title>F.E.A.R. NX — Installer</title>
+  <link rel="icon" href="./icon.jpg" type="image/jpeg">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<main>
+  <header>
+    <div class="topline"><a class="wordmark" href="https://github.com/infriker/fear-nx">F.E.A.R. <span>NX</span></a></div>
+    <div class="hero">
+      <p class="eyebrow" data-i18n="platform">NINTENDO SWITCH · NATIVE PORT</p>
+      <h1 data-i18n="headline">Bring your own fear.</h1>
+      <p class="lead" data-i18n="lead">Create a Switch package from your own Xbox 360 copy of F.E.A.R. Your game files stay on this computer.</p>
+      <p class="privacy"><span aria-hidden="true">●</span> <span data-i18n="privacy">Local processing. No uploads. No account.</span></p>
+    </div>
+  </header>
+
+  <div class="steps">
+    <section aria-labelledby="choose-heading">
+      <div class="section-head"><span class="number" aria-hidden="true">01</span><h2 id="choose-heading" data-i18n="step1">Choose your game</h2></div>
+      <p class="hint" data-i18n="formatHint">Select an Xbox 360 ISO, or the extracted folder containing default.xex and Game/.</p>
+      <div class="pickers">
+        <label class="file-button"><span data-i18n="formatIso">Disc image (.iso)</span><input id="iso" type="file" accept=".iso" aria-label="Xbox 360 disc image"></label>
+        <label class="file-button"><span data-i18n="formatXex">Game folder</span><input id="folder" type="file" webkitdirectory aria-label="Extracted game folder"></label>
+      </div>
+      <div id="chosen" class="chosen" aria-live="polite">Nothing selected yet.</div>
+      <div id="detected" class="detected" hidden role="status">
+        <div id="detectedTitle" class="title"></div>
+        <div id="detectedState" class="state"></div>
+        <div id="fingerprint" class="fingerprint" hidden></div>
+      </div>
+    </section>
+
+    <section aria-labelledby="package-heading">
+      <div class="section-head"><span class="number" aria-hidden="true">02</span><h2 id="package-heading" data-i18n="step2">Create your package</h2></div>
+      <p class="hint" data-i18n="step2First">First install: includes the port and your game files.</p>
+      <button id="create" class="primary" disabled data-i18n="create">Create fear-nx.zip</button>
+      <div class="update-box">
+        <p class="hint" data-i18n="step2Update">Already installed? Download only the new program, settings and notices.</p>
+        <button id="update" class="secondary" disabled data-i18n="createUpdate">Create update ZIP</button>
+      </div>
+      <progress id="bar" max="1" value="0" hidden aria-label="Package progress"></progress>
+      <div id="log" role="log" aria-live="polite"></div>
+    </section>
+  </div>
+
+  <section class="installation" aria-labelledby="install-heading">
+    <div class="section-head"><span class="number" aria-hidden="true">03</span><h2 id="install-heading" data-i18n="step3">Copy to your Switch</h2></div>
+    <ol>
+      <li data-i18n-html="step3Extract">Extract the ZIP into <code>sdmc:/switch/</code>.</li>
+      <li data-i18n-html="step3Start">Hold <strong>R</strong> while launching an installed game, then open <code>fear_nx.nro</code> from the Homebrew Menu.</li>
+      <li data-i18n="updateHint">Keep your game files and userdata folder. Back up custom settings before updating.</li>
+    </ol>
+    <a href="https://github.com/infriker/fear-nx#how-to-install" data-i18n="fullGuide">Installation guide and controls →</a>
+  </section>
+
+  <footer>
+    <div class="footer-links"><a href="https://github.com/infriker/fear-nx" data-i18n="sourceCode">Source code</a><a href="https://github.com/infriker/fear-nx/releases/latest" data-i18n="releaseLink">Latest release</a><a href="https://github.com/infriker/fear-nx/tree/main/installer" data-i18n="installerSource">Installer source</a></div>
+    <p data-i18n="legal">An unofficial fan project. You need your own copy of the Xbox 360 game. F.E.A.R. and its marks belong to their respective owners.</p>
+    <p class="credits">Installer adapted from <a href="https://github.com/R-drg/project8-sw-installer">Project8 SW</a> and <a href="https://github.com/StevensND/nfsmw-nx-installer">nfsmw-nx-installer</a>. <a href="./NOTICES.md">GPL-3.0 notices</a>.</p>
+  </footer>
+</main>
+<script type="module" src="./app.js"></script>
+</body>
+</html>

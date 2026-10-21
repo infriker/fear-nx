@@ -21,6 +21,4 @@ part of these patches. Build instructions remain in `docs/building.md` and
 `docs/driver-build.md`; use the numbered-patch workflow OR this complete snapshot,
 not both. The numbered SDK series can be checked with `bootstrap-sdk.ps1`.
 
-Eden remains an unfinished diagnostic branch with intermittent presentation.
-These patches do not claim to fix its renderer. No Windows/Mesa application
-build was implemented before work was stopped.
+For the current ReXGlue runtime use `../native-vulkan/` and `scripts/bootstrap-native-sdk.ps1`. This older directory remains the complete driver/emulator snapshot reference.

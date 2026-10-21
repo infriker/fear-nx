@@ -1,26 +1,19 @@
-# Сборка NVK для Nintendo Switch
+# Building NVK for Nintendo Switch
 
-Этот документ собирает статические библиотеки Mesa NVK для Horizon/AArch64. Он не скачивает и не включает игровые файлы. Архивы остаются локальными в `sdk/nvk/` и исключены из Git.
+Build the static Mesa/NVK libraries for Horizon/AArch64. Game files are not
+needed. The resulting archives stay in the ignored `sdk/nvk/` directory.
 
-## Зафиксированные версии
+## Pinned versions
 
-- `danfromtico/mesa-switch`, commit `d4a00ea0ab3f59afb967cc5d779e4263d237bd77` (Mesa 26.2.3).
-- Патчи `0001`–`0004` — сохранённые патчи Project8 без изменений. `0005` и `0006` —
-  локальные патчи `fear-nx` для совместимости с Eden.
-- `0005` один раз привязывает класс Maxwell 3D (`SET_OBJECT`, `0xB197`) к субканалу
-  0 перед встроенными NVK-командами cache-acquire/fence.
-- `0006` перед первой отправкой команд привязывает 3D и запрошенные NVK-движки
-  в одной bootstrap-записи. В частности, copy engine класса `0xB0B5` привязывается
-  к субканалу 4; subchannel 4/method `0x1C0` (метод `NVA0B5_SET_REMAP_CONST_A`)
-  был зафиксирован диагностикой Test 9 как незапривязанный. Исправление в Eden ещё
-  не проверено: успешные компиляция и staging не доказывают прохождение этого места
-  или отображение меню.
-- База devkitPro `devkitpro/devkita64:20260219`.
-- Сборка ведётся в Docker Desktop с Linux engine; исходники и результаты хранятся на диске `D:`.
+- `danfromtico/mesa-switch` commit `d4a00ea0ab3f59afb967cc5d779e4263d237bd77` (Mesa 26.2.3).
+- Patches `0001`–`0004` come from Project8 unchanged. Patches `0005` and `0006`
+  bind GPU engines before the first submission for Eden compatibility.
+- devkitPro base image: `devkitpro/devkita64:20260219`.
+- Docker Desktop with its Linux engine and PowerShell 7.
 
-## Подготовка исходников
+## Prepare the sources
 
-Откройте PowerShell в корне `fear-nx`. Эти команды создают shallow checkout без истории и без частичной загрузки blobs:
+Run these commands from the repository root to create a shallow checkout:
 
 ```powershell
 $mesa = Join-Path (Get-Location) 'third_party/mesa-switch'
@@ -32,15 +25,16 @@ git -C $mesa checkout --detach FETCH_HEAD
 
 Get-ChildItem '.\patches\mesa-switch' -Filter '000*.patch' | Sort-Object Name | ForEach-Object {
     git -C $mesa apply --check -- $_.FullName
-    if ($LASTEXITCODE -ne 0) { throw "Проверка патча не прошла: $($_.Name)" }
+    if ($LASTEXITCODE -ne 0) { throw "Patch check failed: $($_.Name)" }
     git -C $mesa apply -- $_.FullName
-    if ($LASTEXITCODE -ne 0) { throw "Не удалось применить патч: $($_.Name)" }
+    if ($LASTEXITCODE -ne 0) { throw "Could not apply patch: $($_.Name)" }
 }
 ```
 
-## Ограничение ресурсов и Docker-образ
+## Prepare the Docker image
 
-Скрипт из патча `0004` запускает `ninja` без лимита, а его Dockerfile собирает SPIR-V Tools с `nproc`. На этом проекте команды ограничены тремя задачами, а Rust target нужно установить явно. После применения патчей внесите локальные настройки сборки:
+Limit parallel compilation to three jobs and install the Rust target explicitly.
+Apply these build settings after the six patches:
 
 ```powershell
 $dockerfile = Join-Path $mesa 'Docker.rust'
@@ -64,13 +58,12 @@ Set-Content -LiteralPath $buildScript -Value $s -Encoding utf8 -NoNewline
 docker build -f (Join-Path $mesa 'Docker.rust') -t devkitpro-mesa-rust-aarch64 $mesa
 ```
 
-Шаблон `000*.patch` применяет все шесть патчей в порядке имени: четыре неизменённых патча Project8, затем локальные `0005` и `0006`.
+The patch pattern applies all six patches in filename order. Normalizing the
+`rustc` and `bindgen` wrappers removes Windows line endings from their shebangs.
 
-Нормализация `rustc` и `bindgen` нужна при checkout на Windows: CRLF в shebang не позволяет Linux-контейнеру запустить эти скрипты напрямую.
+## Build the libraries
 
-## Сборка библиотек
-
-Запустите контейнер, подставив фактический путь checkout:
+Start a container with the Mesa checkout mounted:
 
 ```powershell
 $mesaMount = $mesa.Replace('\', '/')
@@ -79,7 +72,7 @@ docker run --detach --name mesa-switch-build `
   --workdir /project devkitpro-mesa-rust-aarch64 sleep infinity
 ```
 
-Подготовьте обёртки, заголовки и совместимые stub-архивы, которые предусмотрены сборочной схемой Horizon:
+Prepare the wrappers, headers and compatibility archives used by Horizon:
 
 ```powershell
 docker exec mesa-switch-build bash -lc 'set -e
@@ -101,14 +94,14 @@ printf "void __mesa_switch_stub_lib(void) {}\n" > stub_posix.c
 for L in dl rt util; do /opt/devkitpro/devkitA64/bin/aarch64-none-elf-ar rcs /opt/devkitpro/portlibs/switch/lib/lib${L}.a stub_posix.o; done'
 ```
 
-Соберите host-инструменты генерации шейдеров:
+Build the host tools used for shader generation:
 
 ```powershell
 docker exec -e CARGO_BUILD_JOBS=3 mesa-switch-build bash -lc 'cd /project && meson setup builddir-native --wipe -Dvulkan-drivers= -Dgallium-drivers= -Dshader-cache=true -Dplatforms= -Dglx=disabled -Degl=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dtools=[] -Dllvm=enabled -Dmesa-clc=enabled -Dprecomp-compiler=enabled -Dinstall-mesa-clc=true'
 docker exec -e CARGO_BUILD_JOBS=3 mesa-switch-build ninja -j3 -C /project/builddir-native src/compiler/clc/mesa_clc src/compiler/spirv/vtn_bindgen2
 ```
 
-Настройте и соберите Switch NVK:
+Configure and compile Switch NVK:
 
 ```powershell
 docker exec -e MESA_SWITCH_RUST_TARGET=aarch64-unknown-linux-gnu -e CARGO_BUILD_JOBS=3 mesa-switch-build bash -lc 'export PATH=/usr/local/libexec:/project/builddir-native/src/compiler/clc:/project/builddir-native/src/compiler/spirv:$PATH && cd /project && meson setup builddir-switch --wipe --cross-file switch_cross_file.txt --native-file p8-native.txt --buildtype=release -Doptimization=1 -Db_lto=false -Db_ndebug=true -Dvulkan-drivers=nouveau -Dgallium-drivers=nouveau -Dshader-cache=true -Dgallium-rusticl=false -Dplatforms=switch -Dglx=disabled -Degl=disabled -Dopengl=false -Dgles1=disabled -Dgles2=disabled -Dllvm=disabled -Dshared-glapi=disabled -Dshared-llvm=disabled -Dmesa-clc=system -Dprecomp-compiler=system -Dcpp_rtti=false'
@@ -116,20 +109,15 @@ docker exec -e MESA_SWITCH_RUST_TARGET=aarch64-unknown-linux-gnu -e CARGO_BUILD_
 docker exec -e MESA_SWITCH_RUST_TARGET=aarch64-unknown-linux-gnu -e CARGO_BUILD_JOBS=3 mesa-switch-build bash -lc 'export PATH=/usr/local/libexec:/project/builddir-native/src/compiler/clc:/project/builddir-native/src/compiler/spirv:$PATH && ninja -j3 -C /project/builddir-switch src/nouveau/vulkan/libnvk.a src/nouveau/vulkan/libvulkan.a src/vulkan/util/libvulkan_util.a src/compiler/nir/libnir.a src/compiler/libcompiler.a src/compiler/spirv/libvtn.a src/util/libxmlconfig.a src/nouveau/compiler/libnak.a src/nouveau/compiler/libnak_rs.a src/nouveau/nil/libnil.a src/nouveau/nil/liblibnil_format_table.a src/nouveau/mme/libnouveau_mme.a src/nouveau/winsys/libnouveau_ws.a src/nouveau/headers/libnvidia_headers_c.a src/compiler/rust/libcompiler_c_helpers.a src/util/libmesa_util.a src/util/libmesa_util_simd.a src/util/blake3/libblake3.a src/c11/impl/libmesa_util_c11.a'
 ```
 
-## Проверка и размещение SDK
+## Validate and stage the SDK
 
-При индексации Rust-архива GNU BFD может вывести ожидаемые предупреждения о
-несовместимости LLVM bitcode: производитель `LLVM23.1.4-rust-1.101.0-nightly`,
-читатель `LLVM 14.0.6` (например, `Opaque pointers are only supported in
--opaque-pointers mode` или `Invalid record`). BFD-плагин не может прочитать этот
-Rust LTO bitcode для LTO-индекса. Staging-скрипт отдельно проверяет каждый обычный
-объект итогового архива как ELF64 little-endian для AArch64 и вызывает
-`aarch64-none-elf-ranlib`. В текущей успешной staging-проверке было принято 1557
-AArch64-объектов. Stage подтверждает структуру и архитектуру архива; разрешение
-символов проверяется последующей линковкой NRO. Ни stage, ни линковка не подтверждают
-рендер меню в Eden.
+GNU BFD may report LLVM bitcode version warnings while indexing the Rust archive
+(for example, `Opaque pointers are only supported in -opaque-pointers mode` or
+`Invalid record`). Its plugin cannot read the newer Rust LTO bitcode. The staging
+helper separately validates ordinary objects as ELF64 little-endian AArch64 and
+runs `aarch64-none-elf-ranlib`. Linking the NRO checks symbol resolution.
 
-Helper проверяет каждый ELF-объект в объединённом архиве и индексирует его `aarch64-none-elf-ranlib`. Для запуска helper смонтируйте корень проекта и Mesa checkout во временный контейнер:
+Mount the project and Mesa checkout in a staging container:
 
 ```powershell
 $rootMount = (Get-Location).Path.Replace('\', '/')
@@ -147,4 +135,6 @@ docker exec mesa-stage sh -c 'ls -lh /fear-nx/sdk/nvk/lib/libvulkan.a /fear-nx/s
 docker stop mesa-stage
 ```
 
-Укажите `REXGLUE_SWITCH_NVK_SDK` на корень `sdk/nvk` (папка, содержащая `lib/`). Не добавляйте SDK-архивы в Git; каталог `sdk/` уже исключён из репозитория. Сборка проверяет архитектуру архивов, но сам факт компиляции ещё не подтверждает запуск Vulkan или рендер в Eden.
+Point `REXGLUE_SWITCH_NVK_SDK` to `sdk/nvk`, the directory containing `lib/`.
+Keep SDK archives out of Git. Rebuild the NRO after changing the driver and
+test it on a Switch.

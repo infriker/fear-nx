@@ -1,28 +1,34 @@
-# First-run profile for the Switch/ARM64 F.E.A.R. build.
-# The Switch input driver reports letter positions as printed on the Joy-Con;
-# set input.xbox_layout = true if you prefer Xbox-position prompts.
-
+# F.E.A.R. NX release settings. See docs/native-renderer.md.
 [nx]
+native_shared_resolves = true
+native_gpu_profile = true
+native_max_anisotropy = 2
+native_depth24 = true
+native_msaa = false
+native_async_pipelines = true
+native_record_thread = false
 renderer = "native"
+native_trace_output = true
 
 [input]
 xbox_layout = false
 
 [audio]
-# Begin with ReXGlue's queue-consumption pacing until FEAR's mixer is validated.
 switch_bomba = false
 
 [switch]
-# Keep zero-timeout guest waits at yield semantics for the first compatibility run.
+mesa_env = ""
 poll_sleep_us = 0
 
-# Use the system default handheld profile during initial compatibility testing.
 gpu_mhz = 0
 allow_ram_1600 = false
 nvmap_mb = 0
 ab_lap_after_s = 0
 
 [log]
-level = "info"
-flush_level = "warn"
+level = "debug"
+flush_level = "debug"
 flush_interval = 1
+
+[gpu]
+specialize_texture_signs = true

@@ -69,7 +69,7 @@ self-handle and memory-alias tests but received zero exception-handler entries
 at the first UDF trial. The custom Eden change and test procedure are
 documented in `patches/eden/README.md`. The separate asset-free probe has not
 been tested on a physical Switch. The full game's startup probe did pass
-mode 2 on a real Switch Lite, as recorded in docs/hardware-diagnostics.md.
+mode 2 on a real Switch Lite, during early runtime development.
 ## Memory-arena test result
 
 The initial 2600-sparse case failed at index 2500 with CE01; it is preserved in

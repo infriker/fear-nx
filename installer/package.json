@@ -1,0 +1,1 @@
+{"type":"module","scripts":{"test":"node test/package_node.mjs"}}

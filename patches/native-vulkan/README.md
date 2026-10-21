@@ -14,4 +14,4 @@ source tree and submodule revisions match; they are never reset or cleaned.
 The manifest records the patch SHA-256, expected patched tree and recursive
 submodule revisions. A temporary-index restore was compared with the actual
 SDK working sources. Game inputs, generated game code and build outputs are
-excluded. The runtime's real Git index was left untouched.
+excluded. The manifest records the complete patched source tree.

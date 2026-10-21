@@ -1,0 +1,72 @@
+name: Installer
+
+on:
+  workflow_dispatch:
+  release:
+    types: [published]
+  pull_request:
+    paths:
+      - 'installer/**'
+      - 'scripts/package-release.py'
+      - 'scripts/prepare-site.py'
+      - '.github/workflows/installer.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: installer-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: node installer/test/package_node.mjs
+      - run: node installer/test/iso_node.mjs
+      - run: python3 -m py_compile scripts/package-release.py scripts/prepare-site.py
+
+  build:
+    if: github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch the pinned release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          tag=$(python3 -c 'import json; print(json.load(open("installer/release/manifest.json"))["tag"])')
+          gh release download "$tag" --pattern fear_nx.nro --dir downloaded
+      - name: Prepare and verify installer assets
+        run: |
+          python3 scripts/package-release.py --nro downloaded/fear_nx.nro --output dist/release
+          python3 scripts/prepare-site.py --release dist/release --output _site
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    if: github.event_name != 'pull_request'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

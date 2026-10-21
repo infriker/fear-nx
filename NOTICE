@@ -3,8 +3,7 @@ NOTICE
 ================================================================================
 
 Third-party software and source code reused in F.E.A.R. NX are identified
-below, with required licence texts reproduced where applicable. This is a
-source-project notice; no F.E.A.R. NX binary release is described here.
+below, with required licence texts reproduced where applicable. These notices accompany the source project and its packaged releases.
 
 F.E.A.R. NX is an experimental Nintendo Switch/Horizon port of F.E.A.R. (2005)
 based on the Xbox 360 executable. This repository contains no original XEX,
@@ -2791,8 +2790,7 @@ a user's copy are not included in this repository. This project licence grants
 no rights to those game materials. Keep the XEX, game data, and generated
 translation local; do not commit or distribute them.
 
-This notice records source-level attribution and licence texts. It does not
-claim that a future binary release has been packaged or audited.
+This notice records attribution and licence texts for the source and packaged releases.
 
 
 ================================================================================
@@ -2830,7 +2828,10 @@ Build-time toolchain note
 ================================================================================
 
 The ReXGlue code-generation SDK includes GNU binutils (disasm) as part of
-its toolchain. No F.E.A.R. NX binary release is included in this source
-project, and this notice does not claim that any future binary has passed a
-linkage or GPL-boundary audit. Check the actual contents and licence
-obligations before publishing a binary.
+its toolchain. See docs/RELINKING.md for rebuilding the runtime with modified libraries.
+
+F.E.A.R. application icon
+------------------------
+The game icon identifies F.E.A.R. in the Homebrew Menu and installer. The
+original artwork retains its respective owners' rights and is not relicensed
+under the source-code license.

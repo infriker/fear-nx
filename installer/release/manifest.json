@@ -1,0 +1,14 @@
+{
+  "version": "0.1.0",
+  "tag": "v0.1.0",
+  "builds": [
+    {
+      "edition": "Supported Xbox 360 release",
+      "xex_sha256": "e7fccdf6dd57bb58d10efbdd0b2ca567b8cece5b6a3fc696c7fca879aaea2792",
+      "xex_size": 19251200,
+      "nro": "fear_nx.nro",
+      "nro_sha256": "050c6d8d250979e9b48918861328aa8a7a324c1a16334e60a3a6aba9d7196930",
+      "toml": "fear-nx.toml"
+    }
+  ]
+}

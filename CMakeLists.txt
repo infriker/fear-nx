@@ -78,5 +78,8 @@ else()
             "${REXGLUE_SWITCH_NVK_SDK}/lib/libvulkan.a"
             "${REXGLUE_SWITCH_NVK_SDK}/lib/libnak_rs.a")
     endif()
-    rexglue_switch_add_nro(fear_nx NAME "F.E.A.R. NX" AUTHOR "fear-nx contributors" VERSION "0.1.0")
+    set(FEAR_NX_ICON "${CMAKE_CURRENT_SOURCE_DIR}/resources/icon.jpg")
+    set_property(TARGET fear_nx APPEND PROPERTY LINK_DEPENDS "${FEAR_NX_ICON}")
+    rexglue_switch_add_nro(fear_nx NAME "F.E.A.R. NX" AUTHOR "fear-nx contributors"
+        VERSION "${PROJECT_VERSION}" ICON "${FEAR_NX_ICON}")
 endif()
