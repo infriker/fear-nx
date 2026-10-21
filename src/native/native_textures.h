@@ -46,6 +46,9 @@ struct UploadTarget {
   VkBuffer buffer = VK_NULL_HANDLE;
   // Records into the command buffer that runs before the submission's draws.
   VkCommandBuffer setup_commands = VK_NULL_HANDLE;
+  // Ends rendering and returns the command buffer that follows the current resolves.
+  // Shared resolve crops must be copied after the current frame's producer writes.
+  std::function<VkCommandBuffer()> resolve_commands;
   // The submission being recorded (increasing).
   uint64_t submission = 0;
 };
@@ -75,6 +78,9 @@ struct ResolveDestination {
   struct Sized {
     uint32_t width = 0;
     uint32_t height = 0;
+    uint32_t origin_x = 0;
+    uint32_t origin_y = 0;
+    bool initialized = false;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     std::unordered_map<uint32_t, VkImageView> views;
@@ -155,6 +161,15 @@ class TextureCache {
   ResolveDestination* GetResolveDestination(uint32_t address, uint32_t width, uint32_t height,
                                             VkFormat format, uint32_t host_swizzle,
                                             VkCommandBuffer commands);
+  // Registers a validated tiled Xenos resolve address as an alias into one
+  // canonical image. The addresses carry the same optional depth-words tag.
+  ResolveDestination* GetSharedResolveDestination(uint32_t address, uint32_t root_address,
+                                                  uint32_t width, uint32_t height,
+                                                  uint32_t origin_x, uint32_t origin_y,
+                                                  VkFormat format, uint32_t host_swizzle,
+                                                  VkCommandBuffer commands);
+  // Invalidates shared surface owners whose address ranges contain this address.
+  void InvalidateSharedResolve(uint32_t address);
   const ResolveDestination* FindResolveDestination(uint32_t address) const;
   // After a resolve wrote dest (transfer writes recorded in commands): brings
   // its sized copies up to date.

@@ -24,7 +24,15 @@ The Project8 patch series was authored against ReXGlue v0.10.0 commit f5337cd; t
 - Docker Desktop for the ARM64 cross-build.
 - Your legally obtained Xbox 360 copy of F.E.A.R., extracted so you can point to its default.xex.
 
-## 1. Prepare the pinned SDK
+## Current native-renderer candidate
+
+For the 2026-10-21 renderer candidate, use
+`scripts/bootstrap-native-sdk.ps1` and the complete `patches/native-vulkan`
+snapshot. It includes the depth-bias Vulkan device changes required by the
+current renderer. Do not combine it with the older numbered patch workflow
+below. See [candidate instructions](native-render-stable.md).
+
+## 1. Prepare the pinned SDK (historical numbered-patch workflow)
 
 From the repository root, run:
 

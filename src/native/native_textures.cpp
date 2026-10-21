@@ -566,6 +566,26 @@ struct TextureCache::Impl {
 
   std::unordered_map<uint32_t, std::unique_ptr<ResolveDestination>> resolve_destinations;
 
+  struct SharedResolveLayout {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t bytes_per_pixel_log2 = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    uint32_t host_swizzle = 0;
+  };
+  struct SharedResolveAlias {
+    uint32_t root_address = 0;
+    uint32_t origin_x = 0;
+    uint32_t origin_y = 0;
+    uint64_t last_used_frame = 0;
+  };
+  // Owners are ResolveDestinations keyed by root and optional depth-words tag;
+  // aliases never allocate or own Vulkan images.
+  std::unordered_map<uint32_t, SharedResolveLayout> shared_resolve_layouts;
+  std::unordered_map<uint32_t, SharedResolveAlias> shared_resolve_aliases;
+  static constexpr size_t kMaxSharedResolveOwners = 256;
+  static constexpr size_t kMaxSharedResolveAliases = 1024;
+
   static constexpr uint32_t kMaxTrackedTiledResolveSources = 64;
   struct TiledResolveRoot {
     uint32_t width = 0;
@@ -1368,6 +1388,8 @@ void TextureCache::Shutdown() {
     destroy_resolve_destination(*dest);
   }
   im.resolve_destinations.clear();
+  im.shared_resolve_layouts.clear();
+  im.shared_resolve_aliases.clear();
   for (auto& [address, dest] : im.tiled_resolve_composites) {
     destroy_resolve_destination(*dest);
   }
@@ -1450,37 +1472,84 @@ VkImageView TextureCache::GetResolveDestinationView2D(uint32_t address, uint32_t
                                                       uint32_t* width_out, uint32_t* height_out) {
   Impl& im = *impl_;
   ResolveDestination* selected = nullptr;
-  auto composite = im.tiled_resolve_composites.find(address);
-  if (composite != im.tiled_resolve_composites.end() &&
-      im.tiled_resolve_states.count(address) &&
-      im.tiled_resolve_states.at(address).Usable()) {
-    selected = composite->second.get();
+  uint32_t origin_x = 0, origin_y = 0;
+  auto alias = im.shared_resolve_aliases.find(address);
+  if (alias != im.shared_resolve_aliases.end()) {
+    auto owner = im.resolve_destinations.find(alias->second.root_address);
+    if (owner == im.resolve_destinations.end()) return VK_NULL_HANDLE;
+    selected = owner->second.get();
+    origin_x = alias->second.origin_x;
+    origin_y = alias->second.origin_y;
+    alias->second.last_used_frame = im.frame;
   } else {
-    auto it = im.resolve_destinations.find(address);
-    if (it != im.resolve_destinations.end()) selected = it->second.get();
+    auto composite = im.tiled_resolve_composites.find(address);
+    if (composite != im.tiled_resolve_composites.end() &&
+        im.tiled_resolve_states.count(address) &&
+        im.tiled_resolve_states.at(address).Usable()) {
+      selected = composite->second.get();
+    } else {
+      auto it = im.resolve_destinations.find(address);
+      if (it != im.resolve_destinations.end()) selected = it->second.get();
+    }
   }
-  if (!selected) {
-    return VK_NULL_HANDLE;
-  }
+  if (!selected) return VK_NULL_HANDLE;
   ResolveDestination& dest = *selected;
+  if (origin_x > dest.width || origin_y > dest.height) return VK_NULL_HANDLE;
+
+  uint32_t swizzle = GuestToHostSwizzle(guest_swizzle, dest.host_swizzle);
+  if (origin_x || origin_y) {
+    const uint32_t crop_width = dest.width - origin_x;
+    const uint32_t crop_height = dest.height - origin_y;
+    ResolveDestination::Sized* crop = nullptr;
+    for (auto& sized : dest.sized) {
+      if (sized->width == crop_width && sized->height == crop_height &&
+          sized->origin_x == origin_x && sized->origin_y == origin_y && sized->filled) {
+        crop = sized.get();
+        break;
+      }
+    }
+    if (!crop) return VK_NULL_HANDLE;
+    const uint32_t key = swizzle | (1u << 31);
+    auto view = crop->views.find(key);
+    if (view != crop->views.end()) {
+      *width_out = crop_width;
+      *height_out = crop_height;
+      return view->second;
+    }
+    VkImageViewCreateInfo info = {};
+    info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+    info.image = crop->image;
+    info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+    info.format = dest.format;
+    info.components = {ComponentSwizzle(swizzle, 0), ComponentSwizzle(swizzle, 1),
+                       ComponentSwizzle(swizzle, 2), ComponentSwizzle(swizzle, 3)};
+    info.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
+    VkImageView result = VK_NULL_HANDLE;
+    if (im.device->functions().vkCreateImageView(im.device->device(), &info, nullptr, &result) !=
+        VK_SUCCESS) {
+      return VK_NULL_HANDLE;
+    }
+    crop->views.emplace(key, result);
+    *width_out = crop_width;
+    *height_out = crop_height;
+    return result;
+  }
+
   *width_out = dest.width;
   *height_out = dest.height;
-  uint32_t swizzle = GuestToHostSwizzle(guest_swizzle, dest.host_swizzle);
-  uint32_t key = swizzle | (1u << 31);
-  auto v = dest.texture_views.find(key);
-  if (v != dest.texture_views.end()) {
-    return v->second;
-  }
-  VkImageViewCreateInfo view = {};
-  view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-  view.image = dest.image;
-  view.viewType = VK_IMAGE_VIEW_TYPE_2D;
-  view.format = dest.format;
-  view.components = {ComponentSwizzle(swizzle, 0), ComponentSwizzle(swizzle, 1),
+  const uint32_t key = swizzle | (1u << 31);
+  auto view = dest.texture_views.find(key);
+  if (view != dest.texture_views.end()) return view->second;
+  VkImageViewCreateInfo info = {};
+  info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+  info.image = dest.image;
+  info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+  info.format = dest.format;
+  info.components = {ComponentSwizzle(swizzle, 0), ComponentSwizzle(swizzle, 1),
                      ComponentSwizzle(swizzle, 2), ComponentSwizzle(swizzle, 3)};
-  view.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
+  info.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
   VkImageView result = VK_NULL_HANDLE;
-  if (im.device->functions().vkCreateImageView(im.device->device(), &view, nullptr, &result) !=
+  if (im.device->functions().vkCreateImageView(im.device->device(), &info, nullptr, &result) !=
       VK_SUCCESS) {
     return VK_NULL_HANDLE;
   }
@@ -1538,7 +1607,26 @@ std::string TextureCache::TakeUploadReport() {
 }
 
 bool TextureCache::WantsDepthWords(uint32_t address) const {
-  return impl_->depth_words_wanted.count(address) != 0;
+  const Impl& im = *impl_;
+  if (im.depth_words_wanted.count(address)) return true;
+  const uint32_t base = address & ~kDepthWordsTag;
+  for (const auto& [alias_address, alias] : im.shared_resolve_aliases) {
+    if ((alias_address & ~kDepthWordsTag) == base &&
+        im.depth_words_wanted.count(alias.root_address & ~kDepthWordsTag)) {
+      return true;
+    }
+  }
+  for (const auto& [root_address, layout] : im.shared_resolve_layouts) {
+    const uint32_t root_base = root_address & ~kDepthWordsTag;
+    const uint64_t span = uint64_t(layout.width) *
+                          ((uint64_t(layout.height) + 31u) & ~uint64_t(31u)) *
+                          (uint64_t(1) << layout.bytes_per_pixel_log2);
+    if (base >= root_base && uint64_t(base) < uint64_t(root_base) + span &&
+        im.depth_words_wanted.count(root_base)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 void TextureCache::SetComputeCopy(ComputeCopy copy) { impl_->compute_copy = std::move(copy); }
@@ -1556,9 +1644,7 @@ bool TextureCache::StorageCapable(VkFormat format) {
 }
 
 void TextureCache::CopyToSized(ResolveDestination& dest, VkCommandBuffer commands) {
-  if (dest.sized.empty()) {
-    return;
-  }
+  if (dest.sized.empty() || !commands) return;
   const auto& dfn = impl_->device->functions();
   VkMemoryBarrier between = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                              VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT |
@@ -1571,20 +1657,34 @@ void TextureCache::CopyToSized(ResolveDestination& dest, VkCommandBuffer command
                            VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &between, 0, nullptr, 0,
                            nullptr);
   for (auto& sized : dest.sized) {
+    if (!sized->initialized || sized->origin_x > dest.width ||
+        sized->origin_y > dest.height) {
+      continue;
+    }
+    const uint32_t width = std::min(sized->width, dest.width - sized->origin_x);
+    const uint32_t height = std::min(sized->height, dest.height - sized->origin_y);
+    if (!width || !height) continue;
     if (sized->storage_view && dest.view && impl_->compute_copy &&
-        impl_->compute_copy(commands, dest.view, sized->storage_view, 0, 0, 0, 0,
-                            std::min(sized->width, dest.width),
-                            std::min(sized->height, dest.height))) {
-      sized->filled = true;
+        impl_->compute_copy(commands, dest.view, sized->storage_view,
+                            int32_t(sized->origin_x), int32_t(sized->origin_y), 0, 0,
+                            width, height)) {
+      sized->filled = width == sized->width && height == sized->height;
       continue;
     }
     VkImageCopy region = {};
     region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.dstSubresource = region.srcSubresource;
-    region.extent = {std::min(sized->width, dest.width), std::min(sized->height, dest.height), 1};
+    region.srcOffset = {int32_t(sized->origin_x), int32_t(sized->origin_y), 0};
+    region.extent = {width, height, 1};
     dfn.vkCmdCopyImage(commands, dest.image, VK_IMAGE_LAYOUT_GENERAL, sized->image,
                        VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-    sized->filled = true;
+    VkMemoryBarrier to_sample = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                 VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT};
+    dfn.vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                             VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                 VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                             0, 1, &to_sample, 0, nullptr, 0, nullptr);
+    sized->filled = width == sized->width && height == sized->height;
   }
 }
 
@@ -1932,8 +2032,286 @@ void TextureCache::BeginResolveWrite(uint32_t address, bool supported_root) {
 }
 
 const ResolveDestination* TextureCache::FindResolveDestination(uint32_t address) const {
-  auto it = impl_->resolve_destinations.find(address);
-  return it == impl_->resolve_destinations.end() ? nullptr : it->second.get();
+  const Impl& im = *impl_;
+  auto alias = im.shared_resolve_aliases.find(address);
+  if (alias != im.shared_resolve_aliases.end()) {
+    auto owner = im.resolve_destinations.find(alias->second.root_address);
+    return owner == im.resolve_destinations.end() ? nullptr : owner->second.get();
+  }
+  auto it = im.resolve_destinations.find(address);
+  return it == im.resolve_destinations.end() ? nullptr : it->second.get();
+}
+
+void TextureCache::InvalidateSharedResolve(uint32_t address) {
+  Impl& im = *impl_;
+  const uint32_t base = address & ~kDepthWordsTag;
+  std::unordered_set<uint32_t> affected_roots;
+  for (const auto& [alias_address, alias] : im.shared_resolve_aliases) {
+    if ((alias_address & ~kDepthWordsTag) == base) affected_roots.insert(alias.root_address);
+  }
+  for (const auto& [root_address, layout] : im.shared_resolve_layouts) {
+    const uint32_t root_base = root_address & ~kDepthWordsTag;
+    const uint64_t span = uint64_t(layout.width) *
+                          ((uint64_t(layout.height) + 31u) & ~uint64_t(31u)) *
+                          (uint64_t(1) << layout.bytes_per_pixel_log2);
+    if (base >= root_base && uint64_t(base) < uint64_t(root_base) + span) {
+      affected_roots.insert(root_address);
+    }
+  }
+  if (affected_roots.empty()) return;
+
+  for (uint32_t root_address : affected_roots) {
+    auto layout = im.shared_resolve_layouts.find(root_address);
+    if (layout != im.shared_resolve_layouts.end()) {
+      im.InvalidateTiledResolveStateForSource(root_address, layout->second.width,
+                                              layout->second.height, layout->second.format,
+                                              0, 0, VK_FORMAT_UNDEFINED);
+    }
+    auto owner = im.resolve_destinations.find(root_address);
+    if (owner != im.resolve_destinations.end()) {
+      im.RetireResolveDestination(*owner->second, im.frame);
+      im.resolve_destinations.erase(owner);
+    }
+    im.shared_resolve_layouts.erase(root_address);
+    for (auto alias = im.shared_resolve_aliases.begin();
+         alias != im.shared_resolve_aliases.end();) {
+      if (alias->second.root_address == root_address) {
+        alias = im.shared_resolve_aliases.erase(alias);
+      } else {
+        ++alias;
+      }
+    }
+    im.depth_words_wanted.erase(root_address & ~kDepthWordsTag);
+  }
+  im.memo.clear();
+  ++im.answers_epoch;
+}
+
+ResolveDestination* TextureCache::GetSharedResolveDestination(
+    uint32_t address, uint32_t root_address, uint32_t width, uint32_t height,
+    uint32_t origin_x, uint32_t origin_y, VkFormat format, uint32_t host_swizzle,
+    VkCommandBuffer commands) {
+  Impl& im = *impl_;
+  if (!commands || !width || !height || width > 8192 || height > 8192 ||
+      (address & kDepthWordsTag) != (root_address & kDepthWordsTag)) {
+    return nullptr;
+  }
+  uint32_t bytes_per_pixel_log2 = 0;
+  switch (format) {
+    case VK_FORMAT_R8G8B8A8_UNORM:
+    case VK_FORMAT_R8G8B8A8_SRGB:
+    case VK_FORMAT_R8G8B8A8_UINT:
+    case VK_FORMAT_R32_SFLOAT:
+      bytes_per_pixel_log2 = 2;
+      break;
+    default:
+      return nullptr;
+  }
+  const uint32_t tag = address & kDepthWordsTag;
+  const uint32_t address_base = address & ~kDepthWordsTag;
+  const uint32_t root_base = root_address & ~kDepthWordsTag;
+  auto offset = resolve_layout::TileAddressOffset(
+      {origin_x, origin_y}, width, height, bytes_per_pixel_log2);
+  if (!offset || address_base < *offset || address_base - *offset != root_base ||
+      !root_base || uint64_t(root_base) +
+                        uint64_t(width) * ((uint64_t(height) + 31u) & ~uint64_t(31u)) *
+                            (uint64_t(1) << bytes_per_pixel_log2) >
+                        0x20000000ull) {
+    return nullptr;
+  }
+
+  const uint64_t new_span = uint64_t(width) *
+                            ((uint64_t(height) + 31u) & ~uint64_t(31u)) *
+                            (uint64_t(1) << bytes_per_pixel_log2);
+  std::vector<uint32_t> overlapping_roots;
+  for (const auto& [candidate, layout] : im.shared_resolve_layouts) {
+    const uint32_t candidate_base = candidate & ~kDepthWordsTag;
+    if (candidate_base == root_base) continue;  // color/depth-word representations may pair.
+    const uint64_t candidate_span = uint64_t(layout.width) *
+                                    ((uint64_t(layout.height) + 31u) & ~uint64_t(31u)) *
+                                    (uint64_t(1) << layout.bytes_per_pixel_log2);
+    if (uint64_t(root_base) < uint64_t(candidate_base) + candidate_span &&
+        uint64_t(candidate_base) < uint64_t(root_base) + new_span) {
+      overlapping_roots.push_back(candidate);
+    }
+  }
+  for (uint32_t candidate : overlapping_roots) InvalidateSharedResolve(candidate);
+
+  auto existing_layout = im.shared_resolve_layouts.find(root_address);
+  if (existing_layout != im.shared_resolve_layouts.end() &&
+      (existing_layout->second.width != width || existing_layout->second.height != height ||
+       existing_layout->second.format != format ||
+       existing_layout->second.host_swizzle != host_swizzle ||
+       existing_layout->second.bytes_per_pixel_log2 != bytes_per_pixel_log2)) {
+    InvalidateSharedResolve(root_address);
+  }
+  auto existing_alias = im.shared_resolve_aliases.find(address);
+  if (existing_alias != im.shared_resolve_aliases.end() &&
+      (existing_alias->second.root_address != root_address ||
+       existing_alias->second.origin_x != origin_x ||
+       existing_alias->second.origin_y != origin_y)) {
+    InvalidateSharedResolve(address);
+  }
+  if (tag == 0) {
+    auto words = im.shared_resolve_layouts.find(root_address | kDepthWordsTag);
+    if (words != im.shared_resolve_layouts.end() &&
+        (words->second.width != width || words->second.height != height)) {
+      InvalidateSharedResolve(root_address | kDepthWordsTag);
+    }
+  } else {
+    auto color = im.shared_resolve_layouts.find(root_address & ~kDepthWordsTag);
+    if (color != im.shared_resolve_layouts.end() &&
+        (color->second.width != width || color->second.height != height)) {
+      InvalidateSharedResolve(root_address & ~kDepthWordsTag);
+    }
+  }
+
+  // A legacy resolve cached at a tiled address can outlive the raw write that
+  // used it. Once this physical range has a canonical shared owner, those raw
+  // entries must not be returned as independent images on a later fetch.
+  const uint64_t root_end = uint64_t(root_base) + new_span;
+  const uint32_t paired_root_address = root_address ^ kDepthWordsTag;
+  const auto paired_layout = im.shared_resolve_layouts.find(paired_root_address);
+  const auto paired_destination = im.resolve_destinations.find(paired_root_address);
+  const bool legal_depth_words_pair =
+      paired_layout != im.shared_resolve_layouts.end() &&
+      paired_destination != im.resolve_destinations.end() &&
+      paired_layout->second.width == width && paired_layout->second.height == height &&
+      paired_layout->second.bytes_per_pixel_log2 == bytes_per_pixel_log2 &&
+      paired_destination->second->width == width && paired_destination->second->height == height &&
+      ((tag == 0 && format == VK_FORMAT_R32_SFLOAT &&
+        paired_layout->second.format == VK_FORMAT_R8G8B8A8_UNORM) ||
+       (tag != 0 && format == VK_FORMAT_R8G8B8A8_UNORM &&
+        paired_layout->second.format == VK_FORMAT_R32_SFLOAT));
+  bool removed_stale_raw_resolve = false;
+  for (auto raw = im.resolve_destinations.begin(); raw != im.resolve_destinations.end();) {
+    const uint32_t raw_base = raw->first & ~kDepthWordsTag;
+    const bool in_physical_span = raw_base >= root_base && uint64_t(raw_base) < root_end;
+    const bool canonical_owner = raw->first == root_address;
+    const bool preserve_paired_owner = legal_depth_words_pair &&
+                                       raw->first == paired_root_address;
+    if (!in_physical_span || canonical_owner || preserve_paired_owner) {
+      ++raw;
+      continue;
+    }
+    im.InvalidateTiledResolveStateForSource(raw->first, raw->second->width,
+                                            raw->second->height, raw->second->format,
+                                            0, 0, VK_FORMAT_UNDEFINED);
+    im.RetireResolveDestination(*raw->second, im.frame);
+    raw = im.resolve_destinations.erase(raw);
+    removed_stale_raw_resolve = true;
+  }
+  if (removed_stale_raw_resolve) {
+    im.memo.clear();
+    ++im.answers_epoch;
+  }
+
+  if (!im.shared_resolve_layouts.count(root_address) &&
+      im.shared_resolve_layouts.size() >= Impl::kMaxSharedResolveOwners) {
+    uint32_t oldest_root = 0;
+    uint64_t oldest_frame = UINT64_MAX;
+    for (const auto& [candidate, layout] : im.shared_resolve_layouts) {
+      const uint32_t candidate_base = candidate & ~kDepthWordsTag;
+      if (candidate_base == root_base) continue;
+      auto owner = im.resolve_destinations.find(candidate);
+      const uint64_t last = owner == im.resolve_destinations.end()
+                                ? 0
+                                : owner->second->last_written_frame;
+      if (last >= im.frame) continue;
+      const uint64_t candidate_span = uint64_t(layout.width) *
+                                      ((uint64_t(layout.height) + 31u) & ~uint64_t(31u)) *
+                                      (uint64_t(1) << layout.bytes_per_pixel_log2);
+      bool safe_to_evict = true;
+      for (const auto& [other, other_layout] : im.shared_resolve_layouts) {
+        if (other == candidate) continue;
+        const uint32_t other_base = other & ~kDepthWordsTag;
+        const uint64_t other_span = uint64_t(other_layout.width) *
+                                    ((uint64_t(other_layout.height) + 31u) & ~uint64_t(31u)) *
+                                    (uint64_t(1) << other_layout.bytes_per_pixel_log2);
+        if (uint64_t(candidate_base) < uint64_t(other_base) + other_span &&
+            uint64_t(other_base) < uint64_t(candidate_base) + candidate_span) {
+          auto other_owner = im.resolve_destinations.find(other);
+          if (other_base == root_base ||
+              (other_owner != im.resolve_destinations.end() &&
+               other_owner->second->last_written_frame >= im.frame)) {
+            safe_to_evict = false;
+            break;
+          }
+        }
+      }
+      if (safe_to_evict && last < oldest_frame) {
+        oldest_root = candidate;
+        oldest_frame = last;
+      }
+    }
+    if (oldest_root) InvalidateSharedResolve(oldest_root);
+    if (im.shared_resolve_layouts.size() >= Impl::kMaxSharedResolveOwners) return nullptr;
+  }
+
+  auto owner_it = im.resolve_destinations.find(root_address);
+  if (owner_it != im.resolve_destinations.end() &&
+      (owner_it->second->width != width || owner_it->second->height != height ||
+       owner_it->second->format != format)) {
+    im.RetireResolveDestination(*owner_it->second, im.frame);
+    im.resolve_destinations.erase(owner_it);
+    im.memo.clear();
+    ++im.answers_epoch;
+  }
+  ResolveDestination* owner =
+      GetResolveDestination(root_address, width, height, format, host_swizzle, commands);
+  if (!owner || owner->width != width || owner->height != height ||
+      owner->format != format) {
+    return nullptr;
+  }
+
+  std::unordered_set<uint32_t> required_aliases{root_address, address};
+  size_t aliases_to_add = 0;
+  for (uint32_t key : required_aliases) {
+    if (!im.shared_resolve_aliases.count(key)) ++aliases_to_add;
+  }
+  while (im.shared_resolve_aliases.size() + aliases_to_add >
+         Impl::kMaxSharedResolveAliases) {
+    auto oldest = im.shared_resolve_aliases.end();
+    for (auto it = im.shared_resolve_aliases.begin(); it != im.shared_resolve_aliases.end(); ++it) {
+      if (required_aliases.count(it->first)) continue;
+      if (oldest == im.shared_resolve_aliases.end() ||
+          it->second.last_used_frame < oldest->second.last_used_frame) {
+        oldest = it;
+      }
+    }
+    if (oldest == im.shared_resolve_aliases.end()) return nullptr;
+    im.shared_resolve_aliases.erase(oldest);
+    im.memo.clear();
+    ++im.answers_epoch;
+  }
+
+  const auto old_layout = im.shared_resolve_layouts.find(root_address);
+  const auto old_root_alias = im.shared_resolve_aliases.find(root_address);
+  const auto old_alias = im.shared_resolve_aliases.find(address);
+  const bool mapping_changed = old_layout == im.shared_resolve_layouts.end() ||
+      old_root_alias == im.shared_resolve_aliases.end() || old_alias == im.shared_resolve_aliases.end() ||
+      old_alias->second.root_address != root_address || old_alias->second.origin_x != origin_x ||
+      old_alias->second.origin_y != origin_y;
+  if (address != root_address) {
+    auto stale_segment = im.resolve_destinations.find(address);
+    if (stale_segment != im.resolve_destinations.end()) {
+      im.RetireResolveDestination(*stale_segment->second, im.frame);
+      im.resolve_destinations.erase(stale_segment);
+      im.memo.clear();
+      ++im.answers_epoch;
+    }
+  }
+  im.shared_resolve_layouts[root_address] =
+      Impl::SharedResolveLayout{width, height, bytes_per_pixel_log2, format, host_swizzle};
+  im.shared_resolve_aliases[root_address] =
+      Impl::SharedResolveAlias{root_address, 0, 0, im.frame};
+  im.shared_resolve_aliases[address] =
+      Impl::SharedResolveAlias{root_address, origin_x, origin_y, im.frame};
+  if (mapping_changed) {
+    im.memo.clear();
+    ++im.answers_epoch;
+  }
+  return owner;
 }
 
 ResolveDestination* TextureCache::GetResolveDestination(uint32_t address, uint32_t width,
@@ -2017,7 +2395,7 @@ ResolveDestination* TextureCache::GetResolveDestination(uint32_t address, uint32
   // alternately, and on this GPU the layout has no cost.
   VkImageMemoryBarrier barrier = {};
   barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
   barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
   barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
@@ -2029,6 +2407,15 @@ ResolveDestination* TextureCache::GetResolveDestination(uint32_t address, uint32
   VkClearColorValue black = {};
   VkImageSubresourceRange range = rex::ui::vulkan::util::InitializeSubresourceRange();
   dfn.vkCmdClearColorImage(commands, dest->image, VK_IMAGE_LAYOUT_GENERAL, &black, 1, &range);
+  VkMemoryBarrier after_clear = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                 VK_ACCESS_TRANSFER_WRITE_BIT,
+                                 VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT |
+                                     VK_ACCESS_SHADER_WRITE_BIT};
+  dfn.vkCmdPipelineBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                           0, 1, &after_clear, 0, nullptr, 0, nullptr);
   ResolveDestination* result = dest.get();
   im.resolve_destinations.emplace(address, std::move(dest));
   return result;
@@ -2095,22 +2482,40 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     return null_view;
   }
 
-  // A texture a resolve wrote: the image, not the memory.
+  // A texture a resolve wrote: the image, not the memory. Shared aliases use
+  // the canonical owner's image and crop only when the fetch addresses a tile.
   if (fetch.dimension != xenos::DataDimension::k3D &&
       fetch.dimension != xenos::DataDimension::kCube &&
       dimension != xenos::FetchOpDimension::kCube) {
     const uint32_t base_address = base_page << 12;
-    auto it = im.resolve_destinations.find(base_address);
-    auto composite = im.tiled_resolve_composites.find(base_address);
-    auto state = im.tiled_resolve_states.find(base_address);
-    const bool composite_active = composite != im.tiled_resolve_composites.end() &&
-                                  state != im.tiled_resolve_states.end() &&
-                                  state->second.Usable();
-    ResolveDestination* resolved =
-        composite_active ? composite->second.get()
-                         : (it == im.resolve_destinations.end() ? nullptr : it->second.get());
-    if (it != im.resolve_destinations.end() && it->second->format == VK_FORMAT_R32_SFLOAT) {
-      // A depth resolve: floats for depth formats, the memory words for the rest.
+    uint32_t origin_x = 0, origin_y = 0;
+    bool shared = false;
+    ResolveDestination* resolved = nullptr;
+    auto alias = im.shared_resolve_aliases.find(base_address);
+    if (alias != im.shared_resolve_aliases.end()) {
+      auto owner = im.resolve_destinations.find(alias->second.root_address);
+      if (owner != im.resolve_destinations.end()) {
+        resolved = owner->second.get();
+        origin_x = alias->second.origin_x;
+        origin_y = alias->second.origin_y;
+        alias->second.last_used_frame = im.frame;
+        shared = true;
+      }
+    } else {
+      auto composite = im.tiled_resolve_composites.find(base_address);
+      auto state = im.tiled_resolve_states.find(base_address);
+      const bool composite_active = composite != im.tiled_resolve_composites.end() &&
+                                    state != im.tiled_resolve_states.end() &&
+                                    state->second.Usable();
+      if (composite_active) {
+        resolved = composite->second.get();
+      } else {
+        auto it = im.resolve_destinations.find(base_address);
+        if (it != im.resolve_destinations.end()) resolved = it->second.get();
+      }
+    }
+
+    if (resolved && resolved->format == VK_FORMAT_R32_SFLOAT) {
       xenos::TextureFormat format = rex::graphics::GetBaseFormat(fetch.format);
       bool depth_format = format == xenos::TextureFormat::k_24_8 ||
                           format == xenos::TextureFormat::k_24_8_FLOAT;
@@ -2118,125 +2523,237 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
       if (!(logged_formats & (1u << (uint32_t(format) & 31)))) {
         logged_formats |= 1u << (uint32_t(format) & 31);
         REXLOG_INFO("[native] Depth resolve at {:08X} sampled as texture format {}",
-                    base_page << 12, uint32_t(format));
+                    base_address, uint32_t(format));
       }
       if (!depth_format) {
-        im.depth_words_wanted.insert(base_page << 12);
-        auto words = im.resolve_destinations.find((base_page << 12) | kDepthWordsTag);
-        if (words != im.resolve_destinations.end()) {
-          it = words;
-          resolved = words->second.get();
+        im.depth_words_wanted.insert(
+            shared ? (resolved->address & ~kDepthWordsTag) : base_address);
+        const uint32_t words_address = base_address | kDepthWordsTag;
+        auto words_alias = im.shared_resolve_aliases.find(words_address);
+        if (words_alias != im.shared_resolve_aliases.end()) {
+          auto words = im.resolve_destinations.find(words_alias->second.root_address);
+          if (words != im.resolve_destinations.end()) {
+            resolved = words->second.get();
+            origin_x = words_alias->second.origin_x;
+            origin_y = words_alias->second.origin_y;
+            words_alias->second.last_used_frame = im.frame;
+            shared = true;
+          }
+        } else {
+          auto words = im.resolve_destinations.find(words_address);
+          if (words != im.resolve_destinations.end()) {
+            resolved = words->second.get();
+            origin_x = 0;
+            origin_y = 0;
+            shared = false;
+          }
         }
       }
     }
+
     if (resolved) {
       ResolveDestination& dest = *resolved;
-      uint32_t swizzle = GuestToHostSwizzle(fetch.swizzle, dest.host_swizzle);
-      const uint32_t fetch_width = width_minus_1 + 1, fetch_height = height_minus_1 + 1;
-      if ((fetch_width != dest.width || fetch_height != dest.height) && fetch_width <= 8192 &&
-          fetch_height <= 8192 && depth_minus_1 == 0) {
+      const uint32_t swizzle = GuestToHostSwizzle(fetch.swizzle, dest.host_swizzle);
+      const uint32_t fetch_width = width_minus_1 + 1;
+      const uint32_t fetch_height = height_minus_1 + 1;
+      if (fetch_width <= 8192 && fetch_height <= 8192 && depth_minus_1 == 0) {
         ResolveDestination::Sized* sized = nullptr;
-        for (auto& candidate : dest.sized) {
-          if (candidate->width == fetch_width && candidate->height == fetch_height) {
-            sized = candidate.get();
-          }
-        }
-        if (!sized && dest.sized.size() < 4) {
-          auto created = std::make_unique<ResolveDestination::Sized>();
-          created->width = fetch_width;
-          created->height = fetch_height;
-          VkImageCreateInfo info = {};
-          info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
-          info.imageType = VK_IMAGE_TYPE_2D;
-          info.format = dest.format;
-          info.extent = {fetch_width, fetch_height, 1};
-          info.mipLevels = 1;
-          info.arrayLayers = 1;
-          info.samples = VK_SAMPLE_COUNT_1_BIT;
-          info.tiling = VK_IMAGE_TILING_OPTIMAL;
-          info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
-          const bool storage = im.compute_copy && StorageCapable(dest.format);
-          if (storage) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-          info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-          if (rex::ui::vulkan::util::CreateDedicatedAllocationImage(
-                  im.device, info, rex::ui::vulkan::util::MemoryPurpose::kDeviceLocal,
-                  created->image, created->memory)) {
-            if (storage) {
-              VkImageViewCreateInfo plain = {};
-              plain.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-              plain.image = created->image;
-              plain.viewType = VK_IMAGE_VIEW_TYPE_2D;
-              plain.format = dest.format;
-              plain.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
-              if (dfn.vkCreateImageView(d, &plain, nullptr, &created->storage_view) !=
-                  VK_SUCCESS) {
-                created->storage_view = VK_NULL_HANDLE;
-              } else {
-                created->views.emplace(0xFFFFFFFFu, created->storage_view);
+        if (shared && (origin_x || origin_y || fetch_width != dest.width ||
+                       fetch_height != dest.height)) {
+          if (origin_x <= dest.width && origin_y <= dest.height &&
+              fetch_width <= dest.width - origin_x &&
+              fetch_height <= dest.height - origin_y) {
+            for (auto& candidate : dest.sized) {
+              if (candidate->width == fetch_width && candidate->height == fetch_height &&
+                  candidate->origin_x == origin_x && candidate->origin_y == origin_y) {
+                sized = candidate.get();
+                break;
               }
             }
-            // Into GENERAL before this submission's draws; filled by the next
-            // resolve to this address, which runs after them.
-            VkImageMemoryBarrier barrier = {};
-            barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-            barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
-            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
-            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-            barrier.image = created->image;
-            barrier.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
-            dfn.vkCmdPipelineBarrier(upload.setup_commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                                     VK_PIPELINE_STAGE_TRANSFER_BIT |
-                                         VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                                     0, 0, nullptr, 0, nullptr, 1, &barrier);
-            REXLOG_INFO("[native] Resolve at {:08X} ({}x{}) sampled as {}x{}: exact-size copy",
-                        dest.address, dest.width, dest.height, fetch_width, fetch_height);
-            sized = created.get();
-            dest.sized.push_back(std::move(created));
+            if (!sized && dest.sized.size() < 8) {
+              auto created = std::make_unique<ResolveDestination::Sized>();
+              created->width = fetch_width;
+              created->height = fetch_height;
+              created->origin_x = origin_x;
+              created->origin_y = origin_y;
+              VkImageCreateInfo info = {};
+              info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+              info.imageType = VK_IMAGE_TYPE_2D;
+              info.format = dest.format;
+              info.extent = {fetch_width, fetch_height, 1};
+              info.mipLevels = 1;
+              info.arrayLayers = 1;
+              info.samples = VK_SAMPLE_COUNT_1_BIT;
+              info.tiling = VK_IMAGE_TILING_OPTIMAL;
+              info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+              const bool storage = im.compute_copy && StorageCapable(dest.format);
+              if (storage) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+              info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+              if (!rex::ui::vulkan::util::CreateDedicatedAllocationImage(
+                      im.device, info, rex::ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+                      created->image, created->memory)) {
+                return null_view;
+              }
+              if (storage) {
+                VkImageViewCreateInfo plain = {};
+                plain.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+                plain.image = created->image;
+                plain.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                plain.format = dest.format;
+                plain.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
+                if (dfn.vkCreateImageView(d, &plain, nullptr, &created->storage_view) ==
+                    VK_SUCCESS) {
+                  created->views.emplace(0xFFFFFFFFu, created->storage_view);
+                } else {
+                  created->storage_view = VK_NULL_HANDLE;
+                }
+              }
+              const VkCommandBuffer resolve_commands =
+                  upload.resolve_commands ? upload.resolve_commands() : VK_NULL_HANDLE;
+              if (!resolve_commands) {
+                std::vector<VkImageView> views;
+                if (created->storage_view) views.push_back(created->storage_view);
+                im.DestroyNow(created->image, created->memory, views);
+                return null_view;
+              }
+              VkImageMemoryBarrier barrier = {};
+              barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+              barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+              barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+              barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+              barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              barrier.image = created->image;
+              barrier.subresourceRange =
+                  rex::ui::vulkan::util::InitializeSubresourceRange();
+              dfn.vkCmdPipelineBarrier(resolve_commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr,
+                                       1, &barrier);
+              created->initialized = true;
+              sized = created.get();
+              dest.sized.push_back(std::move(created));
+              CopyToSized(dest, resolve_commands);
+            }
           }
-        }
-        // Until the first resolve after it was made, the whole image (once).
-        if (sized && sized->filled) {
-          auto sv = sized->views.find(swizzle);
-          if (sv != sized->views.end()) {
+          if (!sized || !sized->filled) return null_view;
+          auto view = sized->views.find(swizzle);
+          if (view != sized->views.end()) {
             ++stats_.resolved_hits;
-            return sv->second;
+            return view->second;
           }
-          VkImageViewCreateInfo view = {};
-          view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-          view.image = sized->image;
-          view.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-          view.format = dest.format;
-          view.components = {ComponentSwizzle(swizzle, 0), ComponentSwizzle(swizzle, 1),
+          VkImageViewCreateInfo info = {};
+          info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+          info.image = sized->image;
+          info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+          info.format = dest.format;
+          info.components = {ComponentSwizzle(swizzle, 0), ComponentSwizzle(swizzle, 1),
                              ComponentSwizzle(swizzle, 2), ComponentSwizzle(swizzle, 3)};
-          view.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
+          info.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
           VkImageView result = VK_NULL_HANDLE;
-          if (dfn.vkCreateImageView(d, &view, nullptr, &result) != VK_SUCCESS) {
-            return null_view;
-          }
+          if (dfn.vkCreateImageView(d, &info, nullptr, &result) != VK_SUCCESS) return null_view;
           sized->views.emplace(swizzle, result);
           ++stats_.resolved_hits;
           return result;
         }
+
+        if (!shared && (fetch_width != dest.width || fetch_height != dest.height)) {
+          for (auto& candidate : dest.sized) {
+            if (candidate->width == fetch_width && candidate->height == fetch_height &&
+                candidate->origin_x == 0 && candidate->origin_y == 0) {
+              sized = candidate.get();
+            }
+          }
+          if (!sized && dest.sized.size() < 4) {
+            auto created = std::make_unique<ResolveDestination::Sized>();
+            created->width = fetch_width;
+            created->height = fetch_height;
+            VkImageCreateInfo info = {};
+            info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
+            info.imageType = VK_IMAGE_TYPE_2D;
+            info.format = dest.format;
+            info.extent = {fetch_width, fetch_height, 1};
+            info.mipLevels = 1;
+            info.arrayLayers = 1;
+            info.samples = VK_SAMPLE_COUNT_1_BIT;
+            info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            const bool storage = im.compute_copy && StorageCapable(dest.format);
+            if (storage) info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+            info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            if (rex::ui::vulkan::util::CreateDedicatedAllocationImage(
+                    im.device, info, rex::ui::vulkan::util::MemoryPurpose::kDeviceLocal,
+                    created->image, created->memory)) {
+              if (storage) {
+                VkImageViewCreateInfo plain = {};
+                plain.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+                plain.image = created->image;
+                plain.viewType = VK_IMAGE_VIEW_TYPE_2D;
+                plain.format = dest.format;
+                plain.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
+                if (dfn.vkCreateImageView(d, &plain, nullptr, &created->storage_view) !=
+                    VK_SUCCESS) {
+                  created->storage_view = VK_NULL_HANDLE;
+                } else {
+                  created->views.emplace(0xFFFFFFFFu, created->storage_view);
+                }
+              }
+              VkImageMemoryBarrier barrier = {};
+              barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+              barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
+              barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+              barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+              barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+              barrier.image = created->image;
+              barrier.subresourceRange =
+                  rex::ui::vulkan::util::InitializeSubresourceRange();
+              dfn.vkCmdPipelineBarrier(upload.setup_commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                       VK_PIPELINE_STAGE_TRANSFER_BIT |
+                                           VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                                       0, 0, nullptr, 0, nullptr, 1, &barrier);
+              created->initialized = true;
+              sized = created.get();
+              dest.sized.push_back(std::move(created));
+            }
+          }
+          if (sized && sized->filled) {
+            auto view = sized->views.find(swizzle);
+            if (view != sized->views.end()) {
+              ++stats_.resolved_hits;
+              return view->second;
+            }
+            VkImageViewCreateInfo info = {};
+            info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            info.image = sized->image;
+            info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+            info.format = dest.format;
+            info.components = {ComponentSwizzle(swizzle, 0), ComponentSwizzle(swizzle, 1),
+                               ComponentSwizzle(swizzle, 2), ComponentSwizzle(swizzle, 3)};
+            info.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
+            VkImageView result = VK_NULL_HANDLE;
+            if (dfn.vkCreateImageView(d, &info, nullptr, &result) != VK_SUCCESS) return null_view;
+            sized->views.emplace(swizzle, result);
+            ++stats_.resolved_hits;
+            return result;
+          }
+        }
       }
-      auto v = dest.texture_views.find(swizzle);
-      if (v != dest.texture_views.end()) {
+
+      auto view = dest.texture_views.find(swizzle);
+      if (view != dest.texture_views.end()) {
         ++stats_.resolved_hits;
-        return v->second;
+        return view->second;
       }
-      VkImageViewCreateInfo view = {};
-      view.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-      view.image = dest.image;
-      view.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
-      view.format = dest.format;
-      view.components = {ComponentSwizzle(swizzle, 0), ComponentSwizzle(swizzle, 1),
+      VkImageViewCreateInfo info = {};
+      info.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+      info.image = dest.image;
+      info.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
+      info.format = dest.format;
+      info.components = {ComponentSwizzle(swizzle, 0), ComponentSwizzle(swizzle, 1),
                          ComponentSwizzle(swizzle, 2), ComponentSwizzle(swizzle, 3)};
-      view.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
+      info.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
       VkImageView result = VK_NULL_HANDLE;
-      if (dfn.vkCreateImageView(d, &view, nullptr, &result) != VK_SUCCESS) {
-        return null_view;
-      }
+      if (dfn.vkCreateImageView(d, &info, nullptr, &result) != VK_SUCCESS) return null_view;
       dest.texture_views.emplace(swizzle, result);
       ++stats_.resolved_hits;
       return result;
