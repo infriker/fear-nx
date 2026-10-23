@@ -12,7 +12,7 @@ heavy areas. GPU utilization reached 100% in those drops while CPU headroom
 remained. These measurements describe the preceding test builds, not a new
 controlled benchmark of the latest fixes.
 
-The current user comparison reports 20–30 FPS without overclocking on deko3d,
+The current user comparison reports 20–30 FPS with overclocking on deko3d,
 with frequent drops. **Vulkan currently provides more stable performance.**
 Scenes, settings and runs were not identical; no percentage advantage is claimed.
 
