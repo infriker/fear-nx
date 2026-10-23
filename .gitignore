@@ -39,3 +39,20 @@ __pycache__/
 *.ps1
 *.psm1
 *.psd1
+
+# Local captures, emulator experiments and imported development bundles
+*.rar
+*.7z
+/tools/eden/
+/tools/switch/horizon-probe/
+/tools/deko/eden_*
+/patches/eden/
+/patches/checkpoint-20261020/
+/verification/
+/src/verification/
+/src/CHANGES.patch
+/src/README_RU.md
+/src/SHA256SUMS.txt
+/docs/renderer-correctness-audit.md
+/docs/deko3d-dante-optimization-audit.md
+/docs/deko3d-nfsmw-audit.md

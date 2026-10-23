@@ -39,8 +39,37 @@ Compare the submodule paths and commit IDs with `recursive_submodules` in
 an uninitialized, mismatched or conflicted submodule; resolve it before building.
 
 This applies the complete source snapshot in `patches/native-vulkan` to the
-pinned ReXGlue base. The numbered patches and the older checkpoint SDK snapshot
-are retained as source history. Do not apply them on top of this snapshot.
+pinned ReXGlue base. The numbered patches are retained as source history. Do not apply them
+on top of this snapshot.
+
+Then apply the focused gamma-presentation overlay (after verifying the snapshot
+tree above):
+
+```text
+python -c "import hashlib,json; from pathlib import Path; p=Path('patches/native-vulkan'); m=json.loads((p/'gamma-present.json').read_text()); assert hashlib.sha256((p/m['patch']).read_bytes()).hexdigest()==m['sha256'], 'Gamma overlay checksum mismatch'"
+git -C third_party/rexglue-sdk apply --check ../../patches/native-vulkan/gamma-present.patch
+git -C third_party/rexglue-sdk apply --index ../../patches/native-vulkan/gamma-present.patch
+```
+
+This retains the pinned SDK and supplies the raw-frame snapshot API used by the
+native renderer. For 8-bit RGBA/BGRA frontbuffers, gamma is applied per texel in
+the final bilinear shader. A transfer copy still preserves the mailbox frame;
+the separate gamma compute dispatch is removed. Other formats use the original
+compute path. FidelityFX builds keep the original path as well.
+
+`native_fused_gamma = true` in `[nx]` is the default. Set it to `false` and fully
+restart for an A/B comparison. Keep `native_shared_resolves = true` and
+`native_record_thread = false` fixed during this comparison. At 1:1 output the
+new shader uses one source tap; resizing requires four gamma-corrected taps to
+preserve gamma-before-filter ordering, so the FPS benefit needs device testing.
+
+The GLSL source is included in the overlay. To regenerate its two embedded
+headers inside the Switch toolchain container, run from `/project`:
+
+```text
+glslangValidator -S frag -V --target-env vulkan1.1 --vn guest_output_bilinear_gamma_ps -o third_party/rexglue-sdk/src/ui/shaders/vulkan_spirv/guest_output_bilinear_gamma_ps.h third_party/rexglue-sdk/src/ui/shaders/guest_output_bilinear_gamma.frag.glsl
+glslangValidator -S frag -V --target-env vulkan1.1 -DGAMMA_DITHER --vn guest_output_bilinear_gamma_dither_ps -o third_party/rexglue-sdk/src/ui/shaders/vulkan_spirv/guest_output_bilinear_gamma_dither_ps.h third_party/rexglue-sdk/src/ui/shaders/guest_output_bilinear_gamma.frag.glsl
+```
 
 ## 2. Generate the game translation
 

@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -31,6 +32,8 @@
 #include <rex/graphics/pipeline/shader/spirv.h>
 #include <rex/graphics/xenos.h>
 #include <rex/ui/vulkan/device.h>
+
+#include "native_resolve_layout.h"
 
 namespace rex::memory {
 class Memory;
@@ -69,12 +72,15 @@ struct ResolveDestination {
   // Views as textures (2D arrays), by host swizzle; bit 31 set for plain 2D.
   std::unordered_map<uint32_t, VkImageView> texture_views;
   uint64_t last_written_frame = 0;
+  // A shared owner can outlive the resolve that created it. Keep it while
+  // any draw or presentation in the current frame still references its image.
+  uint64_t last_used_frame = 0;
   // Copies of the top-left corner at the sizes the game samples this address
   // as, where that differs from the image. Texture coordinates span the whole
   // image, so sampling the image itself scaled the content: the blur the game
   // makes from a 264x152 resolve into a 320-wide destination came back 1.2
   // times too small, a ghost of the skater up and to the left with a halo.
-  // Refreshed by every resolve here (CopyToSized).
+  // Updated only where a resolve overlaps the crop (CopyToSized).
   struct Sized {
     uint32_t width = 0;
     uint32_t height = 0;
@@ -87,6 +93,9 @@ struct ResolveDestination {
     // Plain 2D view for the compute copy into it (null: copied by transfer).
     VkImageView storage_view = VK_NULL_HANDLE;
     bool filled = false;
+    // Last frame a view was sampled. CopyToSized writes are covered by deferred
+    // retirement at the recording frame and do not make this crop live for draws.
+    uint64_t last_used_frame = 0;
   };
   std::vector<std::unique_ptr<Sized>> sized;
 };
@@ -98,6 +107,14 @@ struct TiledResolveRenderSource {
   VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
   uint32_t width = 0;
   uint32_t height = 0;
+};
+
+// The image and component mapping underlying a presentation view. Borrowed
+// until the next renderer operation; presentation must copy it before returning.
+struct ResolvePresentSource {
+  VkImage image = VK_NULL_HANDLE;
+  VkFormat format = VK_FORMAT_UNDEFINED;
+  VkComponentMapping components = {};
 };
 
 struct TextureCacheStats {
@@ -171,9 +188,10 @@ class TextureCache {
   // Invalidates shared surface owners whose address ranges contain this address.
   void InvalidateSharedResolve(uint32_t address);
   const ResolveDestination* FindResolveDestination(uint32_t address) const;
-  // After a resolve wrote dest (transfer writes recorded in commands): brings
-  // its sized copies up to date.
-  void CopyToSized(ResolveDestination& dest, VkCommandBuffer commands);
+  // After a resolve wrote dest: update its sized copies in destination-image
+  // coordinates. No dirty rectangle, or an unfilled crop, requests a full copy.
+  void CopyToSized(ResolveDestination& dest, VkCommandBuffer commands,
+                   std::optional<resolve_layout::Rect> dirty = std::nullopt);
   // Tracks and combines only validated, 4-byte tiled color resolve segments.
   // `origin` is the segment's guest tile origin in the full destination image;
   // source coordinates are the rectangle stored in the source resolve image.
@@ -207,7 +225,8 @@ class TextureCache {
   // A plain 2D view of a resolve destination with a host swizzle, for the
   // swap (which samples a non-array image).
   VkImageView GetResolveDestinationView2D(uint32_t address, uint32_t guest_swizzle,
-                                          uint32_t* width_out, uint32_t* height_out);
+                                          uint32_t* width_out, uint32_t* height_out,
+                                          ResolvePresentSource* source_out = nullptr);
 
   // Untiling runs on a worker: call before submitting the command buffers
   // that copy from the staging data.
@@ -226,6 +245,9 @@ class TextureCache {
   // Changes when what GetView answers for some fetch may have changed other
   // than by its own checks (a resolve destination made, a texture replaced).
   uint64_t answers_epoch() const;
+  // Retry cached lookup answers after a transient upload failure. Images and
+  // their content hashes remain valid; renderer binding caches follow the epoch.
+  void InvalidateAnswers();
 
  private:
   VkImageView GetViewUncached(const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch,

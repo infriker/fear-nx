@@ -43,6 +43,8 @@ extern "C" {
 #include <rex/system/xmemory.h>
 #include <rex/ui/vulkan/util.h>
 
+REXCVAR_DECLARE(bool, nx_native_precise_resolve_barriers);
+
 namespace fear_nx::native {
 
 namespace xenos = rex::graphics::xenos;
@@ -1100,7 +1102,36 @@ struct TextureCache::Impl {
     for (auto& sized : dest.sized) {
       std::vector<VkImageView> sized_views;
       for (auto& entry : sized->views) sized_views.push_back(entry.second);
-      Retire(sized->image, sized->memory, std::move(sized_views), last_used);
+      Retire(sized->image, sized->memory, std::move(sized_views),
+             std::max(last_used, sized->last_used_frame));
+    }
+  }
+
+  // Keep each owner's crop cache bounded without evicting an image already
+  // referenced by this frame's commands or descriptors. Retired views stay
+  // alive until their last-use frame completes.
+  void EnsureSizedCapacity(ResolveDestination& dest, size_t limit) {
+    while (dest.sized.size() >= limit) {
+      auto oldest = dest.sized.end();
+      for (auto it = dest.sized.begin(); it != dest.sized.end(); ++it) {
+        if ((*it)->last_used_frame >= frame) continue;
+        if (oldest == dest.sized.end() ||
+            (*it)->last_used_frame < (*oldest)->last_used_frame) {
+          oldest = it;
+        }
+      }
+      // A crop sampled in this frame may still be held by a draw
+      // descriptor. Keep the limit soft until one becomes safe to retire.
+      if (oldest == dest.sized.end()) break;
+
+      ResolveDestination::Sized& crop = **oldest;
+      std::vector<VkImageView> views;
+      for (auto& entry : crop.views) views.push_back(entry.second);
+      Retire(crop.image, crop.memory, std::move(views),
+             std::max(frame, crop.last_used_frame));
+      dest.sized.erase(oldest);
+      memo.clear();
+      ++answers_epoch;
     }
   }
 
@@ -1469,7 +1500,8 @@ void TextureCache::BeginFrame(uint64_t frame, uint64_t completed_frame) {
 }
 
 VkImageView TextureCache::GetResolveDestinationView2D(uint32_t address, uint32_t guest_swizzle,
-                                                      uint32_t* width_out, uint32_t* height_out) {
+                                                      uint32_t* width_out, uint32_t* height_out,
+                                                      ResolvePresentSource* source_out) {
   Impl& im = *impl_;
   ResolveDestination* selected = nullptr;
   uint32_t origin_x = 0, origin_y = 0;
@@ -1494,9 +1526,16 @@ VkImageView TextureCache::GetResolveDestinationView2D(uint32_t address, uint32_t
   }
   if (!selected) return VK_NULL_HANDLE;
   ResolveDestination& dest = *selected;
+  dest.last_used_frame = im.frame;
   if (origin_x > dest.width || origin_y > dest.height) return VK_NULL_HANDLE;
 
   uint32_t swizzle = GuestToHostSwizzle(guest_swizzle, dest.host_swizzle);
+  if (source_out) {
+    source_out->image = dest.image;
+    source_out->format = dest.format;
+    source_out->components = {ComponentSwizzle(swizzle, 0), ComponentSwizzle(swizzle, 1),
+                              ComponentSwizzle(swizzle, 2), ComponentSwizzle(swizzle, 3)};
+  }
   if (origin_x || origin_y) {
     const uint32_t crop_width = dest.width - origin_x;
     const uint32_t crop_height = dest.height - origin_y;
@@ -1509,6 +1548,8 @@ VkImageView TextureCache::GetResolveDestinationView2D(uint32_t address, uint32_t
       }
     }
     if (!crop) return VK_NULL_HANDLE;
+    crop->last_used_frame = im.frame;
+    if (source_out) source_out->image = crop->image;
     const uint32_t key = swizzle | (1u << 31);
     auto view = crop->views.find(key);
     if (view != crop->views.end()) {
@@ -1578,6 +1619,11 @@ bool TextureCache::ViewAlive(VkImageView view, uint64_t id) const {
 
 uint64_t TextureCache::answers_epoch() const { return impl_->answers_epoch; }
 
+void TextureCache::InvalidateAnswers() {
+  impl_->memo.clear();
+  ++impl_->answers_epoch;
+}
+
 void* TextureCache::last_texture() const { return impl_->out_texture; }
 
 uint64_t TextureCache::last_valid_until() const { return impl_->out_valid_until; }
@@ -1643,39 +1689,63 @@ bool TextureCache::StorageCapable(VkFormat format) {
   return capable;
 }
 
-void TextureCache::CopyToSized(ResolveDestination& dest, VkCommandBuffer commands) {
+void TextureCache::CopyToSized(ResolveDestination& dest, VkCommandBuffer commands,
+                               std::optional<resolve_layout::Rect> dirty) {
   if (dest.sized.empty() || !commands) return;
   const auto& dfn = impl_->device->functions();
-  VkMemoryBarrier between = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                             VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                                 VK_ACCESS_SHADER_READ_BIT,
-                             VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
-  dfn.vkCmdPipelineBarrier(commands,
-                           VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                               VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
-                           VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &between, 0, nullptr, 0,
-                           nullptr);
+  const bool precise_resolve_barriers = REXCVAR_GET(nx_native_precise_resolve_barriers);
+  bool synchronized = false;
   for (auto& sized : dest.sized) {
-    if (!sized->initialized || sized->origin_x > dest.width ||
-        sized->origin_y > dest.height) {
-      continue;
+    if (!sized->initialized) continue;
+    const auto copy = resolve_layout::PlanSizedCopy(
+        dest.width, dest.height, {sized->origin_x, sized->origin_y},
+        sized->width, sized->height, sized->filled, dirty);
+    if (!copy) continue;
+    // A resolve outside every initialized crop needs no copy or barrier.
+    // The compute copy callback owns its dependencies; in precise mode defer
+    // this transfer barrier until a vkCmdCopyImage fallback is actually used.
+    if (!precise_resolve_barriers && !synchronized) {
+      VkMemoryBarrier between = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                 VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                     VK_ACCESS_SHADER_READ_BIT,
+                                 VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+      dfn.vkCmdPipelineBarrier(commands,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                   VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &between, 0, nullptr, 0,
+                               nullptr);
+      synchronized = true;
     }
-    const uint32_t width = std::min(sized->width, dest.width - sized->origin_x);
-    const uint32_t height = std::min(sized->height, dest.height - sized->origin_y);
-    if (!width || !height) continue;
+    const bool fills_crop = copy->destination_x == 0 && copy->destination_y == 0 &&
+                            copy->width == sized->width && copy->height == sized->height;
     if (sized->storage_view && dest.view && impl_->compute_copy &&
         impl_->compute_copy(commands, dest.view, sized->storage_view,
-                            int32_t(sized->origin_x), int32_t(sized->origin_y), 0, 0,
-                            width, height)) {
-      sized->filled = width == sized->width && height == sized->height;
+                            int32_t(copy->source_x), int32_t(copy->source_y),
+                            int32_t(copy->destination_x), int32_t(copy->destination_y),
+                            copy->width, copy->height)) {
+      sized->filled = sized->filled || fills_crop;
       continue;
+    }
+    if (precise_resolve_barriers && !synchronized) {
+      VkMemoryBarrier between = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                 VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                     VK_ACCESS_SHADER_READ_BIT,
+                                 VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+      dfn.vkCmdPipelineBarrier(commands,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                   VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &between, 0, nullptr, 0,
+                               nullptr);
+      synchronized = true;
     }
     VkImageCopy region = {};
     region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
     region.dstSubresource = region.srcSubresource;
-    region.srcOffset = {int32_t(sized->origin_x), int32_t(sized->origin_y), 0};
-    region.extent = {width, height, 1};
+    region.srcOffset = {int32_t(copy->source_x), int32_t(copy->source_y), 0};
+    region.dstOffset = {int32_t(copy->destination_x), int32_t(copy->destination_y), 0};
+    region.extent = {copy->width, copy->height, 1};
     dfn.vkCmdCopyImage(commands, dest.image, VK_IMAGE_LAYOUT_GENERAL, sized->image,
                        VK_IMAGE_LAYOUT_GENERAL, 1, &region);
     VkMemoryBarrier to_sample = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
@@ -1684,7 +1754,7 @@ void TextureCache::CopyToSized(ResolveDestination& dest, VkCommandBuffer command
                              VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
                                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                              0, 1, &to_sample, 0, nullptr, 0, nullptr);
-    sized->filled = width == sized->width && height == sized->height;
+    sized->filled = sized->filled || fills_crop;
   }
 }
 
@@ -1806,7 +1876,8 @@ bool TextureCache::UpdateTiledResolve(ResolveDestination& source, uint32_t root_
       return false;
     }
     composite.last_written_frame = im.frame;
-    CopyToSized(composite, commands);
+    CopyToSized(composite, commands,
+                resolve_layout::Rect{origin.x + source_x, origin.y + source_y, width, height});
     auto& state = im.tiled_resolve_states[root_address];
     if (!state.Usable()) {
       state.Activate();
@@ -1865,25 +1936,27 @@ bool TextureCache::UpdateTiledResolve(ResolveDestination& source, uint32_t root_
   }
   if (composite_it == im.tiled_resolve_composites.end()) {
     constexpr size_t kMaxTiledResolveComposites = 32;
-    if (im.tiled_resolve_composites.size() >= kMaxTiledResolveComposites) {
+    while (im.tiled_resolve_composites.size() >= kMaxTiledResolveComposites) {
       auto oldest = im.tiled_resolve_composites.end();
-      bool oldest_is_active = true;
+      uint64_t oldest_activity = UINT64_MAX;
       for (auto candidate = im.tiled_resolve_composites.begin();
            candidate != im.tiled_resolve_composites.end(); ++candidate) {
         if (candidate->first == root_address) continue;
-        const auto state = im.tiled_resolve_states.find(candidate->first);
-        const bool active = state != im.tiled_resolve_states.end() && state->second.Usable();
-        if (oldest == im.tiled_resolve_composites.end() ||
-            (oldest_is_active && !active) ||
-            (oldest_is_active == active &&
-             candidate->second->last_written_frame < oldest->second->last_written_frame)) {
+        const ResolveDestination& cached = *candidate->second;
+        const uint64_t activity =
+            std::max(cached.last_written_frame, cached.last_used_frame);
+        if (activity >= im.frame) continue;
+        if (oldest == im.tiled_resolve_composites.end() || activity < oldest_activity) {
           oldest = candidate;
-          oldest_is_active = active;
+          oldest_activity = activity;
         }
       }
-      if (oldest == im.tiled_resolve_composites.end()) return false;
+      // Current-frame composites may still be referenced by recorded draws or
+      // presentation. Let the cache exceed its target until one is safe to evict.
+      if (oldest == im.tiled_resolve_composites.end()) break;
       const uint32_t evicted_address = oldest->first;
-      im.RetireResolveDestination(*oldest->second, im.frame);
+      im.RetireResolveDestination(*oldest->second,
+                                  std::max(im.frame, oldest->second->last_used_frame));
       im.tiled_resolve_composites.erase(oldest);
       im.tiled_resolve_states.erase(evicted_address);
       im.tiled_resolve_roots.erase(evicted_address);
@@ -1974,7 +2047,8 @@ bool TextureCache::UpdateTiledResolve(ResolveDestination& source, uint32_t root_
   im.tiled_resolve_states[root_address].Activate();
   im.memo.clear();
   ++im.answers_epoch;
-  CopyToSized(composite, commands);
+  CopyToSized(composite, commands,
+              resolve_layout::Rect{origin.x + source_x, origin.y + source_y, width, height});
   im.RecordTiledReadback(*root_dest_it->second, source, composite, origin_x, origin_y,
                          root.source_y, source_x, source_y, width, root_address,
                          raw_render_source, commands);
@@ -2206,8 +2280,12 @@ ResolveDestination* TextureCache::GetSharedResolveDestination(
     ++im.answers_epoch;
   }
 
-  if (!im.shared_resolve_layouts.count(root_address) &&
-      im.shared_resolve_layouts.size() >= Impl::kMaxSharedResolveOwners) {
+  // Treat the owner count as a soft limit. Resolve images are the canonical
+  // contents for these guest addresses, so do not retire one while it is
+  // written or sampled in this frame. If all candidates are live, keep the
+  // temporary overflow and try to trim old owners on the next admission.
+  while (!im.shared_resolve_layouts.count(root_address) &&
+         im.shared_resolve_layouts.size() >= Impl::kMaxSharedResolveOwners) {
     uint32_t oldest_root = 0;
     uint64_t oldest_frame = UINT64_MAX;
     for (const auto& [candidate, layout] : im.shared_resolve_layouts) {
@@ -2216,7 +2294,8 @@ ResolveDestination* TextureCache::GetSharedResolveDestination(
       auto owner = im.resolve_destinations.find(candidate);
       const uint64_t last = owner == im.resolve_destinations.end()
                                 ? 0
-                                : owner->second->last_written_frame;
+                                : std::max(owner->second->last_written_frame,
+                                           owner->second->last_used_frame);
       if (last >= im.frame) continue;
       const uint64_t candidate_span = uint64_t(layout.width) *
                                       ((uint64_t(layout.height) + 31u) & ~uint64_t(31u)) *
@@ -2233,7 +2312,8 @@ ResolveDestination* TextureCache::GetSharedResolveDestination(
           auto other_owner = im.resolve_destinations.find(other);
           if (other_base == root_base ||
               (other_owner != im.resolve_destinations.end() &&
-               other_owner->second->last_written_frame >= im.frame)) {
+               std::max(other_owner->second->last_written_frame,
+                        other_owner->second->last_used_frame) >= im.frame)) {
             safe_to_evict = false;
             break;
           }
@@ -2244,8 +2324,8 @@ ResolveDestination* TextureCache::GetSharedResolveDestination(
         oldest_frame = last;
       }
     }
-    if (oldest_root) InvalidateSharedResolve(oldest_root);
-    if (im.shared_resolve_layouts.size() >= Impl::kMaxSharedResolveOwners) return nullptr;
+    if (!oldest_root) break;
+    InvalidateSharedResolve(oldest_root);
   }
 
   auto owner_it = im.resolve_destinations.find(root_address);
@@ -2273,13 +2353,15 @@ ResolveDestination* TextureCache::GetSharedResolveDestination(
          Impl::kMaxSharedResolveAliases) {
     auto oldest = im.shared_resolve_aliases.end();
     for (auto it = im.shared_resolve_aliases.begin(); it != im.shared_resolve_aliases.end(); ++it) {
-      if (required_aliases.count(it->first)) continue;
+      if (required_aliases.count(it->first) || it->second.last_used_frame >= im.frame) continue;
       if (oldest == im.shared_resolve_aliases.end() ||
           it->second.last_used_frame < oldest->second.last_used_frame) {
         oldest = it;
       }
     }
-    if (oldest == im.shared_resolve_aliases.end()) return nullptr;
+    // As above, let current-frame aliases exceed the metadata limit rather
+    // than dropping an address that an already-recorded draw may still use.
+    if (oldest == im.shared_resolve_aliases.end()) break;
     im.shared_resolve_aliases.erase(oldest);
     im.memo.clear();
     ++im.answers_epoch;
@@ -2553,6 +2635,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
 
     if (resolved) {
       ResolveDestination& dest = *resolved;
+      dest.last_used_frame = im.frame;
       const uint32_t swizzle = GuestToHostSwizzle(fetch.swizzle, dest.host_swizzle);
       const uint32_t fetch_width = width_minus_1 + 1;
       const uint32_t fetch_height = height_minus_1 + 1;
@@ -2570,7 +2653,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
                 break;
               }
             }
-            if (!sized && dest.sized.size() < 8) {
+            if (!sized) {
               auto created = std::make_unique<ResolveDestination::Sized>();
               created->width = fetch_width;
               created->height = fetch_height;
@@ -2616,6 +2699,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
                 im.DestroyNow(created->image, created->memory, views);
                 return null_view;
               }
+              im.EnsureSizedCapacity(dest, 8);
               VkImageMemoryBarrier barrier = {};
               barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
               barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -2636,6 +2720,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
             }
           }
           if (!sized || !sized->filled) return null_view;
+          sized->last_used_frame = im.frame;
           auto view = sized->views.find(swizzle);
           if (view != sized->views.end()) {
             ++stats_.resolved_hits;
@@ -2663,7 +2748,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
               sized = candidate.get();
             }
           }
-          if (!sized && dest.sized.size() < 4) {
+          if (!sized) {
             auto created = std::make_unique<ResolveDestination::Sized>();
             created->width = fetch_width;
             created->height = fetch_height;
@@ -2697,6 +2782,15 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
                   created->views.emplace(0xFFFFFFFFu, created->storage_view);
                 }
               }
+              const VkCommandBuffer resolve_commands =
+                  upload.resolve_commands ? upload.resolve_commands() : VK_NULL_HANDLE;
+              if (!resolve_commands) {
+                std::vector<VkImageView> views;
+                for (auto& entry : created->views) views.push_back(entry.second);
+                im.DestroyNow(created->image, created->memory, views);
+                return null_view;
+              }
+              im.EnsureSizedCapacity(dest, 4);
               VkImageMemoryBarrier barrier = {};
               barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
               barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT;
@@ -2707,16 +2801,22 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
               barrier.image = created->image;
               barrier.subresourceRange =
                   rex::ui::vulkan::util::InitializeSubresourceRange();
-              dfn.vkCmdPipelineBarrier(upload.setup_commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+              dfn.vkCmdPipelineBarrier(resolve_commands, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
                                        VK_PIPELINE_STAGE_TRANSFER_BIT |
                                            VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
                                        0, 0, nullptr, 0, nullptr, 1, &barrier);
               created->initialized = true;
               sized = created.get();
               dest.sized.push_back(std::move(created));
+              CopyToSized(dest, resolve_commands);
+            } else {
+              // The full-size resolve has different UV scaling. Do not expose
+              // it as a crop when the correctly sized image could not be made.
+              return null_view;
             }
           }
           if (sized && sized->filled) {
+            sized->last_used_frame = im.frame;
             auto view = sized->views.find(swizzle);
             if (view != sized->views.end()) {
               ++stats_.resolved_hits;
@@ -2736,6 +2836,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
             ++stats_.resolved_hits;
             return result;
           }
+          if (!sized || !sized->filled) return null_view;
         }
       }
 

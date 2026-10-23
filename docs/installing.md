@@ -12,8 +12,10 @@ executable is `sdmc:/switch/fear-nx/game/default.xex` and its data are under
 
 Launch through title takeover: hold R while starting an installed game, then
 select F.E.A.R. NX in the Homebrew Menu. Album/applet mode does not provide the
-required memory. The release profile leaves clocks unchanged; the approximately
-30 FPS performance figure uses a GPU clock of 614 MHz.
+required memory. The release profile leaves clocks unchanged. The latest test
+builds run at about 30 FPS through most gameplay at a 460 MHz GPU clock, with
+25–27 FPS in heavy firefights and lows of about 17 FPS in some GPU-heavy areas.
+See [performance observations and limitations](performance.md).
 
 ## Updates
 

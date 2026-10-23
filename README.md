@@ -5,9 +5,15 @@ The game's PowerPC code is statically recompiled to AArch64 with
 [ReXGlue](https://github.com/rexglue/rexglue-sdk). A native Vulkan renderer draws
 the game through Mesa/NVK on Horizon.
 
-The original menu and campaign are playable. At **614 MHz GPU**, gameplay is
-generally around **30 FPS**, with drops to **25–27 FPS** in demanding scenes,
-especially during slow motion. Performance work is ongoing.
+The original menu and campaign are playable. In the latest on-device testing at
+**460 MHz GPU**, most gameplay runs at **30 FPS**. Heavy firefights can fall to
+**25–27 FPS**, and some unusually demanding areas reach **17 FPS**. Those drops
+are GPU-bound: GPU utilization reaches 100% while the CPU still has headroom.
+Performance work is ongoing.
+
+**Branches:** `main` contains the Vulkan/Mesa renderer. The separate
+[`deko3d` branch](https://github.com/infriker/fear-nx/tree/deko3d) contains the
+experimental deko3d renderer. Vulkan currently provides more stable performance.
 
 ## How to install
 
@@ -69,21 +75,30 @@ preferences are preserved. See [gyro settings](docs/gyro-aiming.md).
 Edit `fear-nx.toml` next to the NRO. The release uses the native renderer,
 shared resolve resources, D24 depth, 2× anisotropic filtering and disabled MSAA.
 The supplied profile leaves GPU clock selection to the system or your clock tool;
-it does not automatically set 614 MHz.
+it does not force a GPU clock or reduce the rendering resolution.
 
-Expect approximately 30 FPS at a 614 MHz GPU clock, with 25–27 FPS in heavier
-scenes and slow motion. These figures are not a guarantee for every level or
-hardware configuration. A comprehensive full-campaign benchmark is not available.
+The user's hardware observations reported on **2026-10-22**, at the tested stock
+**460 MHz GPU** setting, are 30 FPS through most gameplay, 25–27 FPS in heavy
+firefights, and lows of about 17 FPS in anomalous GPU-heavy areas. During drops
+below 30 FPS the GPU is fully occupied while the CPU has headroom. These are
+observations from the recent test builds, not a full-campaign benchmark or a
+guarantee for every level. New renderer changes still need separate hardware
+validation. See the [performance and change history](docs/performance.md).
 The first encounter with a shader can cause temporary missing effects or a hitch
 while its pipeline compiles; compiled pipelines are cached on the SD card.
 
 ## Planned features
 
-- [ ] Performance improvements, focusing on demanding scenes and slow motion.
+- [ ] GPU performance improvements for heavy firefights and anomalous slow areas.
+- [ ] Identify reproducible triggers for the remaining graphical defects.
 
 ## Known issues
 
-- Heavy scenes and slow motion can drop below the 30 FPS target.
+- Intermittent graphical defects remain: incomplete/half-screen rendering and
+  decal artifacts. Their triggers have not yet been identified; the latest
+  renderer fixes do not establish that these symptoms are resolved.
+
+- GPU-heavy areas can fall below the 30 FPS target, down to about 17 FPS in testing.
 - Asynchronous pipeline compilation can briefly omit newly encountered draws.
 - Only the executable revision listed below is supported.
 - Applet mode and emulators are not supported release targets.
@@ -101,6 +116,7 @@ cross-compilation environment.
 | [Building](docs/building.md) | SDK setup, code generation and NRO compilation |
 | [Driver build](docs/driver-build.md) | Mesa/NVK archives for Horizon |
 | [Native renderer](docs/native-renderer.md) | Renderer design and settings |
+| [Performance](docs/performance.md) | Hardware observations and renderer change history |
 | [Relinking](docs/RELINKING.md) | Rebuilding with modified runtime libraries |
 | [Installer](installer/README.md) | Browser installer and GitHub Pages deployment |
 

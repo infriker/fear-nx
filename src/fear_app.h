@@ -9,6 +9,7 @@
 #include <system_error>
 
 #include <rex/crypto/sha256.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/rex_app.h>
 #include <rex/runtime.h>
@@ -20,18 +21,27 @@
 #include "native/native_system.h"
 #include "input/gyro_input.h"
 
+REXCVAR_DECLARE(bool, gpu_implicit_lod_sampling);
+
 class FearNxApp final : public rex::ReXApp {
  public:
   using rex::ReXApp::ReXApp;
 
   static std::unique_ptr<rex::ui::WindowedApp> Create(
       rex::ui::WindowedAppContext& ctx) {
+#if REX_PLATFORM_SWITCH
+    // Apply the Switch default before SetupEnvironment loads the user's TOML,
+    // so an explicit false there can still select the original sampling path.
+    REXCVAR_SET(gpu_implicit_lod_sampling, true);
+#endif
     return std::unique_ptr<FearNxApp>(
         new FearNxApp(ctx, "fear-nx", PPCImageConfig));
   }
 
  protected:
   void OnPreSetup(rex::RuntimeConfig& config) override {
+    REXLOG_INFO("F.E.A.R. NX: implicit LOD sampling {}",
+                REXCVAR_GET(gpu_implicit_lod_sampling));
     config.input_factory = REX_INPUT_BACKEND(fear_nx::input::CreateInputSystem);
     // The app-owned Xenos Vulkan renderer is the Switch default. A config
     // override may select the SDK's reference Xenos backend for diagnosis.

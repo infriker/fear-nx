@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include <algorithm>
 #include <cstdint>
 #include <optional>
 
@@ -11,6 +12,13 @@ struct Point {
   uint32_t y = 0;
 };
 
+struct Rect {
+  uint32_t x = 0;
+  uint32_t y = 0;
+  uint32_t width = 0;
+  uint32_t height = 0;
+};
+
 struct CopyRegion {
   uint32_t source_x = 0;
   uint32_t source_y = 0;
@@ -19,6 +27,32 @@ struct CopyRegion {
   uint32_t width = 0;
   uint32_t height = 0;
 };
+
+// A sized texture is a crop, not a rescale. Dirty coordinates belong to the
+// source/root image, while the copy destination is relative to the crop origin.
+// An unfilled crop must first copy all available pixels, including the source's
+// initial clear outside the latest resolve. Later writes retain those pixels.
+inline std::optional<CopyRegion> PlanSizedCopy(
+    uint32_t source_width, uint32_t source_height, Point crop_origin,
+    uint32_t crop_width, uint32_t crop_height, bool filled,
+    std::optional<Rect> dirty = std::nullopt) {
+  if (crop_origin.x >= source_width || crop_origin.y >= source_height ||
+      !crop_width || !crop_height) return std::nullopt;
+
+  uint64_t left = crop_origin.x, top = crop_origin.y;
+  uint64_t right = left + std::min(crop_width, source_width - crop_origin.x);
+  uint64_t bottom = top + std::min(crop_height, source_height - crop_origin.y);
+  if (filled && dirty) {
+    left = std::max(left, uint64_t(dirty->x));
+    top = std::max(top, uint64_t(dirty->y));
+    right = std::min(right, uint64_t(dirty->x) + dirty->width);
+    bottom = std::min(bottom, uint64_t(dirty->y) + dirty->height);
+  }
+  if (left >= right || top >= bottom) return std::nullopt;
+  return CopyRegion{uint32_t(left), uint32_t(top), uint32_t(left - crop_origin.x),
+                    uint32_t(top - crop_origin.y), uint32_t(right - left),
+                    uint32_t(bottom - top)};
+}
 
 struct CompositeState {
   bool exists = false;

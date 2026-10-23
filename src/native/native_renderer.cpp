@@ -17,6 +17,8 @@
 #include "native_resolve_layout.h"
 #include "native_stencil_clear.h"
 #include "native_depth_color_clear.h"
+#include "native_zcull.h"
+#include "native_attachment_clear.h"
 
 #include <algorithm>
 #include <array>
@@ -79,8 +81,20 @@ REXCVAR_DEFINE_BOOL(nx_native_gpu_profile, false, "F.E.A.R. NX",
 REXCVAR_DEFINE_BOOL(nx_native_record_thread, false, "F.E.A.R. NX",
                     "Make the Vulkan calls of draws on a second thread, so the command ring "
                     "thread prepares the next draw meanwhile");
+REXCVAR_DEFINE_BOOL(nx_native_fused_gamma, true, "F.E.A.R. NX",
+                    "Apply gamma during final bilinear presentation of 8-bit frontbuffers")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(nx_native_zcull, true, "F.E.A.R. NX",
+                    "Allow persistent NVK ZCULL on depth attachments; preserve contents on growth")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(nx_native_shared_resolves, true, "F.E.A.R. NX",
                     "Write validated tiled resolves directly into one shared destination resource")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(nx_native_precise_resolve_barriers, true, "F.E.A.R. NX",
+                    "Avoid the broad pre-transfer barrier when a resolve uses compute")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(nx_native_full_clear_load_op, true, "F.E.A.R. NX",
+                    "Clear fully covered render areas at attachment load without loading old contents")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(nx_native_msaa, true, "F.E.A.R. NX",
                     "Render with the multisampling the game asks for; off draws every target "
@@ -249,6 +263,9 @@ struct RenderTarget {
   uint32_t width = 0;
   uint32_t height = 0;
   uint64_t last_used_frame = 0;
+  // Eligible for NVK's persistent ZCULL allocation. Transfer destinations are
+  // excluded because transfer writes cannot maintain the depth hierarchy.
+  bool zcull_compatible = false;
   // The last actual color write determines its guest EDRAM sample layout.
   uint32_t last_draw_guest_msaa = UINT32_MAX;
 };
@@ -349,6 +366,15 @@ struct Renderer::Impl {
   VkDeviceMemory stream_memory = VK_NULL_HANDLE;
   uint8_t* stream_mapping = nullptr;
   uint64_t stream_head = 0;  // total bytes ever allocated
+  static constexpr uint64_t kNoStreamPosition = UINT64_MAX;
+  // Stream data referenced by the draw currently being prepared. The renderer
+  // may submit and rotate a submission before that draw is enqueued, so its
+  // ranges must survive independently of any submission's stream_oldest.
+  bool draw_stream_active = false;
+  bool draw_stream_failed = false;
+  bool draw_stream_committed = false;
+  uint64_t draw_stream_oldest = kNoStreamPosition;
+  uint64_t draw_stream_submission_oldest = kNoStreamPosition;
   VkDescriptorPool static_pool = VK_NULL_HANDLE;
   VkDescriptorSet set_shared = VK_NULL_HANDLE;
   VkDescriptorSet set_constants = VK_NULL_HANDLE;
@@ -401,13 +427,13 @@ struct Renderer::Impl {
   bool multisample = true;
   // D24_UNORM_S8_UINT for the game's kD24S8 buffers (nx_native_depth24).
   bool depth24 = false;
-  // The float24 ones (here only shadow maps) become D32_SFLOAT without
-  // stencil, 32 instead of 64 bits per pixel; a stencil test on them passes.
+  // Float24 guest surfaces also have an S8 aspect. Keep it even with compact
+  // D24 storage enabled; dropping it would silently disable their stencil tests.
   VkFormat DepthFormatFor(uint32_t guest_format) const {
     if (!depth24) return kDepthFormat;
     return guest_format == uint32_t(xenos::DepthRenderTargetFormat::kD24S8)
                ? VK_FORMAT_D24_UNORM_S8_UINT
-               : VK_FORMAT_D32_SFLOAT;
+               : kDepthFormat;
   }
   static bool HasStencil(VkFormat format) { return format != VK_FORMAT_D32_SFLOAT; }
   VkDescriptorSetLayout depth_convert_set_layout = VK_NULL_HANDLE;
@@ -676,8 +702,9 @@ struct Renderer::Impl {
     uint32_t view_count = 0;
     VkImageView views[24] = {};
     uint64_t view_ids[24] = {};
-    uint32_t texture_count = 0;
-    void* textures[24] = {};
+    // Keep every uploaded texture alive for the actual draw submission, including
+    // bindings beyond the small view-validation cache above.
+    std::vector<void*> textures;
   };
   FlatMap64<TextureBindings> tb_cache;
 
@@ -763,6 +790,8 @@ struct Renderer::Impl {
   // buffer addresses pointing into the stream.
   std::array<uint32_t, 6 * 32> fetch_words = {};
   std::array<uint64_t, 96> fetch_resolved_frame = {};
+  std::array<uint64_t, 96> fetch_resolved_position = {};
+  std::array<uint8_t, 96> draw_stream_fetch_slots = {};
   uint64_t fetch_words_frame = 0;
   uint64_t fetch_words_submission = 0;
   uint32_t last_fetch_words[6 * 32] = {};
@@ -783,6 +812,7 @@ struct Renderer::Impl {
     const void* shader = nullptr;
     uint64_t frame = 0;
     VkDeviceSize offset = 0;
+    uint64_t stream_position = kNoStreamPosition;
   };
   ReusedUpload last_fetch, last_vs_float, last_ps_float, last_bool_loop;
   SpirvShaderTranslator::SystemConstants last_system_constants = {};
@@ -1095,6 +1125,12 @@ struct Renderer::Impl {
     s.number = submission_number;
     s.frame = frame;
     s.stream_oldest = stream_head;
+    if (draw_stream_active) {
+      draw_stream_submission_oldest = s.stream_oldest;
+      if (draw_stream_oldest != kNoStreamPosition) {
+        s.stream_oldest = std::min(s.stream_oldest, draw_stream_oldest);
+      }
+    }
     VkCommandBufferBeginInfo begin = {};
     begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
@@ -1200,7 +1236,63 @@ struct Renderer::Impl {
     return (position / kStreamSize + 1) * kStreamSize;
   }
 
-  uint8_t* Allocate(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset_out) {
+  struct DrawStreamScope {
+    explicit DrawStreamScope(Impl& renderer) : renderer(renderer) {
+      renderer.draw_stream_active = true;
+      renderer.draw_stream_failed = false;
+      renderer.draw_stream_committed = false;
+      renderer.draw_stream_oldest = kNoStreamPosition;
+      renderer.draw_stream_submission_oldest = renderer.current().stream_oldest;
+      renderer.draw_stream_fetch_slots.fill(0);
+    }
+    ~DrawStreamScope() {
+      if (!renderer.draw_stream_committed && renderer.recording &&
+          renderer.draw_stream_submission_oldest != kNoStreamPosition) {
+        // A skipped draw must not keep reused ranges pinned. Allocations made
+        // by the draw are still covered by the submission's original oldest.
+        renderer.current().stream_oldest = renderer.draw_stream_submission_oldest;
+      }
+      if (!renderer.draw_stream_committed) {
+        for (size_t i = 0; i < renderer.draw_stream_fetch_slots.size(); ++i) {
+          if (renderer.draw_stream_fetch_slots[i] &&
+              renderer.fetch_resolved_frame[i] == renderer.frame) {
+            renderer.fetch_resolved_frame[i] = 0;
+          }
+        }
+      }
+      if (renderer.draw_stream_failed) {
+        // A staging allocation rejected by the draw pin may have cached a
+        // null-texture answer. Retry it in the next draw, including the memo,
+        // slot-view and binding caches which all follow answers_epoch.
+        renderer.textures.InvalidateAnswers();
+      }
+      renderer.draw_stream_active = false;
+      renderer.draw_stream_failed = false;
+      renderer.draw_stream_committed = false;
+      renderer.draw_stream_oldest = kNoStreamPosition;
+      renderer.draw_stream_submission_oldest = kNoStreamPosition;
+      renderer.draw_stream_fetch_slots.fill(0);
+    }
+    DrawStreamScope(const DrawStreamScope&) = delete;
+    DrawStreamScope& operator=(const DrawStreamScope&) = delete;
+    Impl& renderer;
+  };
+
+  void PinDrawStreamPosition(uint64_t position) {
+    if (position == kNoStreamPosition) return;
+    if (draw_stream_active) {
+      draw_stream_oldest = std::min(draw_stream_oldest, position);
+      current().stream_oldest = std::min(current().stream_oldest, position);
+    } else {
+      current().stream_oldest = std::min(current().stream_oldest, position);
+    }
+  }
+
+  uint8_t* Allocate(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset_out,
+                    bool pin_for_draw = true) {
+    if (draw_stream_active && draw_stream_failed) {
+      return nullptr;
+    }
     if (size > kStreamSize / 4) {
       return nullptr;
     }
@@ -1212,6 +1304,11 @@ struct Renderer::Impl {
       start = NextStreamLap(start);
     }
     uint64_t end = start + size;
+    if (draw_stream_active && draw_stream_oldest != kNoStreamPosition &&
+        end - draw_stream_oldest > kStreamSize) {
+      draw_stream_failed = true;
+      return nullptr;
+    }
     // The current submission itself must not wrap onto what it still reads.
     const uint64_t fence_before = frame_fence_wait_ns;
     if (end - current().stream_oldest > kStreamSize) {
@@ -1223,6 +1320,15 @@ struct Renderer::Impl {
         start = NextStreamLap(start);
       }
       end = start + size;
+      if (draw_stream_active) {
+        // BeginRecording restored the unfinished draw's pin.
+        if (draw_stream_oldest != kNoStreamPosition &&
+            end - draw_stream_oldest > kStreamSize) {
+          frame_stream_wait_ns += frame_fence_wait_ns - fence_before;
+          draw_stream_failed = true;
+          return nullptr;
+        }
+      }
     }
     for (Submission& s : submissions) {
       if (&s != &current() && s.pending && end - s.stream_oldest > kStreamSize) {
@@ -1232,6 +1338,9 @@ struct Renderer::Impl {
     frame_stream_wait_ns += frame_fence_wait_ns - fence_before;
     stream_head = end;
     offset_out = VkDeviceSize(start % kStreamSize);
+    if (draw_stream_active && pin_for_draw) {
+      PinDrawStreamPosition(start);
+    }
     return stream_mapping + offset_out;
   }
 
@@ -1371,7 +1480,8 @@ struct Renderer::Impl {
 
   // --- Render targets ------------------------------------------------------------
 
-  RenderTarget* GetRenderTarget(const RenderTargetKey& key, uint32_t min_height);
+  RenderTarget* GetRenderTarget(const RenderTargetKey& key, uint32_t min_height,
+                               bool discard_for_zcull = false);
   void EndPass() {
     if (in_pass) {
       dfn().vkCmdEndRendering(cmd());
@@ -1381,7 +1491,8 @@ struct Renderer::Impl {
       resolve_barrier_pending = true;
     }
   }
-  bool BeginPass(const PassTargets& targets);
+  bool BeginPass(const PassTargets& targets, const VkClearValue* color0_clear = nullptr,
+                 const VkClearValue* depth_clear = nullptr);
 
   // --- Draws ---------------------------------------------------------------------
 
@@ -1611,8 +1722,14 @@ bool Renderer::Impl::Initialize() {
   };
   REXLOG_INFO("[native] Resolve resource mode: {}",
               REXCVAR_GET(nx_native_shared_resolves) ? "shared-direct-v1" : "legacy-composite");
+  REXLOG_INFO("[native] ZCULL depth allocation: {}",
+              REXCVAR_GET(nx_native_zcull) ? "persistent-eligible (growth uses copy fallback)"
+                                         : "legacy-transfer");
   upload.allocate = [this](size_t size, size_t alignment, VkDeviceSize& offset) {
-    uint8_t* result = Allocate(size, alignment, offset);
+    // Upload staging is consumed by the setup copy, not by the draw itself.
+    // The allocator still checks it against active draw pins, while the
+    // submission's own oldest position protects it until uploads complete.
+    uint8_t* result = Allocate(size, alignment, offset, false);
     // An allocation may have started a new submission.
     upload.setup_commands = current().setup;
     upload.submission = submission_number;
@@ -1962,7 +2079,8 @@ bool Renderer::Impl::CreateSwapResources() {
 
   VkDeviceSize ramp_size = 256 * sizeof(uint32_t) * kSubmissionSlots;
   if (!rex::ui::vulkan::util::CreateDedicatedAllocationBuffer(
-          device, ramp_size, VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT,
+          device, ramp_size,
+          VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
           rex::ui::vulkan::util::MemoryPurpose::kUpload, ramp_buffer, ramp_memory)) {
     return false;
   }
@@ -2519,25 +2637,45 @@ VkPipeline Renderer::Impl::CreatePipeline(const PipelineJob& job) {
 
 // --- Render targets ------------------------------------------------------------------
 
-RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32_t min_height) {
+RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& requested_key,
+                                            uint32_t min_height, bool discard_for_zcull) {
+  RenderTargetKey key = requested_key;
+  if (!key.is_depth) {
+    // These guest aliases use identical host storage. Keep their contents in
+    // one image; shader gamma/sign behavior still comes from the raw registers.
+    auto format = xenos::GetStorageColorFormat(xenos::ColorRenderTargetFormat(key.format));
+    if (format == xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA) {
+      format = xenos::ColorRenderTargetFormat::k_8_8_8_8;
+    }
+    key.format = uint32_t(format);
+  }
   min_height = std::clamp(min_height, 16u, 2048u);
+  const bool want_zcull = key.is_depth && REXCVAR_GET(nx_native_zcull);
   auto it = render_targets.find(key);
   RenderTarget* old = nullptr;
+  bool replace_for_zcull = false;
   if (it != render_targets.end()) {
     old = it->second.get();
     old->last_used_frame = frame;
-    if (old->height >= min_height) {
+    // The caller has proved that the next guest clear overwrites every depth
+    // and stencil sample, including padded rows. Growth must still preserve
+    // the old contents via the transfer fallback.
+    replace_for_zcull = discard_for_zcull && want_zcull && !old->zcull_compatible &&
+                        old->height >= min_height;
+    if (old->height >= min_height && !replace_for_zcull) {
       return old;
     }
   }
   auto rt = std::make_unique<RenderTarget>();
   rt->key = key;
   rt->width = std::max(key.pitch, 1u);
-  rt->height = rex::align(min_height, 16u);
+  rt->height = replace_for_zcull ? old->height : rex::align(min_height, 16u);
   rt->samples = VkSampleCountFlagBits(1u << key.msaa);
   rt->format = key.is_depth ? DepthFormatFor(key.format)
                             : ColorFormatToVk(xenos::ColorRenderTargetFormat(key.format));
   rt->last_used_frame = frame;
+  const bool preserve_old = old && !replace_for_zcull;
+  rt->zcull_compatible = want_zcull && !preserve_old;
   VkImageCreateInfo info = {};
   info.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
   info.imageType = VK_IMAGE_TYPE_2D;
@@ -2550,11 +2688,15 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
   info.usage = (key.is_depth ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
                                    VK_IMAGE_USAGE_SAMPLED_BIT
                              : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT) |
-               VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+               VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+  if (!rt->zcull_compatible) {
+    info.usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+  }
   info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+  VkDeviceSize allocation_size = 0;
   if (!rex::ui::vulkan::util::CreateDedicatedAllocationImage(
           device, info, rex::ui::vulkan::util::MemoryPurpose::kDeviceLocal, rt->image,
-          rt->memory)) {
+          rt->memory, nullptr, &allocation_size)) {
     REXLOG_ERROR("[native] Could not create a {}x{} render target", rt->width, rt->height);
     return old;
   }
@@ -2584,16 +2726,39 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
   VkImageMemoryBarrier barrier = {};
   barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
   barrier.srcAccessMask = 0;
-  barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+  const VkPipelineStageFlags init_stages =
+      rt->zcull_compatible ? VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                 VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT
+                           : VK_PIPELINE_STAGE_TRANSFER_BIT;
+  const VkAccessFlags init_access = rt->zcull_compatible
+                                       ? VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT
+                                       : VK_ACCESS_TRANSFER_WRITE_BIT;
+  barrier.dstAccessMask = init_access;
   barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
   barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
   barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
   barrier.image = rt->image;
   barrier.subresourceRange = view.subresourceRange;
-  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+  dfn().vkCmdPipelineBarrier(c, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, init_stages,
                              0, 0, nullptr, 0, nullptr, 1, &barrier);
-  if (key.is_depth) {
+  if (rt->zcull_compatible) {
+    // Attachment writes maintain persistent ZCULL metadata; a transfer clear
+    // would require TRANSFER_DST and prevent its allocation in NVK.
+    VkRenderingAttachmentInfo depth = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
+    depth.imageView = rt->view;
+    depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+    depth.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR;
+    depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
+    depth.clearValue.depthStencil = {1.0f, 0};
+    VkRenderingInfo rendering = {VK_STRUCTURE_TYPE_RENDERING_INFO};
+    rendering.renderArea.extent = {rt->width, rt->height};
+    rendering.layerCount = 1;
+    rendering.pDepthAttachment = &depth;
+    rendering.pStencilAttachment = HasStencil(rt->format) ? &depth : nullptr;
+    dfn().vkCmdBeginRendering(c, &rendering);
+    dfn().vkCmdEndRendering(c);
+  } else if (key.is_depth) {
     VkClearDepthStencilValue clear = {1.0f, 0};
     vkCmdClearDepthStencilImage(c, rt->image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                                       &view.subresourceRange);
@@ -2602,7 +2767,7 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
     dfn().vkCmdClearColorImage(c, rt->image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1,
                                &view.subresourceRange);
   }
-  if (old) {
+  if (preserve_old) {
     VkImageCopy copy = {};
     copy.srcSubresource = {aspect, 0, 0, 1};
     copy.dstSubresource = copy.srcSubresource;
@@ -2617,17 +2782,19 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
                                0, nullptr);
     dfn().vkCmdCopyImage(c, old->image, VK_IMAGE_LAYOUT_GENERAL, rt->image,
                          VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+  }
+  if (old) {
     // Destroyed once this frame is done on the GPU (waiting for idle here
     // was a visible hitch).
     retired_render_targets.push_back({frame, old->image, old->view, old->sample_view, old->memory});
   }
   VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                           VK_ACCESS_TRANSFER_WRITE_BIT,
+                           init_access,
                            VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
                                VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
                                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
-  dfn().vkCmdPipelineBarrier(cmd(), VK_PIPELINE_STAGE_TRANSFER_BIT,
+  dfn().vkCmdPipelineBarrier(cmd(), init_stages,
                              VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
                                  VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
                                  VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
@@ -2636,13 +2803,18 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& key, uint32
   render_targets[key] = std::move(rt);
   ++stats().render_targets_created;
   ++rt_generation;
-  REXLOG_INFO("[native] Render target {}x{} {} format {} at tile {}, {}x host MSAA, depth_guest_samples={}", result->width,
-              result->height, key.is_depth ? "depth" : "color", key.format, key.base_tiles,
-              1u << key.msaa, key.is_depth ? 1u << key.guest_msaa : 0);
+  REXLOG_INFO("[native] Render target {}x{} {} format {} at tile {}, {}x host MSAA, "
+              "depth_guest_samples={}, zcull_eligible={}, allocation_bytes={}",
+              result->width, result->height, key.is_depth ? "depth" : "color", key.format,
+              key.base_tiles, 1u << key.msaa, key.is_depth ? 1u << key.guest_msaa : 0,
+              result->zcull_compatible, allocation_size);
   return result;
 }
 
-bool Renderer::Impl::BeginPass(const PassTargets& targets) {
+bool Renderer::Impl::BeginPass(const PassTargets& targets, const VkClearValue* color0_clear,
+                               const VkClearValue* depth_clear) {
+  // A load clear needs a new rendering scope even when attachments match.
+  if (in_pass && (color0_clear || depth_clear)) EndPass();
   if (in_pass) {
     // Track whether the previous superset check would have reused an
     // incompatible dynamic-rendering scope.
@@ -2703,7 +2875,9 @@ bool Renderer::Impl::BeginPass(const PassTargets& targets) {
     if (RenderTarget* rt = targets.color[i]) {
       colors[i].imageView = rt->view;
       colors[i].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-      colors[i].loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+      colors[i].loadOp = i == 0 && color0_clear ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                               : VK_ATTACHMENT_LOAD_OP_LOAD;
+      if (i == 0 && color0_clear) colors[i].clearValue = *color0_clear;
       colors[i].storeOp = VK_ATTACHMENT_STORE_OP_STORE;
       color_count = i + 1;
       width = std::min(width, rt->width);
@@ -2715,7 +2889,8 @@ bool Renderer::Impl::BeginPass(const PassTargets& targets) {
   if (targets.depth) {
     depth.imageView = targets.depth->view;
     depth.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    depth.loadOp = VK_ATTACHMENT_LOAD_OP_LOAD;
+    depth.loadOp = depth_clear ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD;
+    if (depth_clear) depth.clearValue = *depth_clear;
     depth.storeOp = VK_ATTACHMENT_STORE_OP_STORE;
     width = std::min(width, targets.depth->width);
     height = std::min(height, targets.depth->height);
@@ -3226,7 +3401,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   const RegisterFile& r = *regs;
   // The reasons, in order: 0 no surface pitch, 1 no vertex shader, 2 memory
   // export, 3 no rasterization, 4 primitive type, 5 no geometry shaders,
-  // 6 translation, 7 no render target, 8 index data, 9 stream full,
+  // 6 translation, 7 no render target, 8 vertex/index data, 9 stream full,
   // 10 layout, 11 descriptors, 12 geometry shader, 13 pipeline, 14 pass,
   // 15 immediate indices.
   auto skip = [&](uint32_t reason) {
@@ -3259,15 +3434,22 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
                    Renderer::Mix(0x10003, uint32_t(reinterpret_cast<uintptr_t>(active_ps) >> 32)) ^
                    Renderer::Mix(0x10004, (initiator.value & 0xFFFF) | 0x80000000u);
     if (specialize_signs) {
-      // The pipeline depends on the signs of the textures the shaders read.
+      // The analysis lists texture-fetch instructions, not unique slots. XORing
+      // the same slot twice would erase its signs from this key and could reuse
+      // a pipeline specialized for a previous texture's signedness.
+      uint32_t signed_slots = 0;
       for (VulkanShader* shader : {active_vs, active_ps}) {
         if (!shader || !shader->is_ucode_analyzed()) continue;
         for (const auto& binding : shader->texture_bindings()) {
-          key ^= Renderer::Mix(
-              0x10010 + binding.fetch_constant,
-              0x100u | rex::graphics::texture_util::SwizzleSigns(
-                           r.GetTextureFetch(binding.fetch_constant)));
+          signed_slots |= uint32_t(1) << binding.fetch_constant;
         }
+      }
+      uint32_t slot;
+      while (rex::bit_scan_forward(signed_slots, &slot)) {
+        signed_slots &= ~(uint32_t(1) << slot);
+        key ^= Renderer::Mix(
+            0x10010 + slot,
+            0x100u | rex::graphics::texture_util::SwizzleSigns(r.GetTextureFetch(slot)));
       }
     }
     auto found = setup_cache.find(key);
@@ -3299,6 +3481,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
 
   // Indices.
   BeginRecording();
+  DrawStreamScope draw_stream_scope(*this);
   auto dma_size = r.Get<reg::VGT_DMA_SIZE>();
   bool indexed = initiator.source_select != xenos::SourceSelect::kAutoIndex;
   bool index32 = initiator.index_size == xenos::IndexFormat::kInt32;
@@ -3368,7 +3551,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       uint64_t found = FindRange(index_key);
       if (found != UINT64_MAX && stream_head - found < kStreamSize / 2) {
         index_offset = VkDeviceSize(found % kStreamSize);
-        current().stream_oldest = std::min(current().stream_oldest, found);
+        PinDrawStreamPosition(found);
         reused = true;
       }
     }
@@ -3447,10 +3630,13 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     while (rex::bit_scan_forward(bits, &bit)) {
       bits &= ~(1u << bit);
       uint32_t fetch_index = word * 32 + bit;
+      draw_stream_fetch_slots[fetch_index] = 1;
       if (fetch_resolved_frame[fetch_index] == frame) {
+        // The shader words still point at this stream copy even when the
+        // per-frame fetch resolution is a fast hit.
+        PinDrawStreamPosition(fetch_resolved_position[fetch_index]);
         continue;
       }
-      fetch_resolved_frame[fetch_index] = frame;
       uint32_t guest_dword0 =
           r[rex::graphics::XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + fetch_index * 2];
       uint32_t dword1 =
@@ -3461,7 +3647,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       uint32_t size = (dword1 >> 2) & 0xFFFFFF;  // in words
       uint32_t bytes = std::min(size * 4, 16u << 20);
       if (!bytes || uint64_t(address) + bytes > 0x20000000u) {
-        continue;
+        return skip(8);
       }
       const uint8_t* source = memory->TranslatePhysical<const uint8_t*>(address);
       VertexHash& known = vertex_hashes[(uint64_t(address) << 32) | bytes];
@@ -3469,17 +3655,22 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       VertexRangeKey range_key = {address, bytes, known.hash};
       uint64_t found = FindRange(range_key);
       VkDeviceSize range_offset;
+      uint64_t range_position;
       if (found != UINT64_MAX && stream_head - found < kStreamSize / 2) {
         range_offset = VkDeviceSize(found % kStreamSize);
-        current().stream_oldest = std::min(current().stream_oldest, found);
+        range_position = found;
+        PinDrawStreamPosition(range_position);
       } else {
         uint8_t* out = Allocate(bytes, 16, range_offset);
-        if (!out) continue;
+        if (!out) return skip(9);
         std::memcpy(out, source, bytes);
         stats().vertex_bytes_copied += bytes;
-        AddRange(range_key, stream_head - bytes);
+        range_position = stream_head - bytes;
+        AddRange(range_key, range_position);
       }
       dword0 = (guest_dword0 & 0x3) | uint32_t(range_offset);
+      fetch_resolved_position[fetch_index] = range_position;
+      fetch_resolved_frame[fetch_index] = frame;
     }
   }
   if (vertex_ranges.size() > 65536) {
@@ -3492,12 +3683,14 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   if (last_fetch.submission == submission_number &&
       !std::memcmp(last_fetch_words, fetch_words.data(), sizeof(last_fetch_words))) {
     fetch_offset = last_fetch.offset;
+    PinDrawStreamPosition(last_fetch.stream_position);
   } else {
     uint8_t* fetch_out = Allocate(kFetchConstantsBytes, ubo_alignment, fetch_offset);
     if (!fetch_out) return skip(9);
     std::memcpy(fetch_out, fetch_words.data(), kFetchConstantsBytes);
     std::memcpy(last_fetch_words, fetch_words.data(), sizeof(last_fetch_words));
-    last_fetch = {submission_number, 0, nullptr, frame, fetch_offset};
+    last_fetch = {submission_number, 0, nullptr, frame, fetch_offset,
+                  stream_head - kFetchConstantsBytes};
   }
 
   auto write_float_constants = [&](const Shader::ConstantRegisterMap& map, uint32_t base_register,
@@ -3521,18 +3714,25 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     return true;
   };
   VkDeviceSize vs_float_offset, ps_float_offset, bool_loop_offset, system_offset;
+  const VkDeviceSize vs_float_bytes =
+      VkDeviceSize(std::max(vs_constants.float_count, 1u)) * 4 * sizeof(float);
   if (Reusable(last_vs_float, owner->vs_float_generation_, vs)) {
     vs_float_offset = last_vs_float.offset;
+    PinDrawStreamPosition(last_vs_float.stream_position);
   } else {
     if (!write_float_constants(vs_constants, rex::graphics::XE_GPU_REG_SHADER_CONSTANT_000_X,
                                vs_float_offset)) {
       return skip(9);
     }
-    last_vs_float = {submission_number, owner->vs_float_generation_, vs, frame, vs_float_offset};
+    last_vs_float = {submission_number, owner->vs_float_generation_, vs, frame, vs_float_offset,
+                     stream_head - vs_float_bytes};
   }
   if (ps) {
+    const VkDeviceSize ps_float_bytes =
+        VkDeviceSize(std::max(ps->constant_register_map().float_count, 1u)) * 4 * sizeof(float);
     if (Reusable(last_ps_float, owner->ps_float_generation_, ps)) {
       ps_float_offset = last_ps_float.offset;
+      PinDrawStreamPosition(last_ps_float.stream_position);
     } else {
       if (!write_float_constants(ps->constant_register_map(),
                                  rex::graphics::XE_GPU_REG_SHADER_CONSTANT_256_X,
@@ -3540,20 +3740,21 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
         return skip(9);
       }
       last_ps_float = {submission_number, owner->ps_float_generation_, ps, frame,
-                       ps_float_offset};
+                       ps_float_offset, stream_head - ps_float_bytes};
     }
   } else {
     ps_float_offset = vs_float_offset;
   }
   if (Reusable(last_bool_loop, owner->bool_loop_generation_, nullptr)) {
     bool_loop_offset = last_bool_loop.offset;
+    PinDrawStreamPosition(last_bool_loop.stream_position);
   } else {
     uint8_t* bool_loop = Allocate(kBoolLoopConstantsBytes, ubo_alignment, bool_loop_offset);
     if (!bool_loop) return skip(9);
     std::memcpy(bool_loop, &r[rex::graphics::XE_GPU_REG_SHADER_CONSTANT_BOOL_000_031],
                 kBoolLoopConstantsBytes);
     last_bool_loop = {submission_number, owner->bool_loop_generation_, nullptr, frame,
-                      bool_loop_offset};
+                      bool_loop_offset, stream_head - kBoolLoopConstantsBytes};
   }
 
   // Textures and samplers, reused while no fetch slot they come from was
@@ -3615,8 +3816,8 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
                 ((tb.frame == frame && tb.submission == submission_number) ||
                  tb.valid_until >= frame);
   if (tb_hit && (tb.frame != frame || tb.submission != submission_number)) {
-    for (uint32_t i = 0; i < tb.texture_count; ++i) {
-      textures.Touch(tb.textures[i], submission_number);
+    for (void* texture : tb.textures) {
+      textures.Touch(texture, submission_number);
     }
     tb.frame = frame;
     tb.submission = submission_number;
@@ -3647,12 +3848,9 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
           tb.view_ids[tb.view_count] = textures.ViewId(info.imageView);
         }
         ++tb.view_count;
-        if (slot_texture) {
-          if (tb.texture_count < 24) {
-            tb.textures[tb.texture_count++] = slot_texture;
-          } else {
-            tb.valid_until = frame;
-          }
+        if (slot_texture &&
+            std::find(tb.textures.begin(), tb.textures.end(), slot_texture) == tb.textures.end()) {
+          tb.textures.push_back(slot_texture);
         }
       }
       for (const auto& binding : sampler_bindings) {
@@ -3744,16 +3942,32 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   }
   if (system_same) {
     system_offset = last_system.offset;
+    PinDrawStreamPosition(last_system.stream_position);
   } else {
     uint8_t* system_out =
         Allocate(sizeof(SpirvShaderTranslator::SystemConstants), ubo_alignment, system_offset);
     if (!system_out) return skip(9);
     std::memcpy(system_out, &system_constants, sizeof(system_constants));
     std::memcpy(&last_system_constants, &system_constants, sizeof(system_constants));
-    last_system = {submission_number, 0, nullptr, frame, system_offset};
+    last_system = {submission_number, 0, nullptr, frame, system_offset,
+                   stream_head - sizeof(SpirvShaderTranslator::SystemConstants)};
   }
 
-  // Record.
+  // Texture staging can fail the active draw's overlap guard even though the
+  // texture cache returns a null view as its ordinary allocation fallback.
+  if (draw_stream_failed) return skip(9);
+
+  // Texture uploads or the constant allocation above may have submitted the
+  // old command buffers and started a new submission. Pin all bindings to the
+  // submission that will actually record this draw, so a later upload cannot
+  // overwrite an image already referenced by this submission's main commands.
+  for (void* texture : tb.textures) {
+    textures.Touch(texture, submission_number);
+  }
+  tb.frame = frame;
+  tb.submission = submission_number;
+
+  // Record. BeginPass does not allocate stream data or rotate submissions.
   if (!BeginPass(targets)) return skip(14);
   DrawCommand d;
   d.commands = current().main;
@@ -3909,6 +4123,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     }
   }
   SubmitDraw(d);
+  draw_stream_committed = true;
   ProfileDraw();
   ++frame_draw_count;
   ++stats().draws;
@@ -4296,25 +4511,32 @@ void Renderer::Impl::Resolve() {
               (copy_control.copy_command == xenos::CopyCommand::kRaw ||
                copy_control.copy_command == xenos::CopyCommand::kConvert);
   if (copy) {
-    VkMemoryBarrier to_transfer = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
-                                   VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
-                                       VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
-                                       VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
-                                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
-                                       VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
-                                       VK_ACCESS_TRANSFER_READ_BIT |
-                                       VK_ACCESS_TRANSFER_WRITE_BIT,
-                                   VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
-    dfn().vkCmdPipelineBarrier(c,
-                               VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
-                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
-                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
-                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
-                                   VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
-                                   VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-                                   VK_PIPELINE_STAGE_TRANSFER_BIT,
-                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &to_transfer, 0, nullptr,
-                               0, nullptr);
+    const bool precise_resolve_barriers = REXCVAR_GET(nx_native_precise_resolve_barriers);
+    auto barrier_to_transfer = [&]() {
+      VkMemoryBarrier to_transfer = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                         VK_ACCESS_COLOR_ATTACHMENT_READ_BIT |
+                                         VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+                                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                                         VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT |
+                                         VK_ACCESS_TRANSFER_READ_BIT |
+                                         VK_ACCESS_TRANSFER_WRITE_BIT,
+                                     VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+      dfn().vkCmdPipelineBarrier(c,
+                                 VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                                     VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                                     VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                                     VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT |
+                                     VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                                     VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                                     VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                 VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &to_transfer, 0, nullptr,
+                                 0, nullptr);
+    };
+    // Preserve the old ordering when requested. In precise mode the compute
+    // routes provide their own dependency; transfer routes issue this barrier
+    // immediately before the operation that consumes the render target.
+    if (!precise_resolve_barriers) barrier_to_transfer();
     // Legacy exact-address size; shared mode below uses the complete pitch
     // and height instead. Textures sample the image across its whole size, and the game
     // samples its full-screen resolves at 1040 wide, where the pitch made the
@@ -4600,6 +4822,7 @@ void Renderer::Impl::Resolve() {
               0, 1, &after_compute, 0, nullptr, 0, nullptr);
         } else if (msaa == 0 && depth_scratch && depth_convert_pipeline &&
                    packed_offset + texels * 4 <= kDepthScratchSize) {
+          if (precise_resolve_barriers) barrier_to_transfer();
           VkBufferImageCopy regions[2] = {};
           regions[0].imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
           regions[0].imageOffset = {x0, y0, 0};
@@ -4655,7 +4878,8 @@ void Renderer::Impl::Resolve() {
               out.bufferOffset = packed_offset;
               dfn().vkCmdCopyBufferToImage(c, depth_scratch, words->image,
                                            VK_IMAGE_LAYOUT_GENERAL, 1, &out);
-              textures.CopyToSized(*words, c);
+              textures.CopyToSized(*words, c,
+                  resolve_layout::Rect{uint32_t(dest_x), uint32_t(dest_y), width, height});
             }
           }
         } else {
@@ -4667,6 +4891,7 @@ void Renderer::Impl::Resolve() {
           }
         }
       } else if (msaa) {
+        if (precise_resolve_barriers) barrier_to_transfer();
         VkImageResolve resolve = {};
         resolve.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         resolve.dstSubresource = resolve.srcSubresource;
@@ -4679,6 +4904,7 @@ void Renderer::Impl::Resolve() {
                  ComputeColorCopy(c, source->view, dest->view, x0, y0, dest_x, dest_y, width, height)) {
         // Done by compute (see copy_color.cs.glsl).
       } else {
+        if (precise_resolve_barriers) barrier_to_transfer();
         VkImageCopy region = {};
         region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.dstSubresource = region.srcSubresource;
@@ -4688,7 +4914,8 @@ void Renderer::Impl::Resolve() {
         dfn().vkCmdCopyImage(c, source->image, VK_IMAGE_LAYOUT_GENERAL, dest->image,
                              VK_IMAGE_LAYOUT_GENERAL, 1, &region);
       }
-      textures.CopyToSized(*dest, c);
+      textures.CopyToSized(*dest, c,
+          resolve_layout::Rect{uint32_t(dest_x), uint32_t(dest_y), width, height});
       // The shared-resource mode never creates segment resolve images or
       // invokes the legacy composition stage, including for unsupported writes.
       if (!shared_mode) {
@@ -4754,8 +4981,24 @@ void Renderer::Impl::Resolve() {
       clear_targets.color[0] = color_target;
     }
     EndPass();
-    if (BeginPass(clear_targets)) {
-      c = cmd();
+    if (depth_target && !depth_target->zcull_compatible && REXCVAR_GET(nx_native_zcull)) {
+      const uint32_t clear_width = color_target
+                                       ? std::min(depth_target->width, color_target->width)
+                                       : depth_target->width;
+      const uint32_t clear_height = color_target
+                                        ? std::min(depth_target->height, color_target->height)
+                                        : depth_target->height;
+      if (CanDiscardDepthForClear(depth_target->width, depth_target->height, x0, y0,
+                                  width, height, clear_width, clear_height)) {
+        // A target grown via transfer copy can regain persistent ZCULL after
+        // its contents are no longer needed. Partial clears retain it intact.
+        // Copy the key: replacing the target invalidates its old C++ object.
+        const RenderTargetKey depth_key = depth_target->key;
+        depth_target = GetRenderTarget(depth_key, depth_target->height, true);
+        clear_targets.depth = depth_target;
+      }
+    }
+    if (!clear_targets.Empty()) {
       VkClearAttachment attachments[2] = {};
       uint32_t count = 0;
       if (depth_target) {
@@ -4827,14 +5070,34 @@ void Renderer::Impl::Resolve() {
         }
       }
       VkClearRect rect = {};
+      // Match BeginPass's render area, including clipping between color and
+      // depth attachments. A full-area load clear preserves allocation padding
+      // outside this area, just like the previous rectangle clear.
+      const uint32_t clear_width = depth_target
+          ? (color_target ? std::min(depth_target->width, color_target->width)
+                          : depth_target->width)
+          : color_target->width;
+      const uint32_t clear_height = depth_target
+          ? (color_target ? std::min(depth_target->height, color_target->height)
+                          : depth_target->height)
+          : color_target->height;
       rect.rect.offset = {x0, y0};
-      rect.rect.extent = {std::min(width, pass_extent.width - std::min(uint32_t(x0), pass_extent.width)),
-                          std::min(height, pass_extent.height - std::min(uint32_t(y0), pass_extent.height))};
+      rect.rect.extent = {std::min(width, clear_width - std::min(uint32_t(x0), clear_width)),
+                          std::min(height, clear_height - std::min(uint32_t(y0), clear_height))};
       rect.layerCount = 1;
-      if (rect.rect.extent.width && rect.rect.extent.height) {
-        dfn().vkCmdClearAttachments(c, count, attachments, 1, &rect);
+      const bool load_clear = REXCVAR_GET(nx_native_full_clear_load_op) &&
+          CanUseAttachmentLoadClear(x0, y0, rect.rect.extent.width, rect.rect.extent.height,
+                                     clear_width, clear_height);
+      const VkClearValue* color_clear = load_clear && color_target
+          ? &attachments[depth_target ? 1 : 0].clearValue : nullptr;
+      const VkClearValue* depth_clear = load_clear && depth_target
+          ? &attachments[0].clearValue : nullptr;
+      if (BeginPass(clear_targets, color_clear, depth_clear)) {
+        if (!load_clear && rect.rect.extent.width && rect.rect.extent.height) {
+          dfn().vkCmdClearAttachments(cmd(), count, attachments, 1, &rect);
+        }
+        EndPass();
       }
-      EndPass();
     }
   }
 
@@ -4902,8 +5165,10 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
     guest_swizzle = fetch.swizzle;
   }
   uint32_t source_width = 0, source_height = 0;
+  ResolvePresentSource present_source;
   VkImageView source_view =
-      textures.GetResolveDestinationView2D(address, guest_swizzle, &source_width, &source_height);
+      textures.GetResolveDestinationView2D(address, guest_swizzle, &source_width, &source_height,
+                                           &present_source);
   static uint32_t missing_logged = 0;
   if (!source_view && missing_logged < 8) {
     ++missing_logged;
@@ -4946,7 +5211,82 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
             resolve_rect.allocation_height);
       }
     }
-    presenter->RefreshGuestOutput(
+    bool fused_presented = false;
+    if (REXCVAR_GET(nx_native_fused_gamma)) {
+      auto* vulkan_presenter = static_cast<rex::ui::vulkan::VulkanPresenter*>(presenter);
+      fused_presented = vulkan_presenter->RefreshGuestOutputWithGammaTable(
+          width, height, display_width, display_height, present_source.format,
+          present_source.components,
+          [&](rex::ui::vulkan::VulkanPresenter::VulkanGuestOutputRefreshContext& context) {
+            BeginRecording();
+            EndPass();
+            FlushResolveBarrier();
+            const uint32_t slot = uint32_t(submission_number % kSubmissionSlots);
+            const VkDeviceSize ramp_offset = sizeof(gamma_ramp) * slot;
+            std::memcpy(ramp_mapping + ramp_offset, gamma_ramp, sizeof(gamma_ramp));
+            VkCommandBuffer c = cmd();
+            // Keep a stable, uncorrected mailbox snapshot. Its view carries the
+            // same guest/host swizzle as source_view (image copies ignore views).
+            VkImageMemoryBarrier image_barrier = {};
+            image_barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+            image_barrier.srcAccessMask = context.image_ever_written_previously()
+                                             ? VK_ACCESS_SHADER_READ_BIT : 0;
+            image_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            image_barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+            image_barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            image_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            image_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            image_barrier.image = context.image();
+            image_barrier.subresourceRange = rex::ui::vulkan::util::InitializeSubresourceRange();
+            VkBufferMemoryBarrier ramp_barrier = {};
+            ramp_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
+            ramp_barrier.srcAccessMask = image_barrier.srcAccessMask;
+            ramp_barrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            ramp_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            ramp_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+            ramp_barrier.buffer = context.gamma_table_buffer();
+            ramp_barrier.size = VK_WHOLE_SIZE;
+            dfn().vkCmdPipelineBarrier(
+                c, context.image_ever_written_previously()
+                       ? VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT : VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &ramp_barrier, 1, &image_barrier);
+            VkImageCopy copy = {};
+            copy.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            copy.srcSubresource.layerCount = 1;
+            copy.dstSubresource = copy.srcSubresource;
+            copy.extent = {width, height, 1};
+            dfn().vkCmdCopyImage(c, present_source.image, VK_IMAGE_LAYOUT_GENERAL,
+                                  context.image(), VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+            VkBufferCopy ramp_copy = {ramp_offset, 0, sizeof(gamma_ramp)};
+            dfn().vkCmdCopyBuffer(c, ramp_buffer, context.gamma_table_buffer(), 1, &ramp_copy);
+            image_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            image_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            image_barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+            image_barrier.newLayout =
+                rex::ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout;
+            ramp_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+            ramp_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+            // Complete the source read before a later resolve overwrites it.
+            VkMemoryBarrier after_copy = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                                            VK_ACCESS_TRANSFER_READ_BIT,
+                                            VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+            dfn().vkCmdPipelineBarrier(
+                c, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT |
+                    VK_PIPELINE_STAGE_TRANSFER_BIT,
+                0, 1, &after_copy, 1, &ramp_barrier, 1, &image_barrier);
+            Submit();
+            context.SetIs8bpc(true);
+            return true;
+          });
+    }
+    static int logged_fused_present = -1;
+    if (logged_fused_present != int(fused_presented)) {
+      logged_fused_present = int(fused_presented);
+      REXLOG_INFO("[native] Final gamma: {} (source format {})",
+                  fused_presented ? "fused" : "separate", uint32_t(present_source.format));
+    }
+    if (!fused_presented) presenter->RefreshGuestOutput(
         width, height, display_width, display_height,
         [&](rex::ui::Presenter::GuestOutputRefreshContext& context) -> bool {
           auto& vulkan_context = static_cast<

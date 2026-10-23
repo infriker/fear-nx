@@ -1,0 +1,16 @@
+{
+  "base_tree": "c7fb3c0f1a588b268115bf0dceb24f0c26eb1ae0",
+  "apply_after": "rexglue-sdk.patch",
+  "patch": "gamma-present.patch",
+  "sha256": "982247c8ce5533b9ae84b799644169edcad8c4eaecbd7af00491ec3e18837a6a",
+  "files_sha256": {
+    "include/rex/ui/presenter.h": "8ca942db7af9cfc3dc441d615498475f152ea8baaf710f2394ae94382a3f8c5c",
+    "include/rex/ui/vulkan/presenter.h": "3918e067e97f396dac84f1a4480d7ee31979d1f980d6373fa3d0660833bca958",
+    "src/ui/shaders/guest_output_bilinear_gamma.frag.glsl": "568302a17cd4539d6ba518e24ea8537b86e80f5245248fa4dbc815db380cf9e6",
+    "src/ui/shaders/vulkan_spirv/guest_output_bilinear_gamma_dither_ps.h": "597270b4634ac2b105f2125e7bfe05f62e98a3db73b58ae46cdcf7b343f33f9b",
+    "src/ui/shaders/vulkan_spirv/guest_output_bilinear_gamma_ps.h": "98b1ad70b82a5654c53b4ff9fea450373c8524f45d48a30729bf792d44cfb305",
+    "src/ui/vulkan/vulkan_presenter.cpp": "1a9c74fe164a90f5af754b6a6a0ae363d6328d5fa0587a178fee99ceb1ce6832"
+  },
+  "patched_tree": "18c2fda769e63e0be13006be7025ebab79c2de31",
+  "validation": "Applied to documented base tree in a separate index; main SDK index unchanged."
+}

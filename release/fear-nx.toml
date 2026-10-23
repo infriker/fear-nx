@@ -1,14 +1,18 @@
 # F.E.A.R. NX release settings. See docs/native-renderer.md.
 [nx]
 native_shared_resolves = true
-native_gpu_profile = true
+native_gpu_profile = false
 native_max_anisotropy = 2
 native_depth24 = true
 native_msaa = false
 native_async_pipelines = true
 native_record_thread = false
+native_fused_gamma = true
+native_zcull = true
+native_precise_resolve_barriers = true
+native_full_clear_load_op = true
 renderer = "native"
-native_trace_output = true
+native_trace_output = false
 
 [input]
 xbox_layout = false
@@ -35,9 +39,10 @@ nvmap_mb = 0
 ab_lap_after_s = 0
 
 [log]
-level = "debug"
-flush_level = "debug"
-flush_interval = 1
+level = "warn"
+flush_level = "error"
+flush_interval = 5
 
 [gpu]
 specialize_texture_signs = true
+implicit_lod_sampling = true
