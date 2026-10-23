@@ -1,0 +1,30 @@
+diff --git a/cmake/rexglue_switch.cmake b/cmake/rexglue_switch.cmake
+--- a/cmake/rexglue_switch.cmake
++++ b/cmake/rexglue_switch.cmake
+@@ -138,3 +138,6 @@ function(rexglue_switch_add_nro target_name)
+-    cmake_parse_arguments(ARG "" "NAME;AUTHOR;VERSION;ICON" "" ${ARGN})
++    cmake_parse_arguments(ARG "" "NAME;AUTHOR;VERSION;ICON;OUTPUT_NAME" "" ${ARGN})
++    if(NOT ARG_OUTPUT_NAME)
++        set(ARG_OUTPUT_NAME "${target_name}")
++    endif()
+     if(NOT ARG_NAME)
+         set(ARG_NAME "${target_name}")
+@@ -158,12 +161,12 @@ function(rexglue_switch_add_nro target_name)
+     set(_dir "$<TARGET_FILE_DIR:${target_name}>")
+     add_custom_command(TARGET ${target_name} POST_BUILD
+         COMMAND "${REXGLUE_NACPTOOL}" --create "${ARG_NAME}" "${ARG_AUTHOR}" "${ARG_VERSION}"
+-            "${_dir}/${target_name}.nacp"
++            "${_dir}/${ARG_OUTPUT_NAME}.nacp"
+         COMMAND "${CMAKE_COMMAND}" -E copy "$<TARGET_FILE:${target_name}>"
+-            "${_dir}/${target_name}.stripped.elf"
+-        COMMAND "${CMAKE_STRIP}" --strip-all "${_dir}/${target_name}.stripped.elf"
+-        COMMAND "${REXGLUE_ELF2NRO}" "${_dir}/${target_name}.stripped.elf"
+-            "${_dir}/${target_name}.nro" "--nacp=${_dir}/${target_name}.nacp" "--icon=${ARG_ICON}"
+-        COMMENT "Packaging ${target_name}.nro"
++            "${_dir}/${ARG_OUTPUT_NAME}.stripped.elf"
++        COMMAND "${CMAKE_STRIP}" --strip-all "${_dir}/${ARG_OUTPUT_NAME}.stripped.elf"
++        COMMAND "${REXGLUE_ELF2NRO}" "${_dir}/${ARG_OUTPUT_NAME}.stripped.elf"
++            "${_dir}/${ARG_OUTPUT_NAME}.nro" "--nacp=${_dir}/${ARG_OUTPUT_NAME}.nacp" "--icon=${ARG_ICON}"
++        COMMENT "Packaging ${ARG_OUTPUT_NAME}.nro"
+         VERBATIM)
+ endfunction()

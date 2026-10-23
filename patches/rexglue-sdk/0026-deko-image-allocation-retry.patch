@@ -1,0 +1,27 @@
+diff --git a/src/ui/deko3d/nucleo.cpp b/src/ui/deko3d/nucleo.cpp
+--- a/src/ui/deko3d/nucleo.cpp
++++ b/src/ui/deko3d/nucleo.cpp
+@@ -445,7 +445,10 @@ void Nucleo::AnadirTrozo(uint32_t bytes) {
+   bytes = Alinear(bytes, DK_MEMBLOCK_ALIGNMENT);
+   Trozo t;
+   t.bloque = CrearBloque(bytes, DkMemBlockFlags_GpuCached | DkMemBlockFlags_Image, nombre);
++  if (!t.bloque) {
++    return;
++  }
+   t.bytes = bytes;
+   t.libres.push_back({0, bytes});
+   trozos_.push_back(std::move(t));
+   estadisticas_.trozos_imagenes = trozos_.size();
+@@ -494,4 +497,10 @@ BloqueImagen Nucleo::ReservarImagen(uint32_t bytes, uint32_t alineacion) {
+-    AnadirTrozo(std::max(config_.mb_trozo_imagenes << 20, Alinear(bytes + alineacion, DK_MEMBLOCK_ALIGNMENT)));
++    const size_t trozos_antes = trozos_.size();
++    AnadirTrozo(std::max(config_.mb_trozo_imagenes << 20, Alinear(bytes + alineacion, DK_MEMBLOCK_ALIGNMENT)));
++    if (trozos_.size() == trozos_antes) {
++      Registro("[dk] reserva de imagen fallida: el monton no puede colocar %u bytes", bytes);
++      return {};
++    }
+   }
+-  Fatal("[dk] el monton de imagenes no puede colocar %u bytes", bytes);
++  Registro("[dk] reserva de imagen fallida: el monton no puede colocar %u bytes", bytes);
++  return {};
+ }

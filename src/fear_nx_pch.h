@@ -11,3 +11,6 @@
 #endif
 
 #include "generated/default/fear_xbox360_pch.h"
+#if defined(FEAR_NX_CPU_ADAPTER)
+#include "cpu/fear_cpu_guest.h"
+#endif

@@ -29,9 +29,11 @@ probe also requires one actual handler entry per trap, preventing a false
 pass if an emulator silently skips an undefined instruction. This patch
 does not supply missing emulator exception handling.
 
-Apply in `series` order with `git apply --index`. Do not reset an existing
-SDK checkout: the bootstrap script checks the pinned base and recognizes the
-fully applied patch set, otherwise it refuses to modify the checkout.
+For this branch, follow [building.md](../../docs/building.md): first apply the
+complete native-vulkan SDK snapshot and gamma overlay to a fresh pinned SDK,
+then let `prepare_deko3d.py` stage the provider/compiler sources and patches
+0023–0033. Do not apply 0001–0022 again on top of that snapshot. `series` records
+the historical patch order, not an additional step after snapshot setup.
 
 `0020-guest-memory-commit-diagnostics.patch` identifies the failing commit
 stage, clears stale last-result state and records chunk/view counts plus
@@ -60,3 +62,45 @@ but do not identify the exhausted kernel allocator. Compact placement is intende
 to reduce page-table fragmentation; it does not reduce the number of committed
 chunks or guarantee that all metadata pressure is removed. Hardware retesting
 is required before calling the campaign freeze fixed.
+
+`0028-switch-presenter-lifecycle.patch` replaces an unavailable
+`ShutdownPaintThread` call with the base presenter's UI-thread surface
+disconnect. That sets paint mode to none and waits for any ring-thread paint
+before Deko3D resources are released; this ReXGlue 0.10.0 API has no separate
+paint thread to join.
+
+`0030-deko-test-heap-cap.patch` gives the experimental Deko3D NRO a separate
+1,536 MiB libnx heap cap while leaving the Vulkan build at 1,024 MiB. Eden
+run009 stopped on Deko3D `OutOfMemory` while creating a 16 MiB image block.
+The default Deko3D allocator shares this heap with the runtime, unlike the
+existing Vulkan GPU allocation path. The extra 512 MiB targets that shortfall;
+the remaining process memory must accommodate guest mappings and their page
+tables. The subsequent startup results are in the consolidated test history.
+
+`0031-deko-enable-compute-queue.patch` enables compute on the shared graphics
+queue. The renderer records compute dispatches for depth resolves, which
+deko3d cannot submit through a graphics-only queue. Eden run011's first CPU
+exception was a null dereference in `ComputeQueue::bindShader`; creating the
+compute dispatcher addresses that fault without bypassing depth resolves.
+
+`0032-deko-gpu-diagnostics.patch` adds the default-off
+`REXGLUE_SWITCH_DEKO3D_DEBUG` option to select `libdeko3dd` consistently at
+both link sites. The imported callback already reports API validation
+errors, but the release library never calls it. GPU fault details arrive
+as success-level warning callbacks, so all these lines are now flushed to
+stderr before the app log's INFO filter or 200-message limit can discard
+them. Fatal text also goes to stderr before the normal logger. The warning
+counter is atomic because callbacks can originate on different threads.
+The title's CMake gives the diagnostic NRO a separate filename and title.
+This adds evidence for hardware run046; it does not claim to fix its GPU
+fault or provide a signal-safe crash logger.
+
+`0033-prove-vertex-index-register.patch` exposes conservative shader-analysis
+proofs that each full vertex fetch captures the incoming index before any
+instruction can change `r0.x`, and that mini-fetch addresses follow an
+unambiguous linear instruction path. A full fetch may itself write `r0.x`, and
+later writes are allowed unless another full fetch follows. The analysis rejects
+conditional or looping control flow, predicated full fetches, and a mini-fetch
+before any full fetch. Deko combines these proofs with per-fetch validation of
+the analyzed index operand; shaders that fail any check retain the full vertex
+stream.

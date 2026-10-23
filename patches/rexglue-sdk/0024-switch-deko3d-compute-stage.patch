@@ -1,0 +1,28 @@
+diff --git a/include/rex/ui/deko3d/compilador.h b/include/rex/ui/deko3d/compilador.h
+--- a/include/rex/ui/deko3d/compilador.h
++++ b/include/rex/ui/deko3d/compilador.h
+@@ -26,6 +26,6 @@ class Compilador {
+   };
+   using Hecho = std::function<void(Resultado)>;
+-  enum class Etapa { kVertices, kGeometria, kFragmentos };
++  enum class Etapa { kVertices, kGeometria, kFragmentos, kComputo };
+ 
+   // Starts the thread. Ends the process if it cannot be created.
+   Compilador();
+diff --git a/src/ui/deko3d/compilador.cpp b/src/ui/deko3d/compilador.cpp
+--- a/src/ui/deko3d/compilador.cpp
++++ b/src/ui/deko3d/compilador.cpp
+@@ -72,9 +72,10 @@ struct Compilador::Datos {
+         tarea = std::move(cola.front());
+         cola.pop_front();
+       }
+-      const uam::Stage etapa = tarea.etapa == Etapa::kVertices    ? uam::Stage::Vertex
+-                               : tarea.etapa == Etapa::kGeometria ? uam::Stage::Geometry
+-                                                                  : uam::Stage::Fragment;
++      const uam::Stage etapa = tarea.etapa == Etapa::kVertices    ? uam::Stage::Vertex
++                               : tarea.etapa == Etapa::kGeometria ? uam::Stage::Geometry
++                               : tarea.etapa == Etapa::kComputo   ? uam::Stage::Compute
++                                                                  : uam::Stage::Fragment;
+       uam::Result r = uam::compile(etapa, tarea.glsl.c_str());
+       tarea.hecho(Resultado{r.ok, std::move(r.dksh), std::move(r.log)});
+       std::lock_guard<std::mutex> cerrojo(candado);

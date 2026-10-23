@@ -1,16 +1,13 @@
-# F.E.A.R. NX release settings. See docs/native-renderer.md.
+# F.E.A.R. NX deko3d release settings. See README.md.
 [nx]
 native_shared_resolves = true
 native_gpu_profile = false
+native_cpu_profile = false
+native_cpu_adapter_profile = false
 native_max_anisotropy = 2
 native_depth24 = true
 native_msaa = false
-native_async_pipelines = true
-native_record_thread = false
-native_fused_gamma = true
 native_zcull = true
-native_precise_resolve_barriers = true
-native_full_clear_load_op = true
 renderer = "native"
 native_trace_output = false
 

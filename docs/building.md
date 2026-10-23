@@ -1,8 +1,7 @@
 # Building F.E.A.R. NX
 
 Build from your own supported Xbox 360 `default.xex`. Original game data and
-generated translations stay outside Git. The release installer is the simpler
-route if you only want to play.
+generated translations stay outside Git. The browser installer currently supplies Vulkan; this branch builds deko3d.
 
 ## Requirements
 
@@ -14,8 +13,8 @@ route if you only want to play.
 - Disk space for generated C++, dependencies and ARM64 build output.
 
 Run the commands below from the repository root. Stop if a command fails.
-The Docker examples use `D:/fear-nx` as the absolute host checkout path;
-replace it with your own path. Paths inside the container remain `/project`.
+The Docker examples mount the current checkout at `/project`; no second
+checkout or personal development directory is required.
 
 ## 1. Prepare the SDK
 
@@ -39,8 +38,7 @@ Compare the submodule paths and commit IDs with `recursive_submodules` in
 an uninitialized, mismatched or conflicted submodule; resolve it before building.
 
 This applies the complete source snapshot in `patches/native-vulkan` to the
-pinned ReXGlue base. The numbered patches are retained as source history. Do not apply them
-on top of this snapshot.
+pinned ReXGlue base. The numbered patches are retained as source history. Do not apply them on top of this snapshot.
 
 Then apply the focused gamma-presentation overlay (after verifying the snapshot
 tree above):
@@ -62,6 +60,13 @@ restart for an A/B comparison. Keep `native_shared_resolves = true` and
 `native_record_thread = false` fixed during this comparison. At 1:1 output the
 new shader uses one source tap; resizing requires four gamma-corrected taps to
 preserve gamma-before-filter ordering, so the FPS benefit needs device testing.
+
+The Switch build now defaults to `FEAR_NX_RENDERER=DEKO3D`. During CMake
+configuration, `tools/switch/prepare_deko3d.py` adds the pinned Deko3D provider,
+UAM and SPIRV-Cross sources to the ignored SDK copy and applies patches 0023
+through 0033. It preserves the existing runtime source and patches. No Vulkan
+driver build is required for this backend. Set `FEAR_NX_RENDERER=VULKAN` to
+build the existing Vulkan renderer instead.
 
 The GLSL source is included in the overlay. To regenerate its two embedded
 headers inside the Switch toolchain container, run from `/project`:
@@ -92,38 +97,53 @@ rexglue codegen fear_xbox360_manifest.local.toml
 Check that `generated/default/sources.cmake` exists. Code generation must finish
 before CMake configuration. It does not copy the `Game/` data directory.
 
-## 3. Prepare the toolchain and driver
+## 3. Prepare the toolchain
 
 ```text
 docker build -t fear-nx-switch:devkitpro-20260219-clang19 -f tools/switch/Dockerfile tools/switch
 ```
 
-Build the driver using [driver-build.md](driver-build.md). The full build needs
-`sdk/nvk/lib/libvulkan.a` and `sdk/nvk/lib/libnak_rs.a`.
+The Deko3D build does not need the Vulkan driver. The Vulkan build still uses
+the steps in [driver-build.md](driver-build.md).
 
 ## 4. Compile and package the NRO
 
 ```text
-docker run --rm --mount "type=bind,source=D:/fear-nx,target=/project" -w /project fear-nx-switch:devkitpro-20260219-clang19 cmake -S . -B out/switch -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=/project/tools/switch/toolchain.cmake -DREXSDK_DIR=/project/third_party/rexglue-sdk -DREXGLUE_SWITCH_NVK_SDK=/project/sdk/nvk -DREXGLUE_SWITCH_COMPILE_ONLY=OFF
-docker run --rm --mount "type=bind,source=D:/fear-nx,target=/project" -w /project fear-nx-switch:devkitpro-20260219-clang19 cmake --build out/switch --parallel 4 --target fear_nx
+$ProjectRoot = (Get-Location).Path
+docker run --rm --mount "type=bind,source=${ProjectRoot},target=/project" -w /project fear-nx-switch:devkitpro-20260219-clang19 cmake -S /project -B /project/out/switch-deko3d -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=/project/tools/switch/toolchain.cmake -DREXSDK_DIR=/project/third_party/rexglue-sdk -DREXGLUE_SWITCH_COMPILE_ONLY=OFF -DFEAR_GENERATED_DIR=/project/generated/default -DFEAR_ASSET_DIR=/project/assets -DFEAR_NX_RENDERER=DEKO3D
+docker run --rm --mount "type=bind,source=${ProjectRoot},target=/project" -w /project fear-nx-switch:devkitpro-20260219-clang19 cmake --build /project/out/switch-deko3d --parallel 4 --target fear_nx
 ```
 
-Outputs include `out/switch/fear_nx` (AArch64 ELF), `fear_nx.nacp` and
-`fear_nx.nro`. For configuration only, stop after the first command.
+For the existing Vulkan path, configure a separate directory with
+`-DFEAR_NX_RENDERER=VULKAN -DREXGLUE_SWITCH_NVK_SDK=/project/sdk/nvk`.
+Generated sources and game assets are read from the ignored local
+`generated/default` and `assets` directories prepared above. The Deko3D build writes an AArch64 ELF and
+`fear_nx_deko3d.nro` under `out/switch-deko3d/`; the Vulkan build keeps its
+`fear_nx.nro` name. The browser installer remains pinned to the separate Vulkan release. For configuration only, stop after the first command.
+
+For a console GPU fault, add `-DREXGLUE_SWITCH_DEKO3D_DEBUG=ON` to the
+Deko3D configure command. This retains Release game code but links
+`libdeko3dd` at both SDK link sites, enabling API validation and GPU fault
+details. The result is `fear_nx_deko3d_diag.nro`, titled **F.E.A.R. NX deko3d
+diagnostic**, so packaging does not overwrite the regular NRO. Its startup
+marker and deko3d warnings/errors are flushed to `rex_stderr.log`, including
+warnings past the normal app log's rate limit. Set the option back to `OFF`
+and rebuild for the normal output; diagnostic builds are not performance
+baselines.
 
 Copy the NRO and `release/fear-nx.toml` into `sdmc:/switch/fear-nx/`, then place
 your executable and extracted `Game/` under its `game/` subdirectory.
 See [installation](installing.md) for the full layout.
 
-## Publishing a build
+## Packaging a branch build
 
-`scripts/package-release.py` packages an existing NRO with the configuration
-and notices. It never reads or packages the original game files.
+Copy `out/switch-deko3d/fear_nx_deko3d.nro` and `release/fear-nx.toml`
+to the installation folder described above. Preserve the separate NRO name.
+The inherited `scripts/package-release.py`, installer manifest and Pages
+workflow target the Vulkan release in `main`; do not use them to silently
+replace that release with this experimental backend. Publishing a separate
+binary release requires explicit deko3d naming and its matching notices.
 
-```text
-python scripts/package-release.py --nro out/switch/fear_nx.nro --output dist/public-release
-```
-
-For a new binary, update the SHA-256 and version in
-`installer/release/manifest.json`, upload the release assets, and run the
-GitHub Pages workflow. The workflow verifies the hashes before deploying.
+The CPU adapter is generated into the build directory by
+`tools/switch/prepare_cpu_adapter.py`; original generated inputs are retained.
+Optional host regression checks and cache preparation live in `tools/deko/`.

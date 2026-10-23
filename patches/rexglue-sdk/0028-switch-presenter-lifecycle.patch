@@ -1,0 +1,11 @@
+diff --git a/src/ui/deko3d/presentador.cpp b/src/ui/deko3d/presentador.cpp
+--- a/src/ui/deko3d/presentador.cpp
++++ b/src/ui/deko3d/presentador.cpp
+@@ -128,6 +128,6 @@ class PresentadorDeko3d final : public Presenter {
+   ~PresentadorDeko3d() override {
+-    ShutdownPaintThread();  // its thread calls PaintAndPresentImpl (presenter.h)
++    SetWindowSurfaceFromUIThread(nullptr, nullptr);
+     {
+       std::lock_guard<std::mutex> cerrojo(captura_candado_);
+       captura_.Destruir();
+     }

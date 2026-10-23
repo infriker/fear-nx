@@ -1,0 +1,17 @@
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -120,5 +120,13 @@ target_include_directories(rexgpu-xenos PRIVATE
+     ${REXGLUE_ROOT}/thirdparty/renderdoc
+     ${REXGLUE_ROOT}  # For thirdparty/dxbc/DXBCChecksum.h include
+ )
++
++if(REXGLUE_USE_DEKO3D)
++    # The shared SPIR-V translator includes Vulkan-shaped headers, but Deko3D
++    # does not link or execute a Vulkan runtime.
++    target_include_directories(rexgpu-xenos PRIVATE
++        ${REXGLUE_ROOT}/thirdparty/vulkan-headers/include
++    )
++endif()
+ 
+ target_compile_options(rexgpu-xenos PRIVATE -Wno-unused-variable)

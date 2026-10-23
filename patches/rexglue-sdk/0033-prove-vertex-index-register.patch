@@ -1,0 +1,205 @@
+diff --git a/include/rex/graphics/pipeline/shader/shader.h b/include/rex/graphics/pipeline/shader/shader.h
+index 4cf3854..967f6b9 100644
+--- a/include/rex/graphics/pipeline/shader/shader.h
++++ b/include/rex/graphics/pipeline/shader/shader.h
+@@ -895,6 +895,21 @@ class Shader {
+   // register_static_address_bound.
+   bool uses_register_dynamic_addressing() const { return uses_register_dynamic_addressing_; }
+ 
++  // Whether analysis found no instruction that can write temporary register
++  // r0.x. This is conservative across all control-flow paths and includes
++  // relative writes that may alias r0.
++  bool vertex_index_register_unmodified() const { return vertex_index_register_unmodified_; }
++
++  // Whether every full vertex fetch computes its address before any instruction
++  // can change the incoming r0.x index. Writes after a full fetch are allowed
++  // unless another full fetch uses the changed value.
++  bool vertex_fetch_indices_unmodified() const { return vertex_fetch_indices_unmodified_; }
++
++  // Whether vfetch_mini address inheritance is unambiguous from the linear
++  // instruction order. False for control flow that can skip or repeat a full
++  // fetch, or for a predicated full fetch.
++  bool vertex_fetch_addresses_linear() const { return vertex_fetch_addresses_linear_; }
++
+   // For building shader modification bits (and also for normalization of them),
+   // returns the amount of temporary registers that need to be allocated
+   // explicitly - if not using register dynamic addressing, the shader
+@@ -1013,6 +1028,9 @@ class Shader {
+   uint32_t writes_point_size_edge_flag_kill_vertex_ = 0;
+   uint32_t writes_color_targets_ = 0b0000;
+   bool uses_register_dynamic_addressing_ = false;
++  bool vertex_index_register_unmodified_ = true;
++  bool vertex_fetch_indices_unmodified_ = true;
++  bool vertex_fetch_addresses_linear_ = true;
+   bool kills_pixels_ = false;
+   bool uses_texture_fetch_instruction_results_ = false;
+   bool writes_depth_ = false;
+@@ -1036,10 +1054,12 @@ class Shader {
+  private:
+   void GatherExecInformation(const ParsedExecInstruction& instr,
+                              ucode::VertexFetchInstruction& previous_vfetch_full,
++                             bool& previous_vfetch_full_available,
+                              uint32_t& unique_texture_bindings,
+                              string::StringBuffer& ucode_disasm_buffer);
+   void GatherVertexFetchInformation(const ucode::VertexFetchInstruction& op,
+                                     ucode::VertexFetchInstruction& previous_vfetch_full,
++                                    bool& previous_vfetch_full_available,
+                                     string::StringBuffer& ucode_disasm_buffer);
+   void GatherTextureFetchInformation(const ucode::TextureFetchInstruction& op,
+                                      uint32_t& unique_texture_bindings,
+diff --git a/src/graphics/pipeline/shader/translator.cpp b/src/graphics/pipeline/shader/translator.cpp
+index e472251..949c55a 100644
+--- a/src/graphics/pipeline/shader/translator.cpp
++++ b/src/graphics/pipeline/shader/translator.cpp
+@@ -51,6 +51,13 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
+     return;
+   }
+ 
++  // This proof is accumulated while gathering instruction results. Reset it
++  // before a fresh analysis so an interrupted/retried analysis cannot retain
++  // a stale negative result.
++  vertex_index_register_unmodified_ = true;
++  vertex_fetch_indices_unmodified_ = true;
++  vertex_fetch_addresses_linear_ = true;
++
+   // Control flow instructions come paired in blocks of 3 dwords and all are
+   // listed at the top of the ucode.
+   // Each control flow instruction is executed sequentially until the final
+@@ -66,6 +73,19 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
+       // kExec-ish and instruction and using its address as the upper bound.
+       // This is what freedreno does.
+       const ControlFlowInstruction& cf = cf_ab[j];
++      switch (cf.opcode()) {
++        case ControlFlowOpcode::kNop:
++        case ControlFlowOpcode::kExec:
++        case ControlFlowOpcode::kExecEnd:
++        case ControlFlowOpcode::kAlloc:
++          break;
++        default:
++          // Mini-fetches reuse the address computed by the most recently
++          // executed full-fetch. Conditional execution, loops, calls and
++          // jumps can make that differ from the preceding textual full-fetch.
++          vertex_fetch_addresses_linear_ = false;
++          break;
++      }
+       if (IsControlFlowOpcodeExec(cf.opcode())) {
+         cf_pair_index_bound_ = std::min(cf_pair_index_bound_, cf.exec.address());
+       }
+@@ -92,6 +112,7 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
+   ucode_disasm_buffer.Reset();
+   VertexFetchInstruction previous_vfetch_full;
+   std::memset(&previous_vfetch_full, 0, sizeof(previous_vfetch_full));
++  bool previous_vfetch_full_available = false;
+   uint32_t unique_texture_bindings = 0;
+   for (uint32_t i = 0; i < cf_pair_index_bound_; ++i) {
+     ControlFlowInstruction cf_ab[2];
+@@ -113,7 +134,8 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
+         case ControlFlowOpcode::kExecEnd: {
+           ParsedExecInstruction instr;
+           ParseControlFlowExec(cf.exec, cf_index, instr);
+-          GatherExecInformation(instr, previous_vfetch_full, unique_texture_bindings,
++          GatherExecInformation(instr, previous_vfetch_full, previous_vfetch_full_available,
++                                unique_texture_bindings,
+                                 ucode_disasm_buffer);
+         } break;
+         case ControlFlowOpcode::kCondExec:
+@@ -123,14 +145,16 @@ void Shader::AnalyzeUcode(string::StringBuffer& ucode_disasm_buffer) {
+           bool_constant_index = cf.cond_exec.bool_address();
+           ParsedExecInstruction instr;
+           ParseControlFlowCondExec(cf.cond_exec, cf_index, instr);
+-          GatherExecInformation(instr, previous_vfetch_full, unique_texture_bindings,
++          GatherExecInformation(instr, previous_vfetch_full, previous_vfetch_full_available,
++                                unique_texture_bindings,
+                                 ucode_disasm_buffer);
+         } break;
+         case ControlFlowOpcode::kCondExecPred:
+         case ControlFlowOpcode::kCondExecPredEnd: {
+           ParsedExecInstruction instr;
+           ParseControlFlowCondExecPred(cf.cond_exec_pred, cf_index, instr);
+-          GatherExecInformation(instr, previous_vfetch_full, unique_texture_bindings,
++          GatherExecInformation(instr, previous_vfetch_full, previous_vfetch_full_available,
++                                unique_texture_bindings,
+                                 ucode_disasm_buffer);
+         } break;
+         case ControlFlowOpcode::kLoopStart: {
+@@ -340,6 +364,7 @@ uint32_t Shader::GetInterpolatorInputMask(reg::SQ_PROGRAM_CNTL sq_program_cntl,
+ 
+ void Shader::GatherExecInformation(const ParsedExecInstruction& instr,
+                                    ucode::VertexFetchInstruction& previous_vfetch_full,
++                                   bool& previous_vfetch_full_available,
+                                    uint32_t& unique_texture_bindings,
+                                    string::StringBuffer& ucode_disasm_buffer) {
+   instr.Disassemble(&ucode_disasm_buffer);
+@@ -355,7 +380,8 @@ void Shader::GatherExecInformation(const ParsedExecInstruction& instr,
+     if (sequence & 0b01) {
+       auto& op = *reinterpret_cast<const FetchInstruction*>(op_ptr);
+       if (op.opcode() == FetchOpcode::kVertexFetch) {
+-        GatherVertexFetchInformation(op.vertex_fetch(), previous_vfetch_full, ucode_disasm_buffer);
++        GatherVertexFetchInformation(op.vertex_fetch(), previous_vfetch_full,
++                                     previous_vfetch_full_available, ucode_disasm_buffer);
+       } else {
+         GatherTextureFetchInformation(op.texture_fetch(), unique_texture_bindings,
+                                       ucode_disasm_buffer);
+@@ -369,10 +395,30 @@ void Shader::GatherExecInformation(const ParsedExecInstruction& instr,
+ 
+ void Shader::GatherVertexFetchInformation(const VertexFetchInstruction& op,
+                                           VertexFetchInstruction& previous_vfetch_full,
++                                          bool& previous_vfetch_full_available,
+                                           string::StringBuffer& ucode_disasm_buffer) {
++  // A mini-fetch before any full fetch inherits the zero-initialized parser
++  // state. Its apparent source can alias r0.x even though no real full-fetch
++  // source established that relationship, so it cannot support the proof.
++  if (op.is_mini_fetch() && !previous_vfetch_full_available) {
++    vertex_index_register_unmodified_ = false;
++    vertex_fetch_indices_unmodified_ = false;
++    vertex_fetch_addresses_linear_ = false;
++  }
++  if (!op.is_mini_fetch() && op.is_predicated()) {
++    vertex_fetch_addresses_linear_ = false;
++  }
++
+   ParsedVertexFetchInstruction fetch_instr;
+   if (ParseVertexFetchInstruction(op, previous_vfetch_full, fetch_instr)) {
++    // A full fetch captures its address from the incoming r0.x. Its own result
++    // may write r0.x after this point without invalidating that captured index;
++    // later full fetches will observe the write and fail this proof.
++    if (!vertex_index_register_unmodified_) {
++      vertex_fetch_indices_unmodified_ = false;
++    }
+     previous_vfetch_full = op;
++    previous_vfetch_full_available = true;
+   }
+   fetch_instr.Disassemble(&ucode_disasm_buffer);
+ 
+@@ -539,12 +585,18 @@ void Shader::GatherOperandInformation(const InstructionOperand& operand) {
+ }
+ 
+ void Shader::GatherFetchResultInformation(const InstructionResult& result) {
+-  if (!result.GetUsedWriteMask()) {
++  const uint32_t used_write_mask = result.GetUsedWriteMask();
++  if (!used_write_mask) {
+     return;
+   }
+   // Fetch instructions can't export - don't need the current memexport count
+   // operand.
+   assert_true(result.storage_target == InstructionStorageTarget::kRegister);
++  if ((used_write_mask & 0b0001) &&
++      (result.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute ||
++       result.storage_index == 0)) {
++    vertex_index_register_unmodified_ = false;
++  }
+   if (result.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute) {
+     register_static_address_bound_ =
+         std::max(register_static_address_bound_, result.storage_index + uint32_t(1));
+@@ -560,6 +612,11 @@ void Shader::GatherAluResultInformation(const InstructionResult& result, uint32_
+   }
+   switch (result.storage_target) {
+     case InstructionStorageTarget::kRegister:
++      if ((used_write_mask & 0b0001) &&
++          (result.storage_addressing_mode != InstructionStorageAddressingMode::kAbsolute ||
++           result.storage_index == 0)) {
++        vertex_index_register_unmodified_ = false;
++      }
+       if (result.storage_addressing_mode == InstructionStorageAddressingMode::kAbsolute) {
+         register_static_address_bound_ =
+             std::max(register_static_address_bound_, result.storage_index + uint32_t(1));

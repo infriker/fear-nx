@@ -20,6 +20,9 @@
 
 #include "native/native_system.h"
 #include "input/gyro_input.h"
+#if defined(FEAR_NX_CPU_ADAPTER)
+#include "cpu/fear_cpu.h"
+#endif
 
 REXCVAR_DECLARE(bool, gpu_implicit_lod_sampling);
 
@@ -40,11 +43,14 @@ class FearNxApp final : public rex::ReXApp {
 
  protected:
   void OnPreSetup(rex::RuntimeConfig& config) override {
+#if defined(FEAR_NX_CPU_ADAPTER)
+    fear_nx::cpu::Configure();
+#endif
     REXLOG_INFO("F.E.A.R. NX: implicit LOD sampling {}",
                 REXCVAR_GET(gpu_implicit_lod_sampling));
     config.input_factory = REX_INPUT_BACKEND(fear_nx::input::CreateInputSystem);
-    // The app-owned Xenos Vulkan renderer is the Switch default. A config
-    // override may select the SDK's reference Xenos backend for diagnosis.
+    // The app-owned renderer selected for this build is the Switch default. A
+    // config override may select the SDK's reference Xenos backend for diagnosis.
     if (fear_nx::native::Enabled()) {
       config.graphics = fear_nx::native::CreateGraphicsSystem();
     }

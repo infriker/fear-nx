@@ -1,50 +1,55 @@
-# F.E.A.R. NX — Nintendo Switch port
+# F.E.A.R. NX — deko3d branch
 
 A native Nintendo Switch port of the Xbox 360 version of **F.E.A.R. (2005)**.
-The game's PowerPC code is statically recompiled to AArch64 with
-[ReXGlue](https://github.com/rexglue/rexglue-sdk). A native Vulkan renderer draws
-the game through Mesa/NVK on Horizon.
+ReXGlue statically recompiles the game's PowerPC code to AArch64. This branch
+uses **deko3d** for rendering on Horizon and builds **`fear_nx_deko3d.nro`**.
 
-The original menu and campaign are playable. In the latest on-device testing at
-**460 MHz GPU**, most gameplay runs at **30 FPS**. Heavy firefights can fall to
-**25–27 FPS**, and some unusually demanding areas reach **17 FPS**. Those drops
-are GPU-bound: GPU utilization reaches 100% while the CPU still has headroom.
-Performance work is ongoing.
+The original menu, cutscenes and campaign are playable. This is an experimental
+alternative to the [Vulkan/Mesa renderer in `main`](https://github.com/infriker/fear-nx/tree/main).
 
-**Branches:** `main` contains the Vulkan/Mesa renderer. The separate
-[`deko3d` branch](https://github.com/infriker/fear-nx/tree/deko3d) contains the
-experimental deko3d renderer. Vulkan currently provides more stable performance.
+## Performance
+
+**Current Switch testing: 20–30 FPS with overclocking, with frequent drops.**
+**Vulkan currently provides more stable performance.** The overclock settings
+were not recorded with this report, so these numbers are observations rather
+than a reproducible benchmark. They are not stock-clock results or a claim
+that every level maintains 20 FPS.
+
+The current implementation includes persistent geometry and index caches,
+16-bit indices, bounded texture validation, NEON uploads, retained constants,
+deferred clears, 3D copies and finer image dependencies. Shader variants can
+be cached and prepared on a PC. Sustained slow scenes in the recorded tests
+also occurred with zero shader compilations; precompilation alone does not
+remove those drops.
+
+See the single [test and optimization history](docs/deko3d-history.md) for
+what changed, what helped, and which attempts regressed or remain unproven.
 
 ## How to install
 
-1. Open the **[F.E.A.R. NX installer](https://infriker.github.io/fear-nx/)**.
-2. Select your Xbox 360 disc image (`.iso`) or extracted game folder containing
-   `default.xex` and `Game/`.
-3. Choose **Create fear-nx.zip** and extract it into `sdmc:/switch/`.
-4. Launch `fear_nx.nro` through the Homebrew Menu in **title takeover mode**:
-   hold **R** while launching an installed game. Album/applet mode is unsupported.
+Use a deko3d NRO built from this branch or explicitly labelled as deko3d.
+The [browser installer](https://infriker.github.io/fear-nx/) and its pinned
+release still provide the **Vulkan build**; selecting this Git branch does
+not change that download.
 
-The installer checks your executable, downloads the port and packages everything
-locally in your browser. Game files are never uploaded. You need your own copy
-of the Xbox 360 game; the Windows PC release is not compatible.
+For an existing installation, add `fear_nx_deko3d.nro` beside `fear_nx.nro`
+and launch the deko3d entry. Both use the same game and save layout. Back up
+custom settings before applying this branch's `release/fear-nx.toml`.
 
 ```text
 /switch/fear-nx/
-  fear_nx.nro
+  fear_nx_deko3d.nro
   fear-nx.toml
-  LICENSES.txt
   game/
     default.xex
     Game/
+  userdata/              # preserve saves when updating
 ```
 
-The port creates `userdata/`, `cache/`, `update/` and `metadata/` beside the NRO.
-Keep `userdata/` when updating. **Create fear-nx-update.zip** produces only the
-NRO, configuration and notices; it requires your supported `default.xex` but
-does not copy the game again. Back up custom settings before replacing the TOML.
-
-For manual installation, use the files in the [latest release](https://github.com/infriker/fear-nx/releases/latest).
-See [installation and troubleshooting](docs/installing.md).
+You need your own supported Xbox 360 game; the PC release is incompatible.
+Copy the complete extracted `Game/` directory, including `uberCatalog.cat`.
+Launch via Homebrew Menu in **title takeover mode**: hold **R** while opening
+an installed game. Album/applet mode is unsupported.
 
 ## Controls
 
@@ -70,67 +75,67 @@ uncheck **input_gyro_enabled**, then choose **Save to config**. Alternatively,
 set `gyro_enabled = false` under `[input]` in `fear-nx.toml`. Existing saved
 preferences are preserved. See [gyro settings](docs/gyro-aiming.md).
 
-## Settings and performance
+## Settings
 
-Edit `fear-nx.toml` next to the NRO. The release uses the native renderer,
-shared resolve resources, D24 depth, 2× anisotropic filtering and disabled MSAA.
-The supplied profile leaves GPU clock selection to the system or your clock tool;
-it does not force a GPU clock or reduce the rendering resolution.
+Edit `fear-nx.toml` beside the NRO. Backend selection is made at build time;
+`renderer = "native"` selects this branch's native deko3d renderer. The release
+profile leaves clocks to the system/user and does not force overclocking.
+It disables profiling and verbose tracing for normal play. User configurations
+remain in effect when replacing only the NRO.
 
-The user's hardware observations reported on **2026-10-22**, at the tested stock
-**460 MHz GPU** setting, are 30 FPS through most gameplay, 25–27 FPS in heavy
-firefights, and lows of about 17 FPS in anomalous GPU-heavy areas. During drops
-below 30 FPS the GPU is fully occupied while the CPU has headroom. These are
-observations from the recent test builds, not a full-campaign benchmark or a
-guarantee for every level. New renderer changes still need separate hardware
-validation. See the [performance and change history](docs/performance.md).
-The first encounter with a shader can cause temporary missing effects or a hitch
-while its pipeline compiles; compiled pipelines are cached on the SD card.
+For diagnostics, enable `native_cpu_profile = true` and/or
+`native_gpu_profile = true` under `[nx]`, and `level = "info"` under `[log]`.
+Profiling affects measurements; use a separate run for clean FPS comparisons.
+See [shader tools](tools/deko/README.md) for cache preparation.
 
-## Planned features
+## Planned work
 
-- [ ] GPU performance improvements for heavy firefights and anomalous slow areas.
-- [ ] Identify reproducible triggers for the remaining graphical defects.
+- [ ] **Optimize CPU work in the game**, including guest execution, waits and
+  synchronization, using measured hot paths.
+- [ ] Reduce render-thread queue waits and remaining constant/texture work.
+- [ ] Validate performance and image correctness across more levels on Switch.
+
+The existing bounded CPU adapter is retained; it is not a completed optimization
+of the game's CPU workload. Current caches and the separate Vulkan path remain.
 
 ## Known issues
 
-- Intermittent graphical defects remain: incomplete/half-screen rendering and
-  decal artifacts. Their triggers have not yet been identified; the latest
-  renderer fixes do not establish that these symptoms are resolved.
+- Frequent frame-rate drops, especially with complex scenes and combat.
+- New shader variants may stall on first use; existing cache entries help only
+  the variants already observed or prepared.
+- Only the Xbox 360 executable revision below is supported.
+- Menu and campaign testing does not establish that every mission is correct.
 
-- GPU-heavy areas can fall below the 30 FPS target, down to about 17 FPS in testing.
-- Asynchronous pipeline compilation can briefly omit newly encountered draws.
-- Only the executable revision listed below is supported.
-- Applet mode and emulators are not supported release targets.
-
-See [known issues and reporting](docs/known-issues.md).
+See [known issues](docs/known-issues.md). Vulkan's unresolved graphical defects
+are tracked separately in `main`; their triggers have not yet been identified.
 
 ## Build and documentation
 
-Building requires your own game executable, ReXGlue 0.10.0, devkitA64/libnx,
-CMake, Ninja and the patched Horizon Mesa/NVK driver. Docker provides the
-cross-compilation environment.
+Use ReXGlue 0.10.0, the pinned SDK patches, devkitA64/libnx/deko3d, CMake,
+Ninja and the repository's Docker toolchain. No Mesa/NVK driver is required
+for the default deko3d build. Original assets and generated translations stay
+local. Build tools and source-level regression checks are included; emulator
+launchers, captures, personal scripts and binary development bundles are not.
 
-| Document | Contents |
-|---|---|
-| [Building](docs/building.md) | SDK setup, code generation and NRO compilation |
-| [Driver build](docs/driver-build.md) | Mesa/NVK archives for Horizon |
-| [Native renderer](docs/native-renderer.md) | Renderer design and settings |
-| [Performance](docs/performance.md) | Hardware observations and renderer change history |
-| [Relinking](docs/RELINKING.md) | Rebuilding with modified runtime libraries |
-| [Installer](installer/README.md) | Browser installer and GitHub Pages deployment |
+- [Building](docs/building.md) — dependency setup, code generation and NRO.
+- [Test history](docs/deko3d-history.md) — changes, measurements and limitations.
+- [Shader cache tools](tools/deko/README.md) — optional PC precompilation.
+- [Relinking](docs/RELINKING.md) — rebuilding with modified libraries.
 
-Supported `default.xex` SHA-256 (Xbox 360 Title ID `565507D9`):
+Supported `default.xex` SHA-256, Xbox 360 Title ID `565507D9`:
 
 ```text
 e7fccdf6dd57bb58d10efbdd0b2ca567b8cece5b6a3fc696c7fca879aaea2792
 ```
 
-The installer and application check this hash. Other revisions are rejected.
-
 ## Credits
 
 - The original F.E.A.R. development and publishing teams.
+- [nx-mod / rexglue-sdk-nx](https://github.com/nx-mod/rexglue-sdk-nx) — deko3d
+  integration and renderer references.
+- [VasilkovND / Dante's Inferno NX](https://github.com/VasilkovND/dantes-inferno-nx)
+  — geometry, caching, image-operation and CPU-adapter references.
+- [deko3d](https://github.com/devkitPro/deko3d), UAM, SPIRV-Cross and their contributors.
 - [R-drg / Rodrigo Ferreira](https://github.com/R-drg) —
   [Project8 SW](https://github.com/R-drg/project8-sw), the Switch runtime and
   renderer foundation, and the browser installer this project adapts.

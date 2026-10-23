@@ -1,0 +1,19 @@
+diff --git a/src/ui/deko3d/nucleo.cpp b/src/ui/deko3d/nucleo.cpp
+--- a/src/ui/deko3d/nucleo.cpp
++++ b/src/ui/deko3d/nucleo.cpp
+@@ -103,11 +103,14 @@ void Dispositivo::Crear(bool zcull) {
+   DkQueueMaker qm;
+   dkQueueMakerDefaults(&qm, dispositivo_);
+-  qm.flags = DkQueueFlags_Graphics | DkQueueFlags_MediumPrio |
++  // Depth resolves submit compute control commands on this same queue. Without
++  // Compute, deko3d leaves its compute dispatcher null and submitting those
++  // commands faults in ComputeQueue::bindShader (Eden run011).
++  qm.flags = DkQueueFlags_Graphics | DkQueueFlags_Compute | DkQueueFlags_MediumPrio |
+              (zcull ? DkQueueFlags_EnableZcull : DkQueueFlags_DisableZcull);
+   qm.commandMemorySize = 1u << 20;
+   qm.flushThreshold = qm.commandMemorySize / 8;
+-  Registro("[dk] creando la cola: graficos, ZCULL %s", zcull ? "activo" : "apagado");
++  Registro("[dk] creando la cola: graficos + computo, ZCULL %s", zcull ? "activo" : "apagado");
+   VaciarRegistro();
+   cola_ = dkQueueCreate(&qm);
+ }

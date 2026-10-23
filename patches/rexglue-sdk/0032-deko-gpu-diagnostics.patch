@@ -1,0 +1,95 @@
+diff --git a/cmake/rexglue_switch.cmake b/cmake/rexglue_switch.cmake
+--- a/cmake/rexglue_switch.cmake
++++ b/cmake/rexglue_switch.cmake
+@@ -10,6 +10,9 @@
+ # Vulkan builds also require REXGLUE_SWITCH_NVK_SDK or REXGLUE_SWITCH_NVK_SOURCE.
+ #==========================================================
+ include_guard(GLOBAL)
++
++option(REXGLUE_SWITCH_DEKO3D_DEBUG
++    "Link deko3d validation and GPU fault diagnostics (libdeko3dd)" OFF)
+ 
+ set(REXGLUE_SWITCH_NVK_SOURCE "" CACHE PATH "Pinned NXVK source and build tree")
+ set(REXGLUE_SWITCH_NVK_SDK "" CACHE PATH "Mesa Horizon SDK")
+@@ -125,7 +128,8 @@
+     if(REXGLUE_USE_VULKAN)
+         target_link_libraries(${target_name} PRIVATE ${_libs} rex::nvk)
+     elseif(REXGLUE_USE_DEKO3D)
+-        target_link_libraries(${target_name} PRIVATE ${_libs} deko3d)
++        target_link_libraries(${target_name} PRIVATE ${_libs}
++            $<IF:$<BOOL:${REXGLUE_SWITCH_DEKO3D_DEBUG}>,deko3dd,deko3d>)
+     else()
+         target_link_libraries(${target_name} PRIVATE ${_libs})
+     endif()
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -145,7 +145,11 @@
+ endif()
+ target_link_libraries(rexui PRIVATE utf8cpp)
+ if(REXGLUE_USE_DEKO3D)
+-    target_link_libraries(rexui PUBLIC deko3d uamlib spirv-cross-glsl xxHash::xxhash)
++    target_link_libraries(rexui PUBLIC
++        $<IF:$<BOOL:${REXGLUE_SWITCH_DEKO3D_DEBUG}>,deko3dd,deko3d>
++        uamlib spirv-cross-glsl xxHash::xxhash)
++    set_property(SOURCE deko3d/nucleo.cpp APPEND PROPERTY COMPILE_DEFINITIONS
++        REXGLUE_SWITCH_DEKO3D_DEBUG=$<BOOL:${REXGLUE_SWITCH_DEKO3D_DEBUG}>)
+ endif()
+ 
+ if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include")
+diff --git a/src/ui/deko3d/nucleo.cpp b/src/ui/deko3d/nucleo.cpp
+--- a/src/ui/deko3d/nucleo.cpp
++++ b/src/ui/deko3d/nucleo.cpp
+@@ -5,6 +5,7 @@
+ #include <switch.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdarg>
+ #include <cstdio>
+ #include <cstdlib>
+@@ -34,13 +35,18 @@
+     Fatal("[dk] error de deko3d en %s: resultado %d: %s", contexto ? contexto : "?", int(resultado),
+           mensaje ? mensaje : "");
+   }
+-  static int mensajes = 0;
+-  if (mensajes < 200) {
++  // GPU fault details arrive as Success warnings. Preserve every line in
++  // stderr before the normal log level/rate limit can discard it. The
++  // Switch crash hooks redirect stderr to rex_stderr.log at startup.
++  std::fprintf(stderr, "[dk-debug] %s: %s\n", contexto ? contexto : "?", mensaje ? mensaje : "");
++  std::fflush(stderr);
++  static std::atomic<unsigned> mensajes{0};
++  const unsigned mensaje_id = mensajes.fetch_add(1, std::memory_order_relaxed);
++  if (mensaje_id < 200) {
+     Registro("[dk] deko3d %s: %s", contexto ? contexto : "?", mensaje ? mensaje : "");
+-  } else if (mensajes == 200) {
++  } else if (mensaje_id == 200) {
+     Registro("[dk] deko3d: hay mas mensajes; no se registran");
+   }
+-  ++mensajes;
+ }
+ 
+ void AnadirMemoriaDeComandos(void* nucleo, DkCmdBuf cual, size_t minimo) {
+@@ -83,6 +89,9 @@
+   va_start(args, formato);
+   std::vsnprintf(linea, sizeof(linea), formato, args);
+   va_end(args);
++  // Preserve fatal text even when the regular log filters INFO messages.
++  std::fprintf(stderr, "%s\n", linea);
++  std::fflush(stderr);
+   Registro("%s", linea);
+   VaciarRegistro();
+   std::abort();
+@@ -93,6 +102,11 @@
+ Dispositivo::~Dispositivo() { Destruir(); }
+ 
+ void Dispositivo::Crear(bool zcull) {
++#if REXGLUE_SWITCH_DEKO3D_DEBUG
++  std::fputs("[dk-debug] FEAR GPU diagnostics enabled: libdeko3dd, run046 follow-up\n", stderr);
++  std::fflush(stderr);
++  Registro("[dk-debug] FEAR GPU diagnostics enabled: libdeko3dd, run046 follow-up");
++#endif
+   Registro("[dk] creando el dispositivo de deko3d (origen arriba a la izquierda, profundidad 0..1)");
+   VaciarRegistro();
+   DkDeviceMaker dm;

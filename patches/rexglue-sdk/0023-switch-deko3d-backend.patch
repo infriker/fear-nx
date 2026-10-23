@@ -1,0 +1,257 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -38,13 +38,19 @@
+ if(WIN32)
+     option(REXGLUE_USE_D3D12  "Enable D3D12 graphics backend" ON)
+     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" OFF)
++    option(REXGLUE_USE_DEKO3D "Enable Deko3D graphics backend" OFF)
+ else()
+     set(REXGLUE_USE_D3D12 OFF)
+     option(REXGLUE_USE_VULKAN "Enable Vulkan graphics backend" ON)
+-endif()
+-
+-if(NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN)
+-    message(FATAL_ERROR "At least one graphics backend must be enabled (REXGLUE_USE_D3D12 or REXGLUE_USE_VULKAN)")
++    option(REXGLUE_USE_DEKO3D "Enable Deko3D graphics backend" OFF)
++endif()
++
++if(REXGLUE_USE_DEKO3D AND NOT REXGLUE_PLATFORM_SWITCH)
++    message(FATAL_ERROR "Deko3D is only supported by the Nintendo Switch build")
++endif()
++
++if(NOT REXGLUE_USE_D3D12 AND NOT REXGLUE_USE_VULKAN AND NOT REXGLUE_USE_DEKO3D)
++    message(FATAL_ERROR "At least one graphics backend must be enabled (D3D12, Vulkan, or Deko3D)")
+ endif()
+ 
+ if (REXGLUE_ENABLE_FIDELITYFX AND
+@@ -322,7 +328,7 @@
+ message(STATUS "  Configurations: ${CMAKE_CONFIGURATION_TYPES}")
+ message(STATUS "  Output Dir: ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
+ message(STATUS "  C++ Standard: C++${CMAKE_CXX_STANDARD}")
+-message(STATUS "  Graphics: D3D12=${REXGLUE_USE_D3D12} Vulkan=${REXGLUE_USE_VULKAN}")
++message(STATUS "  Graphics: D3D12=${REXGLUE_USE_D3D12} Vulkan=${REXGLUE_USE_VULKAN} Deko3D=${REXGLUE_USE_DEKO3D}")
+ message(STATUS "  FidelityFX: ${REXGLUE_ENABLE_FIDELITYFX}")
+ message(STATUS "  Tracy: ${REXGLUE_ENABLE_TRACY}")
+ message(STATUS "  Perf Counters: ${REXGLUE_ENABLE_PERF_COUNTERS}")
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -58,6 +58,10 @@
+     endif()
+ endif()
+ 
++if(REXGLUE_USE_DEKO3D)
++    list(APPEND REQUIRED_SUBMODULES spirv-headers glslang)
++endif()
++
+ 
+ if(REXGLUE_ENABLE_TRACY)
+     list(APPEND REQUIRED_SUBMODULES tracy)
+@@ -221,6 +225,33 @@
+         set(MVK_EXCLUDE_SPIRV_TOOLS ON CACHE BOOL "" FORCE)
+         add_subdirectory(moltenvk)
+     endif()
++endif()
++
++#=============================================================================
++# Deko3D shader translation and GLSL compilation (Nintendo Switch only)
++#=============================================================================
++if(REXGLUE_USE_DEKO3D)
++    set(SPIRV_CROSS_STATIC ON CACHE BOOL "" FORCE)
++    set(SPIRV_CROSS_SHARED OFF CACHE BOOL "" FORCE)
++    set(SPIRV_CROSS_CLI OFF CACHE BOOL "" FORCE)
++    set(SPIRV_CROSS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
++    set(SPIRV_CROSS_ENABLE_GLSL ON CACHE BOOL "" FORCE)
++    set(SPIRV_CROSS_ENABLE_HLSL OFF CACHE BOOL "" FORCE)
++    set(SPIRV_CROSS_ENABLE_MSL OFF CACHE BOOL "" FORCE)
++    set(SPIRV_CROSS_ENABLE_CPP OFF CACHE BOOL "" FORCE)
++    set(SPIRV_CROSS_ENABLE_REFLECT OFF CACHE BOOL "" FORCE)
++    set(SPIRV_CROSS_ENABLE_C_API OFF CACHE BOOL "" FORCE)
++    set(SPIRV_CROSS_ENABLE_UTIL OFF CACHE BOOL "" FORCE)
++    set(SPIRV_CROSS_SKIP_INSTALL ON CACHE BOOL "" FORCE)
++    add_subdirectory(spirv-cross)
++    target_include_directories(spirv-cross-glsl PUBLIC
++        "${CMAKE_CURRENT_SOURCE_DIR}/spirv-cross/include")
++
++    # SwitchWakerHD's pinned CMake source tree builds UAM without its host CLI
++    # and host Threads dependency when NX_ROOT is defined.
++    set(NX_ROOT TRUE)
++    add_subdirectory(uam)
++    unset(NX_ROOT)
+ endif()
+ 
+ #=============================================================================
+@@ -324,9 +355,9 @@
+ endif()
+ 
+ #=============================================================================
+-# SPIR-V toolchain (only when Vulkan backend is enabled)
+-#=============================================================================
+-if(REXGLUE_USE_VULKAN)
++# SPIR-V toolchain (Vulkan backend or Deko3D shader translation)
++#=============================================================================
++if(REXGLUE_USE_VULKAN OR REXGLUE_USE_DEKO3D)
+     # SPIRV-Headers
+     set(SPIRV_HEADERS_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+     set(SPIRV_HEADERS_ENABLE_INSTALL OFF CACHE BOOL "" FORCE)
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -102,6 +102,15 @@
+     list(APPEND REXUI_SOURCES ${REXUI_VULKAN_SOURCES})
+ endif()
+ 
++if(REXGLUE_USE_DEKO3D)
++    list(APPEND REXUI_SOURCES
++        deko3d/cache_dksh.cpp
++        deko3d/compilador.cpp
++        deko3d/glsl.cpp
++        deko3d/nucleo.cpp
++        deko3d/presentador.cpp)
++endif()
++
+ if(REXGLUE_USE_D3D12)
+     list(APPEND REXUI_SOURCES ${REXUI_D3D12_SOURCES})
+ endif()
+@@ -120,6 +129,11 @@
+     ${REXGLUE_ROOT}/src  # For ui/shaders/bytecode includes
+     ${REXGLUE_ROOT}/thirdparty/stb  # stb_image.h for icon decoding
+ )
++if(REXGLUE_USE_DEKO3D)
++    target_include_directories(rexui PRIVATE
++        ${REXGLUE_ROOT}/thirdparty/uam
++        ${REXGLUE_ROOT}/thirdparty/spirv-cross)
++endif()
+ 
+ target_link_libraries(rexui PUBLIC
+     rexcore
+@@ -130,6 +144,9 @@
+     target_link_libraries(rexui PUBLIC SDL3::SDL3)
+ endif()
+ target_link_libraries(rexui PRIVATE utf8cpp)
++if(REXGLUE_USE_DEKO3D)
++    target_link_libraries(rexui PUBLIC deko3d uamlib spirv-cross-glsl xxHash::xxhash)
++endif()
+ 
+ if(REXGLUE_FIDELITYFX_SOURCE_DIR AND EXISTS "${REXGLUE_FIDELITYFX_SOURCE_DIR}/sdk/include")
+     target_include_directories(rexui PRIVATE
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -89,6 +89,10 @@
+ 
+ if(REXGLUE_USE_VULKAN)
+     list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_SPIRV_SOURCES} ${REXGPU_XENOS_VULKAN_SOURCES})
++elseif(REXGLUE_USE_DEKO3D)
++    # The app-owned Deko3D renderer reuses the SDK's Xenos-to-SPIR-V shader
++    # translator, without compiling or linking the Vulkan backend.
++    list(APPEND REXGPU_XENOS_SOURCES ${REXGPU_XENOS_SPIRV_SOURCES})
+ endif()
+ 
+ if(REXGLUE_USE_D3D12)
+@@ -162,6 +166,16 @@
+         OSDependent
+         OGLCompiler
+     )
++elseif(REXGLUE_USE_DEKO3D)
++    target_link_libraries(rexgpu-xenos PRIVATE
++        spirv-tools-headers
++        glslang::SPIRV
++        glslang
++        MachineIndependent
++        GenericCodeGen
++        OSDependent
++        OGLCompiler
++    )
+ endif()
+ 
+ if(REXGLUE_USE_D3D12)
+diff --git a/cmake/rexglue_switch.cmake b/cmake/rexglue_switch.cmake
+--- a/cmake/rexglue_switch.cmake
++++ b/cmake/rexglue_switch.cmake
+@@ -6,16 +6,18 @@
+ #   rexglue_switch_add_nro(<target> [NAME ..] [AUTHOR ..] [VERSION ..] [ICON ..])
+ #       packages <target>.nro next to the executable
+ #
+-# Requires the switch-devkitA64.cmake toolchain (DEVKITPRO, compiler, specs) and
+-# REXGLUE_SWITCH_NVK_SDK pointing at the Mesa Horizon SDK.
++# Requires the switch-devkitA64.cmake toolchain (DEVKITPRO, compiler, specs).
++# Vulkan builds also require REXGLUE_SWITCH_NVK_SDK or REXGLUE_SWITCH_NVK_SOURCE.
+ #==========================================================
+ include_guard(GLOBAL)
+ 
+ set(REXGLUE_SWITCH_NVK_SOURCE "" CACHE PATH "Pinned NXVK source and build tree")
+ set(REXGLUE_SWITCH_NVK_SDK "" CACHE PATH "Mesa Horizon SDK")
+-add_library(rexglue_switch_nvk INTERFACE)
+-add_library(rex::nvk ALIAS rexglue_switch_nvk)
+-if(REXGLUE_SWITCH_NVK_SOURCE)
++if(REXGLUE_USE_VULKAN)
++    add_library(rexglue_switch_nvk INTERFACE)
++    add_library(rex::nvk ALIAS rexglue_switch_nvk)
++endif()
++if(REXGLUE_USE_VULKAN AND REXGLUE_SWITCH_NVK_SOURCE)
+     set(_nvklib "${REXGLUE_SWITCH_NVK_SOURCE}/switch/build/pkg/lib")
+     target_link_libraries(rexglue_switch_nvk INTERFACE
+         "-Wl,--whole-archive" "${_nvklib}/libnvk.a" "-Wl,--no-whole-archive"
+@@ -23,7 +25,7 @@
+         expat z nx m stdc++ pthread "-Wl,--end-group")
+     # This driver exposes the ICD entry, not the loader entry.
+     add_compile_definitions(REX_SWITCH_NXVK=1)
+-else()
++elseif(REXGLUE_USE_VULKAN)
+     if(NOT EXISTS "${REXGLUE_SWITCH_NVK_SDK}/lib/libvulkan.a" AND NOT REXGLUE_SWITCH_COMPILE_ONLY)
+         message(FATAL_ERROR "Set REXGLUE_SWITCH_NVK_SDK or REXGLUE_SWITCH_NVK_SOURCE")
+     endif()
+@@ -49,24 +51,31 @@
+ #   switch_crash_hooks.c  abort()/exit() reports and stderr to the SD; abort
+ #                       must be defined before libc.a is searched
+ if(NOT TARGET rexglue_switch_startup)
+-    add_library(rexglue_switch_startup OBJECT
++    set(_switch_startup_sources
+         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/runtime_switch.cpp"
+-        "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_elf_stubs.c"
+         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_crash_hooks.c"
+         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_saltynx.cpp"
+         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_perf.cpp"
+         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_apm.cpp")
++    if(REXGLUE_USE_VULKAN)
++        list(APPEND _switch_startup_sources
++            "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_elf_stubs.c")
++    endif()
++    add_library(rexglue_switch_startup OBJECT ${_switch_startup_sources})
+     # switch_perf.cpp registers every thread (the profiler needs their handles)
+     # by wrapping libnx's threadCreate/threadClose, which pthread goes through.
+     # It also counts the libnx calls that cost IPC or walk memory and the time
+     # the calling threads spend inside them.
+     target_link_options(rexglue_switch_startup INTERFACE
+         "LINKER:--wrap=threadCreate,--wrap=threadClose"
+-        "LINKER:--wrap=nvFenceWait,--wrap=nvGpuChannelKickoff,--wrap=nvMapCreate"
+-        "LINKER:--wrap=nvAddressSpaceAllocFixed,--wrap=nvioctlNvhostAsGpu_MapBufferEx"
+         "LINKER:--wrap=armDCacheClean,--wrap=nwindowQueueBuffer,--wrap=bqDequeueBuffer"
+         "LINKER:--wrap=svcSleepThread")
+-    if(REXGLUE_SWITCH_NVK_SOURCE)
++    if(REXGLUE_USE_VULKAN)
++        target_link_options(rexglue_switch_startup INTERFACE
++            "LINKER:--wrap=nvFenceWait,--wrap=nvGpuChannelKickoff,--wrap=nvMapCreate"
++            "LINKER:--wrap=nvAddressSpaceAllocFixed,--wrap=nvioctlNvhostAsGpu_MapBufferEx")
++    endif()
++    if(REXGLUE_USE_VULKAN AND REXGLUE_SWITCH_NVK_SOURCE)
+         target_sources(rexglue_switch_startup PRIVATE
+             "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_nvk_compat.c")
+     endif()
+@@ -110,7 +119,13 @@
+     set_property(TARGET ${target_name} APPEND PROPERTY LINK_DEPENDS ${_whole})
+     # Still linked normally, for the build order and their own dependencies
+     # (glslang, FFmpeg, ...), which stay regular archives.
+-    target_link_libraries(${target_name} PRIVATE ${_libs} rex::nvk)
++    if(REXGLUE_USE_VULKAN)
++        target_link_libraries(${target_name} PRIVATE ${_libs} rex::nvk)
++    elseif(REXGLUE_USE_DEKO3D)
++        target_link_libraries(${target_name} PRIVATE ${_libs} deko3d)
++    else()
++        target_link_libraries(${target_name} PRIVATE ${_libs})
++    endif()
+ 
+     # rex_app.cpp includes imgui.h. rexruntime links imgui privately, so its
+     # include path does not reach the title; take the path alone, since imgui's

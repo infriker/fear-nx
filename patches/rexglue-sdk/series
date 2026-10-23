@@ -20,3 +20,14 @@
 0020-guest-memory-commit-diagnostics.patch
 0021-switch-resource-telemetry.patch
 0022-compact-shadow-arena.patch
+0023-switch-deko3d-backend.patch
+0024-switch-deko3d-compute-stage.patch
+0025-switch-nro-output-name.patch
+0026-deko-image-allocation-retry.patch
+0027-switch-spirv-cross-headers.patch
+0028-switch-presenter-lifecycle.patch
+0029-deko-translator-header-only-vulkan.patch
+0030-deko-test-heap-cap.patch
+0031-deko-enable-compute-queue.patch
+0032-deko-gpu-diagnostics.patch
+0033-prove-vertex-index-register.patch

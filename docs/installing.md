@@ -1,50 +1,16 @@
-# Installation
+# Installing the deko3d build
 
-Use the [browser installer](https://infriker.github.io/fear-nx/) with an Xbox 360
-disc image or extracted folder. The extracted layout is `default.xex` beside
-`Game/`; `Game/uberCatalog.cat` must be present. The installer checks the XEX
-revision, but that check alone cannot prove that every data file is intact.
+Follow the [branch README](../README.md#how-to-install). The browser installer
+currently supplies Vulkan; it does not select deko3d from a Git branch.
 
-The full ZIP contains `fear-nx/`. Extract it into `sdmc:/switch/`.
-The resulting executable is `sdmc:/switch/fear-nx/fear_nx.nro`; the game's
-executable is `sdmc:/switch/fear-nx/game/default.xex` and its data are under
-`sdmc:/switch/fear-nx/game/Game/`.
+Place `fear_nx_deko3d.nro` and `fear-nx.toml` in `sdmc:/switch/fear-nx/`.
+Your own supported Xbox 360 files belong in `game/default.xex` and `game/Game/`
+under that folder. Copy the entire extracted game; `Game/uberCatalog.cat` must
+be present. The PC edition cannot be substituted.
 
-Launch through title takeover: hold R while starting an installed game, then
-select F.E.A.R. NX in the Homebrew Menu. Album/applet mode does not provide the
-required memory. The release profile leaves clocks unchanged. The latest test
-builds run at about 30 FPS through most gameplay at a 460 MHz GPU clock, with
-25–27 FPS in heavy firefights and lows of about 17 FPS in some GPU-heavy areas.
-See [performance observations and limitations](performance.md).
+Use title takeover mode (hold R when starting an installed game). Keep
+`userdata/` when updating and back up custom settings before replacing the TOML.
+Vulkan and deko3d NROs have distinct names and can coexist in this folder.
+The profile does not force overclocking; the reported 20–30 FPS used overclocking.
 
-## Updates
-
-Select your supported game folder and choose **Create fear-nx-update.zip**.
-For an update, `default.xex` alone in the selected folder is enough. The update
-contains only `fear_nx.nro`, `fear-nx.toml` and `LICENSES.txt`.
-
-Back up your TOML if you customized it. Keep `userdata/` (saves), `game/` and the
-existing runtime directories when replacing the release files.
-
-## Manual installation
-
-Download `fear-nx-update.zip` from the [release page](https://github.com/infriker/fear-nx/releases/latest),
-extract it into `sdmc:/switch/`, and copy your own `default.xex` and `Game/`
-directory into `sdmc:/switch/fear-nx/game/`. The release contains no original
-game assets.
-
-## Troubleshooting
-
-- **Unsupported executable:** the port needs the exact SHA-256 shown in the
-  README. PC game files and other Xbox revisions cannot be substituted.
-- **Incomplete folder:** choose the folder above `default.xex` and `Game/`,
-  not `Game/` alone. Copy the whole extracted game.
-- **No launch or loading failure:** check title takeover mode, package paths
-  and the presence of your original game files.
-- **Missing objects on first encounter:** allow asynchronous pipelines to
-  compile; see [known issues](known-issues.md).
-- **Installer download fails:** keep the page open until the browser download
-  completes and use a current desktop browser with service workers enabled.
-
-The installer reads files locally. Its network requests download the page and
-port files; they do not upload your ISO, XEX or game data.
+See [known issues](known-issues.md) for performance and reporting limitations.

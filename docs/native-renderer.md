@@ -1,5 +1,8 @@
 # Native Vulkan renderer
 
+This document describes the retained optional Vulkan path. This branch defaults
+to deko3d; see the [README](../README.md) and [test history](deko3d-history.md).
+
 The renderer consumes the Xbox 360 Xenos command ring produced by the game and
 records Vulkan commands. Game shaders are translated to SPIR-V by ReXGlue;
 Mesa/NVK executes them on the Switch GPU. The source is in `src/native/`.
