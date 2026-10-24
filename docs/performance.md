@@ -46,6 +46,16 @@ The normal profile keeps profiling/tracing off, anisotropy at 2x, host MSAA off,
 the guest game's tile scheduling. A recording-thread experiment was worse in
 the user's comparison and is not enabled.
 
+
+Version 0.1.2 disables routine logging, periodic log flushing, Vulkan validation,
+GPU verification/statistics and the separate Switch performance report by
+default. The NRO also defaults to quiet logging when no TOML is present.
+FPS/resolution overlays, shader caches and the existing graphics profile remain.
+To update an old diagnostic installation, replace both the NRO and the supplied
+TOML (back up custom settings first); explicit settings in an old TOML still win.
+For deliberate profiling, set `[switch] perf_report = true` and restart.
+No new controlled hardware FPS measurement is claimed.
+
 ## Next work
 
 - Find reproducible triggers for incomplete frames and decal artifacts.

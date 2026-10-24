@@ -1,0 +1,238 @@
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -33,7 +33,7 @@
+ #include <spdlog/sinks/stdout_sinks.h>
+ #endif
+ 
+-REXCVAR_DEFINE_STRING(log_level, "info", "Log",
++REXCVAR_DEFINE_STRING(log_level, REX_PLATFORM_SWITCH ? "off" : "info", "Log",
+                       "Global log level: trace, debug, info, warn, error, critical, off")
+     .allowed({"trace", "debug", "info", "warn", "error", "critical", "off"});
+ 
+@@ -44,7 +44,7 @@
+ 
+ REXCVAR_DEFINE_BOOL(log_noisy, false, "Log", "Enable noisy/high-frequency log macros");
+ 
+-REXCVAR_DEFINE_STRING(log_flush_level, "", "Log",
++REXCVAR_DEFINE_STRING(log_flush_level, REX_PLATFORM_SWITCH ? "off" : "", "Log",
+                       "Level at which every message is flushed to the log file at once; empty "
+                       "keeps the default (info). On the Switch each flush is a synchronous SD "
+                       "write on the logging thread.")
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -25,7 +25,7 @@
+ #include "vulkan_moltenvk.h"
+ #endif
+ 
+-REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, true, "UI/Vulkan", "Log Vulkan debug messages");
++REXCVAR_DEFINE_BOOL(vulkan_log_debug_messages, !REX_PLATFORM_SWITCH, "UI/Vulkan", "Log Vulkan debug messages");
+ 
+ #if REX_PLATFORM_SWITCH
+ extern "C" {
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -87,6 +87,10 @@
+                      "Start the profiler's GPU A/B lap this many seconds after launch; 0 = only "
+                      "with L+R+ZL. The image is wrong while the lap runs, on purpose.");
+ extern "C" void RexSwitchPerfScheduleAb(uint32_t seconds);
++extern "C" void RexSwitchPerfConfigure(bool enabled);
++REXCVAR_DEFINE_BOOL(switch_perf_report, false, "Switch",
++                    "Enable diagnostic counters, timing and SD profiler reports; restart required")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ REXCVAR_DEFINE_STRING(switch_mesa_env, "", "Switch",
+                       "Driver environment variables, NAME=value separated by ';', set before "
+                       "the Vulkan instance exists (the driver reads them with getenv). "
+@@ -225,7 +229,8 @@
+       start = end + 1;
+     }
+   }
+-  if (REXCVAR_GET(switch_ab_lap_after_s) > 0) {
++  RexSwitchPerfConfigure(REXCVAR_GET(switch_perf_report));
++  if (REXCVAR_GET(switch_perf_report) && REXCVAR_GET(switch_ab_lap_after_s) > 0) {
+     RexSwitchPerfScheduleAb(static_cast<uint32_t>(REXCVAR_GET(switch_ab_lap_after_s)));
+   }
+   RexSwitchApmPedirGpuMhz(REXCVAR_GET(switch_gpu_mhz));
+--- a/src/ui/switch_perf.cpp
++++ b/src/ui/switch_perf.cpp
+@@ -5,7 +5,8 @@
+  * The first boot that reached the title screen ran at 5-10 fps, with two cores at 97% and the
+  * GPU at 99.7% according to the Horizon OC monitor. That does not tell what to optimize: it takes
+  * knowing which thread spends the CPU and in which function. Horizon has no perf and no debugger
+- * on a retail console, so it is measured from inside. Every 10 s a report is appended to
++ * on a retail console, so it is measured from inside. With switch_perf_report=true,
++ * every 10 s a report is appended to
+  * <NRO folder>/logs/rex/rex_perfil.log:
+  *
+  *  - Game FPS: guest presents (IssueSwap).
+@@ -168,6 +169,20 @@
+ 
+ std::atomic<u64> g_counters[kCounterCount];
+ 
++// Configuration arrives after the startup constructor. Keep diagnostics off
++// until SetupEnvironment has loaded the user's explicit opt-in.
++std::atomic<bool> g_diagnostics_enabled{false};
++std::atomic<bool> g_diagnostics_configured{false};
++
++bool DiagnosticsEnabled() {
++  return g_diagnostics_enabled.load(std::memory_order_relaxed);
++}
++
++extern "C" void RexSwitchPerfConfigure(bool enabled) {
++  g_diagnostics_enabled.store(enabled, std::memory_order_relaxed);
++  g_diagnostics_configured.store(true, std::memory_order_release);
++}
++
+ /*
+  * Wrapped libnx calls (see the file header): how many, how much time inside and, where it makes
+  * sense, how many bytes. They are constant-initialized, so they are valid even if someone calls
+@@ -198,6 +213,7 @@
+ Llamadas g_llamadas[kLlamadasCount];
+ 
+ inline void Anotar(unsigned id, u64 desde, u64 bytes = 0) {
++  if (!DiagnosticsEnabled()) return;
+   const u64 ticks = armGetSystemTick() - desde;
+   Llamadas& l = g_llamadas[id];
+   l.n.fetch_add(1, std::memory_order_relaxed);
+@@ -258,6 +274,7 @@
+ }
+ 
+ extern "C" void RexSwitchPerfToggleAb(void) {
++  if (!DiagnosticsEnabled()) return;
+   const bool nuevo = !g_ab_activas.load(std::memory_order_relaxed);
+   g_ab_activas.store(nuevo, std::memory_order_relaxed);
+   if (!nuevo) {
+@@ -973,7 +990,8 @@
+   const u64 inicio = armGetSystemTick();
+   overlay.Arrancar(inicio);
+   const u64 calentamiento = (kStartDelayNs / 1000000ULL) * tick_freq / 1000ULL;
+-  while (armGetSystemTick() - inicio < calentamiento) {
++  while (armGetSystemTick() - inicio < calentamiento ||
++         !g_diagnostics_configured.load(std::memory_order_acquire)) {
+     __real_svcSleepThread(kPassiveIntervalNs);
+     overlay.Paso(armGetSystemTick(), tick_freq, false);
+   }
+@@ -981,6 +999,15 @@
+   // The stock high-GPU profile (switch_apm.cpp). Requested here, after the warm-up, because the
+   // title's configuration has been read by now; it polls the clocks for about 1.5 s.
+   RexSwitchApmAplicar();
++
++  // Normal releases retain overlay/clock updates, with no report files,
++  // thread sampling, memory telemetry or diagnostic A/B draw suppression.
++  if (!DiagnosticsEnabled()) {
++    while (true) {
++      __real_svcSleepThread(kPassiveIntervalNs);
++      overlay.Paso(armGetSystemTick(), tick_freq, true);
++    }
++  }
+ 
+   // Invasive sampling is only enabled explicitly, for diagnostics.
+   // The normal mode keeps FPS, CPU and counters, without stopping the game.
+@@ -1123,28 +1150,28 @@
+ 
+ /* libnx calls that cost IPC or walk memory. See g_llamadas. */
+ Result __wrap_nvFenceWait(NvFence* f, s32 timeout_us) {
+-  const u64 desde = armGetSystemTick();
++  const u64 desde = DiagnosticsEnabled() ? armGetSystemTick() : 0;
+   const Result rc = __real_nvFenceWait(f, timeout_us);
+   Anotar(timeout_us == 0 ? kFenceConsulta : kFenceEspera, desde);
+   return rc;
+ }
+ 
+ Result __wrap_nvGpuChannelKickoff(NvGpuChannel* c) {
+-  const u64 desde = armGetSystemTick();
++  const u64 desde = DiagnosticsEnabled() ? armGetSystemTick() : 0;
+   const Result rc = __real_nvGpuChannelKickoff(c);
+   Anotar(kKickoff, desde);
+   return rc;
+ }
+ 
+ Result __wrap_nvMapCreate(NvMap* m, void* cpu_addr, u32 size, u32 align, NvKind kind, bool is_cpu_cacheable) {
+-  const u64 desde = armGetSystemTick();
++  const u64 desde = DiagnosticsEnabled() ? armGetSystemTick() : 0;
+   const Result rc = __real_nvMapCreate(m, cpu_addr, size, align, kind, is_cpu_cacheable);
+   Anotar(is_cpu_cacheable ? kNvMapCacheada : kNvMapSinCache, desde, size);
+   return rc;
+ }
+ 
+ Result __wrap_nvAddressSpaceAllocFixed(NvAddressSpace* a, bool sparse, u64 size, iova_t iova) {
+-  const u64 desde = armGetSystemTick();
++  const u64 desde = DiagnosticsEnabled() ? armGetSystemTick() : 0;
+   const Result rc = __real_nvAddressSpaceAllocFixed(a, sparse, size, iova);
+   Anotar(kReservaDireccion, desde, size);
+   return rc;
+@@ -1152,7 +1179,7 @@
+ 
+ Result __wrap_nvioctlNvhostAsGpu_MapBufferEx(u32 fd, u32 flags, u32 kind, u32 nvmap_handle, u32 page_size,
+                                              u64 buffer_offset, u64 mapping_size, u64 input_offset, u64* offset) {
+-  const u64 desde = armGetSystemTick();
++  const u64 desde = DiagnosticsEnabled() ? armGetSystemTick() : 0;
+   const Result rc = __real_nvioctlNvhostAsGpu_MapBufferEx(fd, flags, kind, nvmap_handle, page_size, buffer_offset,
+                                                           mapping_size, input_offset, offset);
+   Anotar(kMapeoGpu, desde, mapping_size);
+@@ -1160,7 +1187,7 @@
+ }
+ 
+ void __wrap_armDCacheClean(void* addr, size_t size) {
+-  const u64 desde = armGetSystemTick();
++  const u64 desde = DiagnosticsEnabled() ? armGetSystemTick() : 0;
+   __real_armDCacheClean(addr, size);
+   Anotar(kCacheClean, desde, size);
+ }
+@@ -1181,7 +1208,7 @@
+ std::atomic<unsigned> g_intervalo_swap{0};
+ 
+ Result __wrap_nwindowQueueBuffer(NWindow* nw, s32 slot, const NvMultiFence* fence) {
+-  const u64 desde = armGetSystemTick();
++  const u64 desde = DiagnosticsEnabled() ? armGetSystemTick() : 0;
+   const unsigned pedido = g_intervalo_swap.load(std::memory_order_relaxed);
+   if (pedido != 0 && nw != nullptr && nw->swap_interval != pedido) {
+     nwindowSetSwapInterval(nw, pedido);
+@@ -1193,14 +1220,14 @@
+ 
+ Result __wrap_bqDequeueBuffer(Binder* b, bool async, u32 width, u32 height, s32 format, u32 usage, s32* buf,
+                               NvMultiFence* fence) {
+-  const u64 desde = armGetSystemTick();
++  const u64 desde = DiagnosticsEnabled() ? armGetSystemTick() : 0;
+   const Result rc = __real_bqDequeueBuffer(b, async, width, height, format, usage, buf, fence);
+   Anotar(kDequeueBuffer, desde);
+   return rc;
+ }
+ 
+ void __wrap_svcSleepThread(s64 nano) {
+-  const u64 desde = armGetSystemTick();
++  const u64 desde = DiagnosticsEnabled() ? armGetSystemTick() : 0;
+   __real_svcSleepThread(nano);
+   Anotar(nano == 0 ? kSleep0 : nano < 0 ? kSleepCeder : nano <= 1000000 ? kSleepCorto : kSleepLargo, desde);
+ }
+@@ -1213,6 +1240,7 @@
+  */
+ // A long frame, in armGetSystemTick ticks (see VentanaTiron).
+ void RexSwitchPerfTiron(u64 inicio, u64 fin) {
++  if (!DiagnosticsEnabled()) return;
+   const u32 i = g_num_tirones.fetch_add(1);
+   if (i < kMaxTirones) {
+     g_tirones[i] = {inicio, fin};
+@@ -1229,6 +1257,7 @@
+ }
+ 
+ void RexSwitchPerfCount(unsigned id) {
++  if (id != 0 && !DiagnosticsEnabled()) return;
+   if (id < kCounterCount) {
+     g_counters[id].fetch_add(1, std::memory_order_relaxed);
+   }
+@@ -1250,6 +1279,7 @@
+  * 21 clipped audio samples, 22 audio buffers with a peak of 0.98 or more.
+  */
+ void RexSwitchPerfAdd(unsigned id, u64 value) {
++  if (!DiagnosticsEnabled()) return;
+   if (id < kCounterCount) {
+     g_counters[id].fetch_add(value, std::memory_order_relaxed);
+   }
+@@ -1257,6 +1287,7 @@
+ 
+ /* max counter (23 = audio mix peak in ten-thousandths; the report resets it to 0). */
+ void RexSwitchPerfMax(unsigned id, u64 value) {
++  if (!DiagnosticsEnabled()) return;
+   if (id >= kCounterCount) {
+     return;
+   }

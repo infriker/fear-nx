@@ -1,4 +1,7 @@
 # F.E.A.R. NX release settings. See docs/native-renderer.md.
+# No shader dumps or verbose decoder output. Keep shader/pipeline caches enabled.
+dump_shaders = ""
+ffmpeg_verbose = false
 [nx]
 # Dynamic water/mirror reflections; restart after changing.
 planar_reflections = false
@@ -45,12 +48,26 @@ gpu_mhz = 0
 allow_ram_1600 = false
 nvmap_mb = 0
 ab_lap_after_s = 0
+perf_report = false
 
 [log]
-level = "warn"
-flush_level = "error"
-flush_interval = 5
+level = "off"
+flush_level = "off"
+flush_interval = 0
+verbose = false
+noisy = false
 
 [gpu]
 specialize_texture_signs = true
 implicit_lod_sampling = true
+native_verify = false
+page_hash_validation = false
+native_stats = false
+cp_fastpath_stats = false
+debug_markers = false
+texture_last_view_cache_stats = false
+
+[vulkan]
+validation_enabled = false
+log_debug_messages = false
+tessellation_wireframe = false

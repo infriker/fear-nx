@@ -66,3 +66,11 @@ Previously Windows paths were saved with unescaped backslashes, causing the
 next launch to reject the entire config and silently use renderer defaults.
 The patch covers both complete and category-filtered serialization and adds
 a save/load round-trip regression for paths, quotes and control characters.
+
+`0024-switch-diagnostics-opt-in.patch` defaults Switch logging and Vulkan debug
+messages to off. The separate performance reporter now requires
+`[switch] perf_report = true` and a restart: its SD writes, timing counters,
+thread/CPU reports, optional stack sampling and A/B draw-suppression hotkey
+are inactive otherwise. FPS/resolution overlay updates and clock management
+remain active. The profiler waits for configuration before choosing its mode;
+desktop defaults and explicit user logging overrides are preserved.

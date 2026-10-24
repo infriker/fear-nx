@@ -84,6 +84,16 @@ large compressed textures. Dynamic planar reflections are disabled by default;
 lighting and volumetric shadows remain enabled. See the
 [renderer settings](docs/native-renderer.md) to restore the original quality.
 
+
+Version 0.1.2 disables routine logging, periodic log flushing, Vulkan validation,
+GPU verification/statistics and the separate Switch performance report by
+default. The NRO also defaults to quiet logging when no TOML is present.
+FPS/resolution overlays, shader caches and the existing graphics profile remain.
+To update an old diagnostic installation, replace both the NRO and the supplied
+TOML (back up custom settings first); explicit settings in an old TOML still win.
+For deliberate profiling, set `[switch] perf_report = true` and restart.
+No new controlled hardware FPS measurement is claimed.
+
 The user's hardware observations reported on **2026-10-22**, at the tested stock
 **460 MHz GPU** setting, are 30 FPS through most gameplay, 25–27 FPS in heavy
 firefights, and lows of about 17 FPS in anomalous GPU-heavy areas. During drops
