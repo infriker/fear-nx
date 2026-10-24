@@ -39,7 +39,8 @@ void main() {
     depth = float(depth24) * (1.0 / 16777215.0);
   } else {
     depth = clamp(uintBitsToFloat(raw), 0.0, 1.0);
-    depth24 = uint(depth * 16777215.0 + 0.5);
+    // Adding 0.5 can round 0xFFFFFF + 0.5 to 2^24 in float32 at depth 1.0.
+    depth24 = uint(roundEven(depth * 16777215.0));
   }
   uint stencil = 0u;
   if ((flags & 2u) != 0u) {

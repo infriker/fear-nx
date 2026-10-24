@@ -8,6 +8,11 @@ needed. The resulting archives stay in the ignored `sdk/nvk/` directory.
 - `danfromtico/mesa-switch` commit `d4a00ea0ab3f59afb967cc5d779e4263d237bd77` (Mesa 26.2.3).
 - Patches `0001`–`0004` come from Project8 unchanged. Patches `0005` and `0006`
   bind GPU engines before the first submission for Eden compatibility.
+- Patch `0007` backports the GPFIFO-capacity fix from upstream commit
+  `f68a41350dbc0b380dcb1462898d8bed48dfdb5e`, preserving the engine bindings.
+- Patch `0008` fixes memory binding for images with a stencil-copy plane.
+  It is included in v0.1.1; affected images may lose compression, with no
+  global compression override. See the patch directory README.
 - devkitPro base image: `devkitpro/devkita64:20260219`.
 - Docker Desktop with its Linux engine and PowerShell 7.
 
@@ -34,7 +39,7 @@ Get-ChildItem '.\patches\mesa-switch' -Filter '000*.patch' | Sort-Object Name | 
 ## Prepare the Docker image
 
 Limit parallel compilation to three jobs and install the Rust target explicitly.
-Apply these build settings after the six patches:
+Apply these build settings after the eight patches:
 
 ```powershell
 $dockerfile = Join-Path $mesa 'Docker.rust'
@@ -58,7 +63,7 @@ Set-Content -LiteralPath $buildScript -Value $s -Encoding utf8 -NoNewline
 docker build -f (Join-Path $mesa 'Docker.rust') -t devkitpro-mesa-rust-aarch64 $mesa
 ```
 
-The patch pattern applies all six patches in filename order. Normalizing the
+The patch pattern applies all eight patches in filename order. Normalizing the
 `rustc` and `bindgen` wrappers removes Windows line endings from their shebangs.
 
 ## Build the libraries

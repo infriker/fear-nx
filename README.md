@@ -77,6 +77,13 @@ shared resolve resources, D24 depth, 2× anisotropic filtering and disabled MSAA
 The supplied profile leaves GPU clock selection to the system or your clock tool;
 it does not force a GPU clock or reduce the rendering resolution.
 
+Version 0.1.1 keeps weapon displays enabled and carries the depth/color alias,
+video-plane update and descriptor-lifetime fixes. Its balanced profile uses
+128 volumetric-light slices, 64x64 volumetric shadow maps and mip 1 for eligible
+large compressed textures. Dynamic planar reflections are disabled by default;
+lighting and volumetric shadows remain enabled. See the
+[renderer settings](docs/native-renderer.md) to restore the original quality.
+
 The user's hardware observations reported on **2026-10-22**, at the tested stock
 **460 MHz GPU** setting, are 30 FPS through most gameplay, 25–27 FPS in heavy
 firefights, and lows of about 17 FPS in anomalous GPU-heavy areas. During drops

@@ -11,11 +11,12 @@
 // rectangle (draw_util::GetResolveInfo). They are what the translated shaders
 // expect, so they are kept as close to the original as the native design allows;
 // EDRAM storage, fragment shader interlock and tessellation are omitted, with
-// explicit alias handling for recognized stencil and zero depth/color clears.
+// explicit alias handling for recognized stencil and constant depth/color clears.
 
 #include "native_renderer.h"
 #include "native_resolve_layout.h"
 #include "native_stencil_clear.h"
+#include "native_color_clear.h"
 #include "native_depth_color_clear.h"
 #include "native_zcull.h"
 #include "native_attachment_clear.h"
@@ -110,6 +111,8 @@ namespace shaders {
 #include "shaders/vulkan_spirv/apply_gamma_table_cs.h"
 #include "shaders/depth_resolve_cs.h"
 #include "shaders/depth_to_float_cs.h"
+#include "shaders/depth_msaa_to_float_cs.h"
+#include "shaders/depth_msaa_to_words_cs.h"
 #include "shaders/copy_color_cs.h"
 }  // namespace shaders
 
@@ -258,6 +261,9 @@ struct RenderTarget {
   VkImageView view = VK_NULL_HANDLE;
   // Depth only, for the compute pass that resolves depth.
   VkImageView sample_view = VK_NULL_HANDLE;
+  // Stencil-only sampled view for MSAA depth resolves that also need the
+  // packed (depth24 << 8) | stencil guest word representation.
+  VkImageView stencil_sample_view = VK_NULL_HANDLE;
   VkFormat format = VK_FORMAT_UNDEFINED;
   VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
   uint32_t width = 0;
@@ -365,6 +371,10 @@ struct Renderer::Impl {
   VkBuffer stream_buffer = VK_NULL_HANDLE;
   VkDeviceMemory stream_memory = VK_NULL_HANDLE;
   uint8_t* stream_mapping = nullptr;
+  uint32_t stream_memory_type_index = 0;
+  VkDeviceSize stream_allocation_size = 0;
+  VkDeviceSize stream_noncoherent_atom_size = 1;
+  bool stream_memory_coherent = true;
   uint64_t stream_head = 0;  // total bytes ever allocated
   static constexpr uint64_t kNoStreamPosition = UINT64_MAX;
   // Stream data referenced by the draw currently being prepared. The renderer
@@ -394,6 +404,10 @@ struct Renderer::Impl {
     uint64_t frame = 0;
     // Oldest stream position the submission reads.
     uint64_t stream_oldest = 0;
+    // Virtual stream range written by the host in this submission.
+    uint64_t stream_dirty_begin = kNoStreamPosition;
+    uint64_t stream_dirty_end = 0;
+    bool stream_has_allocation = false;
     std::vector<VkDescriptorPool> descriptor_pools;
     size_t descriptor_pool_used = 0;
     bool timed = false;
@@ -414,7 +428,8 @@ struct Renderer::Impl {
   std::set<std::array<uint32_t, 15>> trace_draw_geometries;
   std::set<std::array<uint32_t, 12>> trace_stencil_states;
   std::set<std::array<uint32_t, 8>> trace_stencil_clear_aliases;
-  std::set<std::array<uint32_t, 8>> trace_depth_color_clears;
+  std::set<std::array<uint32_t, 9>> trace_depth_color_clears;
+  std::set<std::array<uint32_t, 14>> trace_zero_color_alias_clears;
   std::set<std::array<uint32_t, 26>> trace_resolve_states;
   std::set<std::array<uint32_t, 26>> trace_depth_resolve_states;
   std::set<std::array<uint32_t, 12>> trace_shared_resolve_states;
@@ -446,6 +461,11 @@ struct Renderer::Impl {
   VkDescriptorSetLayout depth_copy_set_layout = VK_NULL_HANDLE;
   VkPipelineLayout depth_copy_layout = VK_NULL_HANDLE;
   VkPipeline depth_copy_pipeline = VK_NULL_HANDLE;
+  VkPipelineLayout depth_msaa_copy_layout = VK_NULL_HANDLE;
+  VkPipeline depth_msaa_copy_pipeline = VK_NULL_HANDLE;
+  VkDescriptorSetLayout depth_msaa_words_set_layout = VK_NULL_HANDLE;
+  VkPipelineLayout depth_msaa_words_layout = VK_NULL_HANDLE;
+  VkPipeline depth_msaa_words_pipeline = VK_NULL_HANDLE;
   // Color resolves by compute (copy_color.cs.glsl), same set layout.
   VkPipelineLayout copy_color_layout = VK_NULL_HANDLE;
   VkPipeline copy_color_pipeline = VK_NULL_HANDLE;
@@ -620,6 +640,9 @@ struct Renderer::Impl {
   VkPipeline swap_pipeline = VK_NULL_HANDLE;
   VkBuffer ramp_buffer = VK_NULL_HANDLE;
   VkDeviceMemory ramp_memory = VK_NULL_HANDLE;
+  uint32_t ramp_memory_type_index = 0;
+  VkDeviceSize ramp_allocation_size = 0;
+  bool ramp_memory_coherent = true;
   uint8_t* ramp_mapping = nullptr;
   VkBufferView ramp_views[kSubmissionSlots] = {};
   VkDescriptorPool swap_pool = VK_NULL_HANDLE;
@@ -671,6 +694,7 @@ struct Renderer::Impl {
     VkImage image;
     VkImageView view;
     VkImageView sample_view;
+    VkImageView stencil_sample_view;
     VkDeviceMemory memory;
   };
   std::vector<RetiredRenderTarget> retired_render_targets;
@@ -1124,6 +1148,9 @@ struct Renderer::Impl {
     s.descriptor_pool_used = 0;
     s.number = submission_number;
     s.frame = frame;
+    s.stream_dirty_begin = kNoStreamPosition;
+    s.stream_dirty_end = 0;
+    s.stream_has_allocation = false;
     s.stream_oldest = stream_head;
     if (draw_stream_active) {
       draw_stream_submission_oldest = s.stream_oldest;
@@ -1194,6 +1221,24 @@ struct Renderer::Impl {
     // Keep pending render/resolve dependencies across submissions. Queue order
     // alone does not make writes visible to later commands.
     Submission& s = current();
+    if (!stream_memory_coherent && s.stream_dirty_begin != kNoStreamPosition) {
+      const uint64_t dirty_begin = s.stream_dirty_begin;
+      const uint64_t dirty_end = s.stream_dirty_end;
+      auto flush = [this](VkDeviceSize offset, VkDeviceSize size) {
+        rex::ui::vulkan::util::FlushMappedMemoryRange(
+            device, stream_memory, stream_memory_type_index, offset, stream_allocation_size, size);
+      };
+      const uint64_t begin_lap = dirty_begin / kStreamSize;
+      const uint64_t end_lap = (dirty_end - 1) / kStreamSize;
+      if (begin_lap == end_lap) {
+        flush(dirty_begin % kStreamSize, dirty_end - dirty_begin);
+      } else {
+        const uint64_t tail_offset = dirty_begin % kStreamSize;
+        flush(tail_offset, kStreamSize - tail_offset);
+        const uint64_t head_size = dirty_end % kStreamSize;
+        if (head_size) flush(0, head_size);
+      }
+    }
     {
       uint32_t slot = uint32_t(submission_number % kSubmissionSlots);
       if (profile_pool && !profile_segments[slot].empty()) {
@@ -1297,6 +1342,11 @@ struct Renderer::Impl {
       return nullptr;
     }
     BeginRecording();
+    if (!stream_memory_coherent && size && !current().stream_has_allocation) {
+      // Flushes operate on whole atoms, which also bound concurrent host/device
+      // access. Start each submission on a fresh atom without padding every draw.
+      alignment = std::max(alignment, stream_noncoherent_atom_size);
+    }
     // Allocations stay kStreamGuard short of the end, so a constant binding's
     // fixed range starting at any allocation stays inside the buffer.
     uint64_t start = rex::align(stream_head, uint64_t(alignment));
@@ -1315,6 +1365,9 @@ struct Renderer::Impl {
       Submit();
       WaitSubmission(submissions[submission_number % kSubmissionSlots]);
       BeginRecording();
+      if (!stream_memory_coherent && size) {
+        alignment = std::max(alignment, stream_noncoherent_atom_size);
+      }
       start = rex::align(stream_head, uint64_t(alignment));
       if ((start % kStreamSize) + size > kStreamSize - kStreamGuard) {
         start = NextStreamLap(start);
@@ -1337,6 +1390,12 @@ struct Renderer::Impl {
     }
     frame_stream_wait_ns += frame_fence_wait_ns - fence_before;
     stream_head = end;
+    if (!stream_memory_coherent && size) {
+      Submission& s = current();
+      s.stream_dirty_begin = std::min(s.stream_dirty_begin, start);
+      s.stream_dirty_end = std::max(s.stream_dirty_end, end);
+      s.stream_has_allocation = true;
+    }
     offset_out = VkDeviceSize(start % kStreamSize);
     if (draw_stream_active && pin_for_draw) {
       PinDrawStreamPosition(start);
@@ -1417,11 +1476,12 @@ struct Renderer::Impl {
             {VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, 16384},
             {VK_DESCRIPTOR_TYPE_SAMPLER, 16384},
             {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 256},
+            {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 256},
         };
         VkDescriptorPoolCreateInfo pool_info = {};
         pool_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO;
         pool_info.maxSets = 4096;
-        pool_info.poolSizeCount = 3;
+        pool_info.poolSizeCount = uint32_t(std::size(sizes));
         pool_info.pPoolSizes = sizes;
         VkDescriptorPool pool = VK_NULL_HANDLE;
         if (dfn().vkCreateDescriptorPool(vk, &pool_info, nullptr, &pool) != VK_SUCCESS) {
@@ -1497,9 +1557,12 @@ struct Renderer::Impl {
   // --- Draws ---------------------------------------------------------------------
 
   void Draw(const uint32_t* immediate_indices, uint32_t immediate_index_words);
-  bool GetFastClearRectangle(StencilClearRect& rect, bool require_zero_depth);
+  bool GetFastClearRectangle(StencilClearRect& rect, bool require_zero_depth,
+                             uint32_t required_zero_interpolators = 0,
+                             float required_constant_depth = -1.0f);
   void MirrorStencilClear();
   void MirrorZeroDepthColorClear();
+  void MirrorZeroColorAliasClear();
   void UpdateSystemConstants(bool primitive_polygonal, const draw_util::ViewportInfo& viewport,
                              uint32_t used_texture_mask, uint32_t vertex_index_endian_flags,
                              const VulkanShader* vs, const VulkanShader* ps);
@@ -1592,7 +1655,12 @@ bool Renderer::Impl::Initialize() {
     REXLOG_ERROR("[native] Could not create the {} MB stream buffer", kStreamSize >> 20);
     return false;
   }
-  if (!(device->memory_types().host_coherent & (1u << stream_memory_type))) {
+  stream_memory_type_index = stream_memory_type;
+  stream_allocation_size = stream_allocation;
+  stream_memory_coherent =
+      (device->memory_types().host_coherent & (1u << stream_memory_type_index)) != 0;
+  if (!stream_memory_coherent) {
+    stream_noncoherent_atom_size = device->properties().nonCoherentAtomSize;
     REXLOG_WARN("[native] The stream memory is not host-coherent");
   }
   void* mapping = nullptr;
@@ -1649,18 +1717,25 @@ bool Renderer::Impl::Initialize() {
     constant_infos[i].offset = 0;
     constant_infos[i].range = constant_ranges[i];
   }
-  VkWriteDescriptorSet writes[2] = {};
+  VkWriteDescriptorSet writes[1 + SpirvShaderTranslator::kConstantBufferCount] = {};
   writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
   writes[0].dstSet = set_shared;
   writes[0].descriptorCount = shared_binding_count;
   writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
   writes[0].pBufferInfo = shared_infos.data();
-  writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-  writes[1].dstSet = set_constants;
-  writes[1].descriptorCount = SpirvShaderTranslator::kConstantBufferCount;
-  writes[1].descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
-  writes[1].pBufferInfo = constant_infos;
-  dfn().vkUpdateDescriptorSets(vk, 2, writes, 0, nullptr);
+  // Consecutive-binding writes require identical stageFlags. The vertex and
+  // pixel constant bindings differ, so update each binding separately.
+  for (uint32_t i = 0; i < SpirvShaderTranslator::kConstantBufferCount; ++i) {
+    VkWriteDescriptorSet& write = writes[1 + i];
+    write.sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    write.dstSet = set_constants;
+    write.dstBinding = i;
+    write.descriptorCount = 1;
+    write.descriptorType = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC;
+    write.pBufferInfo = &constant_infos[i];
+  }
+  dfn().vkUpdateDescriptorSets(vk, 1 + SpirvShaderTranslator::kConstantBufferCount,
+                              writes, 0, nullptr);
 
   // Submissions.
   for (Submission& s : submissions) {
@@ -1892,6 +1967,59 @@ bool Renderer::Impl::CreateDepthConversion() {
   if (!depth_copy_pipeline) {
     REXLOG_WARN("[native] No direct depth resolve; resolving depth through a buffer");
   }
+  VkPushConstantRange msaa_copy_push = {
+      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) * 7};
+  VkPipelineLayoutCreateInfo msaa_copy_layout_info = {};
+  msaa_copy_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  msaa_copy_layout_info.setLayoutCount = 1;
+  msaa_copy_layout_info.pSetLayouts = &depth_copy_set_layout;
+  msaa_copy_layout_info.pushConstantRangeCount = 1;
+  msaa_copy_layout_info.pPushConstantRanges = &msaa_copy_push;
+  if (depth_copy_set_layout &&
+      dfn().vkCreatePipelineLayout(vk, &msaa_copy_layout_info, nullptr,
+                                   &depth_msaa_copy_layout) == VK_SUCCESS) {
+    depth_msaa_copy_pipeline = rex::ui::vulkan::util::CreateComputePipeline(
+        device, depth_msaa_copy_layout, shaders::kDepthMsaaToFloatCs,
+        sizeof(shaders::kDepthMsaaToFloatCs));
+  }
+  if (!depth_msaa_copy_pipeline) {
+    REXLOG_WARN("[native] No MSAA depth resolve pipeline");
+  }
+
+  VkDescriptorSetLayoutBinding words_bindings[3] = {};
+  words_bindings[0].binding = 0;
+  words_bindings[0].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+  words_bindings[0].descriptorCount = 1;
+  words_bindings[0].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  words_bindings[1] = words_bindings[0];
+  words_bindings[1].binding = 1;
+  words_bindings[2].binding = 2;
+  words_bindings[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+  words_bindings[2].descriptorCount = 1;
+  words_bindings[2].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+  VkDescriptorSetLayoutCreateInfo words_set_info = {};
+  words_set_info.sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO;
+  words_set_info.bindingCount = uint32_t(std::size(words_bindings));
+  words_set_info.pBindings = words_bindings;
+  VkPushConstantRange words_push = {
+      VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(uint32_t) * 6};
+  VkPipelineLayoutCreateInfo words_layout_info = {};
+  words_layout_info.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+  words_layout_info.setLayoutCount = 1;
+  words_layout_info.pSetLayouts = &depth_msaa_words_set_layout;
+  words_layout_info.pushConstantRangeCount = 1;
+  words_layout_info.pPushConstantRanges = &words_push;
+  if (dfn().vkCreateDescriptorSetLayout(vk, &words_set_info, nullptr,
+                                        &depth_msaa_words_set_layout) == VK_SUCCESS &&
+      dfn().vkCreatePipelineLayout(vk, &words_layout_info, nullptr,
+                                   &depth_msaa_words_layout) == VK_SUCCESS) {
+    depth_msaa_words_pipeline = rex::ui::vulkan::util::CreateComputePipeline(
+        device, depth_msaa_words_layout, shaders::kDepthMsaaToWordsCs,
+        sizeof(shaders::kDepthMsaaToWordsCs));
+  }
+  if (!depth_msaa_words_pipeline) {
+    REXLOG_WARN("[native] No MSAA depth/stencil packed-word resolve pipeline");
+  }
 
   VkPhysicalDeviceFeatures features = {};
   device->vulkan_instance()->functions().vkGetPhysicalDeviceFeatures(device->physical_device(),
@@ -2081,9 +2209,12 @@ bool Renderer::Impl::CreateSwapResources() {
   if (!rex::ui::vulkan::util::CreateDedicatedAllocationBuffer(
           device, ramp_size,
           VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-          rex::ui::vulkan::util::MemoryPurpose::kUpload, ramp_buffer, ramp_memory)) {
+          rex::ui::vulkan::util::MemoryPurpose::kUpload, ramp_buffer, ramp_memory,
+          &ramp_memory_type_index, &ramp_allocation_size)) {
     return false;
   }
+  ramp_memory_coherent =
+      (device->memory_types().host_coherent & (1u << ramp_memory_type_index)) != 0;
   void* mapping = nullptr;
   dfn().vkMapMemory(vk, ramp_memory, 0, VK_WHOLE_SIZE, 0, &mapping);
   ramp_mapping = static_cast<uint8_t*>(mapping);
@@ -2171,6 +2302,7 @@ void Renderer::Impl::Shutdown() {
   vkDeviceWaitIdle(vk);
   textures.Shutdown();
   for (auto& [key, rt] : render_targets) {
+    if (rt->stencil_sample_view) dfn().vkDestroyImageView(vk, rt->stencil_sample_view, nullptr);
     if (rt->sample_view) dfn().vkDestroyImageView(vk, rt->sample_view, nullptr);
     if (rt->view) dfn().vkDestroyImageView(vk, rt->view, nullptr);
     if (rt->image) dfn().vkDestroyImage(vk, rt->image, nullptr);
@@ -2178,6 +2310,9 @@ void Renderer::Impl::Shutdown() {
   }
   render_targets.clear();
   for (auto& retired : retired_render_targets) {
+    if (retired.stencil_sample_view) {
+      dfn().vkDestroyImageView(vk, retired.stencil_sample_view, nullptr);
+    }
     if (retired.sample_view) dfn().vkDestroyImageView(vk, retired.sample_view, nullptr);
     dfn().vkDestroyImageView(vk, retired.view, nullptr);
     dfn().vkDestroyImage(vk, retired.image, nullptr);
@@ -2187,11 +2322,22 @@ void Renderer::Impl::Shutdown() {
   if (depth_convert_pipeline) dfn().vkDestroyPipeline(vk, depth_convert_pipeline, nullptr);
   if (depth_convert_layout) dfn().vkDestroyPipelineLayout(vk, depth_convert_layout, nullptr);
   if (depth_copy_pipeline) dfn().vkDestroyPipeline(vk, depth_copy_pipeline, nullptr);
+  if (depth_msaa_copy_pipeline) dfn().vkDestroyPipeline(vk, depth_msaa_copy_pipeline, nullptr);
+  if (depth_msaa_words_pipeline) {
+    dfn().vkDestroyPipeline(vk, depth_msaa_words_pipeline, nullptr);
+  }
   if (copy_color_pipeline) dfn().vkDestroyPipeline(vk, copy_color_pipeline, nullptr);
   if (copy_color_layout) dfn().vkDestroyPipelineLayout(vk, copy_color_layout, nullptr);
   if (depth_copy_layout) dfn().vkDestroyPipelineLayout(vk, depth_copy_layout, nullptr);
+  if (depth_msaa_copy_layout) dfn().vkDestroyPipelineLayout(vk, depth_msaa_copy_layout, nullptr);
+  if (depth_msaa_words_layout) {
+    dfn().vkDestroyPipelineLayout(vk, depth_msaa_words_layout, nullptr);
+  }
   if (depth_copy_set_layout) {
     dfn().vkDestroyDescriptorSetLayout(vk, depth_copy_set_layout, nullptr);
+  }
+  if (depth_msaa_words_set_layout) {
+    dfn().vkDestroyDescriptorSetLayout(vk, depth_msaa_words_set_layout, nullptr);
   }
   if (depth_convert_pool) dfn().vkDestroyDescriptorPool(vk, depth_convert_pool, nullptr);
   if (depth_convert_set_layout) {
@@ -2715,6 +2861,10 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& requested_k
   if (key.is_depth) {
     view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
     dfn().vkCreateImageView(vk, &view, nullptr, &rt->sample_view);
+    if (HasStencil(rt->format)) {
+      view.subresourceRange.aspectMask = VK_IMAGE_ASPECT_STENCIL_BIT;
+      dfn().vkCreateImageView(vk, &view, nullptr, &rt->stencil_sample_view);
+    }
     view.subresourceRange.aspectMask = aspect;
   }
 
@@ -2786,7 +2936,8 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& requested_k
   if (old) {
     // Destroyed once this frame is done on the GPU (waiting for idle here
     // was a visible hitch).
-    retired_render_targets.push_back({frame, old->image, old->view, old->sample_view, old->memory});
+    retired_render_targets.push_back(
+        {frame, old->image, old->view, old->sample_view, old->stencil_sample_view, old->memory});
   }
   VkMemoryBarrier after = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
                            init_access,
@@ -3824,6 +3975,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   }
   if (!tb_hit) {
     TextureTimer texture_timer(frame_texture_ns);
+    const uint64_t set_generation_at_build_start = set_cache_generation;
     ++stats().texture_bindings_built;
     tb = TextureBindings();
     tb.valid_until = UINT64_MAX;
@@ -3918,7 +4070,10 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     tb.ps = ps;
     tb.layout = layout;
     tb.views_epoch = textures.views_epoch();
-    tb.set_generation = set_cache_generation;
+    // A flush between the shader stages can retire the pool of an earlier
+    // set in this bundle. Keep the entry stale for subsequent draws; the
+    // retired pool remains alive for the current draw until GPU completion.
+    tb.set_generation = set_generation_at_build_start;
     tb.answers_epoch = textures.answers_epoch();
     // Only the slots these bindings read are cleared: another draw's
     // bindings may still need to see the others as written.
@@ -4135,6 +4290,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   }
   MirrorStencilClear();
   MirrorZeroDepthColorClear();
+  MirrorZeroColorAliasClear();
 }
 
 
@@ -4144,7 +4300,9 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
 // image. Preserve that operation while keeping native host images and MSAA off.
 // This handles only unconditional, whole-pixel stencil replacement; ordinary
 // stencil tests, shadow volumes, depth and color writes are left untouched.
-bool Renderer::Impl::GetFastClearRectangle(StencilClearRect& rect, bool require_zero_depth) {
+bool Renderer::Impl::GetFastClearRectangle(StencilClearRect& rect, bool require_zero_depth,
+                                           uint32_t required_zero_interpolators,
+                                           float required_constant_depth) {
   const DrawSetup& st = setup;
   const RegisterFile& r = *regs;
   // Derive the actual three corners, never assume the whole scissor is cleared.
@@ -4154,14 +4312,26 @@ bool Renderer::Impl::GetFastClearRectangle(StencilClearRect& rect, bool require_
    public:
     void Export(rex::graphics::ucode::ExportRegister output, const float* value,
                 uint32_t mask) override {
-      if (output != rex::graphics::ucode::ExportRegister::kVSPosition) return;
-      for (uint32_t i = 0; i < 4; ++i) {
-        if (mask & (1u << i)) position[i] = value[i];
+      if (output == rex::graphics::ucode::ExportRegister::kVSPosition) {
+        for (uint32_t i = 0; i < 4; ++i) {
+          if (mask & (1u << i)) position[i] = value[i];
+        }
+        written |= mask;
+        return;
       }
-      written |= mask;
+      if (output < rex::graphics::ucode::ExportRegister::kVSInterpolator0 ||
+          output > rex::graphics::ucode::ExportRegister::kVSInterpolator15) return;
+      const uint32_t interpolator = uint32_t(output) -
+                                    uint32_t(rex::graphics::ucode::ExportRegister::kVSInterpolator0);
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (mask & (1u << i)) interpolators[interpolator][i] = value[i];
+      }
+      interpolator_written[interpolator] |= mask & 0xFu;
     }
     float position[4] = {};
     uint32_t written = 0;
+    float interpolators[xenos::kMaxInterpolators][4] = {};
+    uint32_t interpolator_written[xenos::kMaxInterpolators] = {};
   } sink;
   rex::graphics::ShaderInterpreter interpreter(r, *memory);
   interpreter.SetShader(*st.vs);
@@ -4172,6 +4342,19 @@ bool Renderer::Impl::GetFastClearRectangle(StencilClearRect& rect, bool require_
   if (require_zero_depth && vte.vport_z_scale_ena) {
     const float scale_z = r.Get<float>(rex::graphics::XE_GPU_REG_PA_CL_VPORT_ZSCALE);
     if (!std::isfinite(scale_z) || scale_z < 0.0f) return false;
+  }
+  if (required_constant_depth >= 0.0f) {
+    // This path mirrors one known D24 guest word. Keep the host depth mapping
+    // identity so the interpreted VS Z is also the rasterized D24 value.
+    // The caller separately requires depth bias zero and viewport [0, 1].
+    if (!std::isfinite(required_constant_depth) || required_constant_depth > 1.0f ||
+        (vte.vport_z_offset_ena &&
+         r.Get<float>(rex::graphics::XE_GPU_REG_PA_CL_VPORT_ZOFFSET) != 0.0f) ||
+        (vte.vport_z_scale_ena &&
+         r.Get<float>(rex::graphics::XE_GPU_REG_PA_CL_VPORT_ZSCALE) != 1.0f) ||
+        st.vp.minDepth != 0.0f || st.vp.maxDepth != 1.0f) {
+      return false;
+    }
   }
   const float scale_x = vte.vport_x_scale_ena
                             ? r.Get<float>(rex::graphics::XE_GPU_REG_PA_CL_VPORT_XSCALE) : 1.0f;
@@ -4204,6 +4387,16 @@ bool Renderer::Impl::GetFastClearRectangle(StencilClearRect& rect, bool require_
     if (sink.written != 0b1111 || !std::isfinite(sink.position[2]) ||
         !std::isfinite(sink.position[3]) ||
         !(sink.position[3] > 0.0f)) return false;
+    if (required_constant_depth >= 0.0f &&
+        !IsConstantDepthClearVertex(sink.position[2], sink.position[3], vte.vtx_z_fmt,
+                                    required_constant_depth)) return false;
+    for (uint32_t interpolator = 0; interpolator < xenos::kMaxInterpolators; ++interpolator) {
+      if (!(required_zero_interpolators & (1u << interpolator))) continue;
+      if (sink.interpolator_written[interpolator] != 0xFu) return false;
+      for (uint32_t component = 0; component < 4; ++component) {
+        if (sink.interpolators[interpolator][component] != 0.0f) return false;
+      }
+    }
     // With depth clamp enabled, positive W and nonnegative Z scale, any
     // nonpositive Z maps exactly to zero, including D24 rounding bias.
     if (require_zero_depth && sink.position[2] > 0.0f) return false;
@@ -4335,11 +4528,12 @@ void Renderer::Impl::MirrorStencilClear() {
   }
 }
 
-// D3D9 also clears RGBA8 EDRAM by binding that same memory as D24S8 and
-// drawing depth=0, stencil=0. All 32 guest bits become zero. A separate native
-// color image must observe that write before the next color pass / resolve.
-// Only mirror whole EDRAM tiles with an established, identical guest layout.
-// Partial clears and nonzero depth require a general bit-exact alias transfer.
+// D3D9 also clears RGBA8 EDRAM by binding that same memory as D24S8 and drawing
+// a constant depth/stencil rectangle. A separate native color image must
+// observe that write before the next color pass / resolve. Mirror the existing
+// all-zero case and one verified Xenos fast-clear word (D24=0xFF0000, S8=0),
+// whose RGBA8 alias is opaque black. Other nonzero values still require a
+// general bit-exact alias transfer.
 void Renderer::Impl::MirrorZeroDepthColorClear() {
   const DrawSetup& st = setup;
   RenderTarget* source = st.targets.depth;
@@ -4373,25 +4567,202 @@ void Renderer::Impl::MirrorZeroDepthColorClear() {
   bool has_alias = false;
   for (const auto& entry : render_targets) {
     const RenderTarget& target = *entry.second;
-    if (!target.key.is_depth && target.samples == source->samples &&
-        target.key.base_tiles == source->key.base_tiles &&
-        target.key.pitch == source->key.pitch &&
-        target.last_draw_guest_msaa == source->key.guest_msaa &&
-        target.key.format <= uint32_t(xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
+    if (target.key.is_depth || target.samples != source->samples ||
+        target.key.base_tiles != source->key.base_tiles ||
+        target.key.format > uint32_t(xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
+      continue;
+    }
+    const StencilClearLayout target_layout = layout_of(target);
+    if (source_layout.guest_msaa <= 2 && target_layout.guest_msaa <= 2 &&
+        stencil_clear_detail::EdramPitchTiles(source_layout) ==
+            stencil_clear_detail::EdramPitchTiles(target_layout)) {
       has_alias = true;
       break;
     }
   }
   if (!has_alias) return;
   StencilClearRect rect{};
-  if (!GetFastClearRectangle(rect, true)) return;
+  constexpr uint32_t kOpaqueBlackDepth24 = 0x00FF0000;
+  const float opaque_black_depth = xenos::UNorm24To32(kOpaqueBlackDepth24);
+  const bool zero_depth = GetFastClearRectangle(rect, true);
+  const bool opaque_black_depth_clear =
+      !zero_depth && GetFastClearRectangle(rect, false, 0, opaque_black_depth);
+  if (!zero_depth && !opaque_black_depth_clear) return;
 
   bool started = false;
   for (const auto& entry : render_targets) {
     RenderTarget& target = *entry.second;
     StencilClearRect mapped{};
     if (target.key.is_depth || target.samples != source->samples ||
-        !MapZeroDepthColorClearRectangle(source_layout, layout_of(target), rect, mapped)) continue;
+        !(zero_depth
+              ? MapZeroDepthColorClearRectangle(source_layout, layout_of(target), rect, mapped)
+              : MapConstantDepthColorClearRectangle(source_layout, layout_of(target), rect,
+                                                    mapped))) continue;
+    if (!started) {
+      DrainRecorder();
+      EndPass();
+      started = true;
+    }
+    PassTargets clear_targets;
+    clear_targets.color[0] = &target;
+    if (!BeginPass(clear_targets)) continue;
+    VkClearAttachment attachment{};
+    attachment.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    attachment.colorAttachment = 0;
+    attachment.clearValue.color =
+        {{0.0f, 0.0f, 0.0f, opaque_black_depth_clear ? 1.0f : 0.0f}};
+    VkClearRect clear{};
+    clear.rect.offset = {mapped.x0, mapped.y0};
+    clear.rect.extent = {uint32_t(mapped.x1 - mapped.x0), uint32_t(mapped.y1 - mapped.y0)};
+    clear.layerCount = 1;
+    dfn().vkCmdClearAttachments(cmd(), 1, &attachment, 1, &clear);
+    EndPass();
+    target.last_used_frame = frame;
+    if (REXCVAR_GET(nx_native_trace_output) && trace_depth_color_clears.size() < 16) {
+      const std::array<uint32_t, 9> key = {source->key.base_tiles, source->key.pitch,
+          source->key.guest_msaa, target.key.format, uint32_t(mapped.x0), uint32_t(mapped.y0),
+          uint32_t(mapped.x1), uint32_t(mapped.y1),
+          opaque_black_depth_clear ? kOpaqueBlackDepth24 : 0u};
+      if (trace_depth_color_clears.insert(key).second) {
+        REXLOG_INFO("[native][trace] mirrored constant depth/color clear base={} pitch={} "
+                    "guest_samples={} rect=({},{})-({},{}) color_format={} depth24={:#08x}",
+                    source->key.base_tiles, source->key.pitch, 1u << source->key.guest_msaa,
+                    mapped.x0, mapped.y0, mapped.x1, mapped.y1, target.key.format,
+                    key.back());
+      }
+    }
+  }
+}
+
+// Some games clear a color EDRAM alias by drawing an RGBA8 rectangle with a
+// pixel shader whose inputs produce exact zero. When the same EDRAM range is
+// also represented by a differently sampled host image, that draw cannot
+// update both images. Mirror only after interpreting the vertex and pixel
+// shaders for this draw proves the complete color output is zero.
+void Renderer::Impl::MirrorZeroColorAliasClear() {
+  const DrawSetup& st = setup;
+  const RegisterFile& r = *regs;
+  RenderTarget* source = st.targets.color[0];
+  const auto initiator = r.Get<reg::VGT_DRAW_INITIATOR>();
+  const auto& depth = st.depth_control;
+  const auto program = r.Get<reg::SQ_PROGRAM_CNTL>();
+  const auto color_control = r.Get<reg::RB_COLORCONTROL>();
+
+  if (!source || source->key.is_depth ||
+      source->key.format != kColorAliasClearFormatRgba8 || !st.ps || !st.vs ||
+      st.primitive_polygonal ||
+      st.ps->type() != xenos::ShaderType::kPixel ||
+      st.ps->writes_color_targets() != 0b0001 || st.ps->kills_pixels() ||
+      st.ps->writes_depth() || st.ps->memexport_eM_written() ||
+      st.ps->uses_texture_fetch_instruction_results() ||
+      !st.ps->texture_bindings().empty() || !st.ps->vertex_bindings().empty() ||
+      !st.ps->label_addresses().empty() || !st.vs->label_addresses().empty() ||
+      !rex::graphics::ShaderInterpreter::CanInterpretShader(*st.ps) ||
+      !rex::graphics::ShaderInterpreter::CanInterpretShader(*st.vs) ||
+      program.param_gen || color_control.alpha_test_enable ||
+      color_control.alpha_to_mask_enable || !device->properties().depthClamp ||
+      (depth.stencil_enable && depth.stencilfunc != xenos::CompareFunction::kAlways) ||
+      (depth.z_enable && depth.zfunc != xenos::CompareFunction::kAlways) ||
+      initiator.prim_type != xenos::PrimitiveType::kRectangleList ||
+      initiator.source_select != xenos::SourceSelect::kAutoIndex ||
+      initiator.num_indices != 3 || !r.Get<reg::PA_CL_CLIP_CNTL>().clip_disable ||
+      (st.vs->writes_point_size_edge_flag_kill_vertex() & 0b100) ||
+      st.bias_constant != 0.0f || st.bias_slope != 0.0f ||
+      (r[rex::graphics::XE_GPU_REG_PA_SC_AA_MASK] & 0xFFFFu) != 0xFFFFu ||
+      source->last_draw_guest_msaa > 2) {
+    return;
+  }
+  for (uint32_t i = 1; i < 4; ++i) {
+    if (st.targets.color[i]) return;
+  }
+
+  const uint32_t color_mask =
+      draw_util::GetNormalizedColorMask(r, st.ps->writes_color_targets());
+  if (color_mask != 0xFu) return;
+  const auto blend = r[reg::RB_BLENDCONTROL::rt_register_indices[0]];
+  reg::RB_BLENDCONTROL blend_control;
+  blend_control.value = blend;
+  if (blend_control.color_srcblend != xenos::BlendFactor::kOne ||
+      blend_control.color_destblend != xenos::BlendFactor::kZero ||
+      blend_control.color_comb_fcn != xenos::BlendOp::kAdd ||
+      blend_control.alpha_srcblend != xenos::BlendFactor::kOne ||
+      blend_control.alpha_destblend != xenos::BlendFactor::kZero ||
+      blend_control.alpha_comb_fcn != xenos::BlendOp::kAdd) {
+    return;
+  }
+
+  uint32_t param_gen_pos = UINT32_MAX;
+  const uint32_t required_interpolators = st.ps->GetInterpolatorInputMask(
+      program, r.Get<reg::SQ_CONTEXT_MISC>(), param_gen_pos);
+  if (param_gen_pos != UINT32_MAX ||
+      (required_interpolators & ~st.vs->writes_interpolators()) != 0) {
+    return;
+  }
+
+  const StencilClearLayout source_layout{
+      source->key.base_tiles, source->key.pitch, source->last_draw_guest_msaa,
+      source->key.format, source->width, source->height};
+  auto is_color_alias = [&](const RenderTarget& target) {
+    if (&target == source || target.key.is_depth || target.key.base_tiles != source->key.base_tiles ||
+        target.key.format != source->key.format || target.last_draw_guest_msaa > 2) {
+      return false;
+    }
+    const StencilClearLayout destination_layout{
+        target.key.base_tiles, target.key.pitch, target.last_draw_guest_msaa,
+        target.key.format, target.width, target.height};
+    StencilClearRect mapped{};
+    return MapZeroColorAliasClearRectangle(
+        source_layout, destination_layout,
+        {0, 0, int32_t(source->width), int32_t(source->height)}, mapped);
+  };
+
+  // Avoid shader interpretation for the common case where this target has no
+  // differently sampled color alias.
+  bool has_alias = false;
+  for (const auto& entry : render_targets) {
+    if (is_color_alias(*entry.second)) {
+      has_alias = true;
+      break;
+    }
+  }
+  if (!has_alias) return;
+
+  StencilClearRect rect{};
+  if (!GetFastClearRectangle(rect, false, required_interpolators)) return;
+
+  class ColorSink final : public rex::graphics::ShaderInterpreter::ExportSink {
+   public:
+    void Export(rex::graphics::ucode::ExportRegister output, const float* value,
+                uint32_t mask) override {
+      if (output != rex::graphics::ucode::ExportRegister::kPSColor0) return;
+      for (uint32_t i = 0; i < 4; ++i) {
+        if (mask & (1u << i)) color[i] = value[i];
+      }
+      written |= mask & 0xFu;
+    }
+    float color[4] = {};
+    uint32_t written = 0;
+  } color_sink;
+  rex::graphics::ShaderInterpreter pixel_interpreter(r, *memory);
+  pixel_interpreter.SetShader(*st.ps);
+  pixel_interpreter.SetExportSink(&color_sink);
+  std::fill_n(pixel_interpreter.temp_registers(), xenos::kMaxShaderTempRegisters * 4,
+              0.0f);
+  pixel_interpreter.Execute();
+  if (color_sink.written != 0xFu) return;
+  for (float component : color_sink.color) {
+    if (component != 0.0f) return;
+  }
+
+  bool started = false;
+  for (const auto& entry : render_targets) {
+    RenderTarget& target = *entry.second;
+    if (!is_color_alias(target)) continue;
+    const StencilClearLayout destination_layout{
+        target.key.base_tiles, target.key.pitch, target.last_draw_guest_msaa,
+        target.key.format, target.width, target.height};
+    StencilClearRect mapped{};
+    if (!MapZeroColorAliasClearRectangle(source_layout, destination_layout, rect, mapped)) continue;
     if (!started) {
       DrainRecorder();
       EndPass();
@@ -4411,15 +4782,23 @@ void Renderer::Impl::MirrorZeroDepthColorClear() {
     dfn().vkCmdClearAttachments(cmd(), 1, &attachment, 1, &clear);
     EndPass();
     target.last_used_frame = frame;
-    if (REXCVAR_GET(nx_native_trace_output) && trace_depth_color_clears.size() < 16) {
-      const std::array<uint32_t, 8> key = {source->key.base_tiles, source->key.pitch,
-          source->key.guest_msaa, target.key.format, uint32_t(mapped.x0), uint32_t(mapped.y0),
-          uint32_t(mapped.x1), uint32_t(mapped.y1)};
-      if (trace_depth_color_clears.insert(key).second) {
-        REXLOG_INFO("[native][trace] mirrored zero depth/color clear base={} pitch={} "
-                    "guest_samples={} rect=({},{})-({},{}) color_format={}",
-                    source->key.base_tiles, source->key.pitch, 1u << source->key.guest_msaa,
-                    mapped.x0, mapped.y0, mapped.x1, mapped.y1, target.key.format);
+    if (REXCVAR_GET(nx_native_trace_output) &&
+        trace_zero_color_alias_clears.size() < 16) {
+      const std::array<uint32_t, 14> key = {
+          source->key.base_tiles, source->key.pitch, source->last_draw_guest_msaa,
+          target.key.base_tiles, target.key.pitch, target.last_draw_guest_msaa,
+          uint32_t(rect.x0), uint32_t(rect.y0), uint32_t(rect.x1), uint32_t(rect.y1),
+          uint32_t(mapped.x0), uint32_t(mapped.y0), uint32_t(mapped.x1),
+          uint32_t(mapped.y1)};
+      if (trace_zero_color_alias_clears.insert(key).second) {
+        REXLOG_INFO("[native][trace] mirrored zero-color alias clear base={} pitch={} "
+                    "guest_samples={} rect=({},{})-({},{}) -> base={} pitch={} "
+                    "guest_samples={} rect=({},{})-({},{})",
+                    source->key.base_tiles, source->key.pitch,
+                    1u << source->last_draw_guest_msaa, rect.x0, rect.y0, rect.x1, rect.y1,
+                    target.key.base_tiles, target.key.pitch,
+                    1u << target.last_draw_guest_msaa, mapped.x0, mapped.y0,
+                    mapped.x1, mapped.y1);
       }
     }
   }
@@ -4770,8 +5149,171 @@ void Renderer::Impl::Resolve() {
         const bool has_stencil = HasStencil(source->format);
         const bool unorm_guest = xenos::DepthRenderTargetFormat(source->key.format) ==
                                  xenos::DepthRenderTargetFormat::kD24S8;
-        if (msaa == 0 && depth_copy_pipeline && source->sample_view &&
-            !textures.WantsDepthWords(dest_base & 0x1FFFFFFF)) {
+        const bool wants_depth_words = textures.WantsDepthWords(dest_base & 0x1FFFFFFF);
+        bool msaa_depth_written_with_words = false;
+        if (msaa && wants_depth_words && unorm_guest && has_stencil &&
+            depth_msaa_words_pipeline && source->sample_view && source->stencil_sample_view &&
+            depth_scratch && packed_offset + texels * 4 <= kDepthScratchSize) {
+          ResolveDestination* words = shared_write
+              ? textures.GetSharedResolveDestination(
+                    resolve_address | TextureCache::kDepthWordsTag,
+                    shared_write->root_address | TextureCache::kDepthWordsTag,
+                    dest_width, dest_height, shared_write->origin.x, shared_write->origin.y,
+                    VK_FORMAT_R8G8B8A8_UNORM, uint32_t(xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA), c)
+              : textures.GetResolveDestination(
+                    resolve_address | TextureCache::kDepthWordsTag, dest_width, dest_height,
+                    VK_FORMAT_R8G8B8A8_UNORM, uint32_t(xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA), c);
+          if (words) {
+            VkMemoryBarrier to_compute = {
+                VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                    VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+            dfn().vkCmdPipelineBarrier(
+                c,
+                VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                    VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                    VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &to_compute, 0, nullptr, 0, nullptr);
+            VkDescriptorSet set = AllocateSet(depth_msaa_words_set_layout);
+            if (set) {
+              VkDescriptorImageInfo images[2] = {
+                  {VK_NULL_HANDLE, source->sample_view, VK_IMAGE_LAYOUT_GENERAL},
+                  {VK_NULL_HANDLE, source->stencil_sample_view, VK_IMAGE_LAYOUT_GENERAL}};
+              VkDescriptorBufferInfo buffer = {depth_scratch, 0, kDepthScratchSize};
+              VkWriteDescriptorSet writes[3] = {};
+              for (uint32_t i = 0; i < 2; ++i) {
+                writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                writes[i].dstSet = set;
+                writes[i].dstBinding = i;
+                writes[i].descriptorCount = 1;
+                writes[i].descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+                writes[i].pImageInfo = &images[i];
+              }
+              writes[2].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+              writes[2].dstSet = set;
+              writes[2].dstBinding = 2;
+              writes[2].descriptorCount = 1;
+              writes[2].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+              writes[2].pBufferInfo = &buffer;
+              dfn().vkUpdateDescriptorSets(vk, uint32_t(std::size(writes)), writes, 0, nullptr);
+              const auto sample_select = draw_util::SanitizeCopySampleSelect(
+                  copy_control.copy_sample_select, surface_info.msaa_samples, true);
+              uint32_t sample_index = 0;
+              switch (sample_select) {
+                case xenos::CopySampleSelect::k1: sample_index = 1; break;
+                case xenos::CopySampleSelect::k2: sample_index = 2; break;
+                case xenos::CopySampleSelect::k3: sample_index = 3; break;
+                default: break;
+              }
+              const uint32_t params[6] = {uint32_t(x0), uint32_t(y0), width, height,
+                                          sample_index, uint32_t(packed_offset / 4)};
+              dfn().vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                      depth_msaa_words_pipeline);
+              dfn().vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                            depth_msaa_words_layout, 0, 1, &set, 0, nullptr);
+              dfn().vkCmdPushConstants(c, depth_msaa_words_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                       sizeof(params), params);
+              dfn().vkCmdDispatch(c, (width + 7) / 8, (height + 7) / 8, 1);
+              VkMemoryBarrier after_compute = {
+                  VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                  VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                  VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                      VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+              dfn().vkCmdPipelineBarrier(
+                  c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                  VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                      VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                  0, 1, &after_compute, 0, nullptr, 0, nullptr);
+              VkBufferImageCopy out = {};
+              out.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+              out.imageOffset = {dest_x, dest_y, 0};
+              out.imageExtent = {width, height, 1};
+              dfn().vkCmdCopyBufferToImage(c, depth_scratch, dest->image,
+                                           VK_IMAGE_LAYOUT_GENERAL, 1, &out);
+              out.bufferOffset = packed_offset;
+              dfn().vkCmdCopyBufferToImage(c, depth_scratch, words->image,
+                                           VK_IMAGE_LAYOUT_GENERAL, 1, &out);
+              textures.CopyToSized(
+                  *words, c,
+                  resolve_layout::Rect{uint32_t(dest_x), uint32_t(dest_y), width, height});
+              msaa_depth_written_with_words = true;
+            }
+          }
+        }
+        if (msaa && wants_depth_words && unorm_guest && !msaa_depth_written_with_words) {
+          static bool logged_missing_words = false;
+          if (!logged_missing_words) {
+            logged_missing_words = true;
+            REXLOG_WARN("[native] MSAA depth resolved without packed stencil words; "
+                        "the packed-word path is unavailable for this target");
+          }
+        }
+        if (msaa && depth_msaa_copy_pipeline && source->sample_view &&
+            !msaa_depth_written_with_words) {
+          // Depth resolves select one guest sample; unlike color, depth cannot
+          // be averaged. Use the same sanitization as the SDK resolve path.
+          VkMemoryBarrier to_compute = {
+              VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+              VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                  VK_ACCESS_SHADER_WRITE_BIT,
+              VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
+          dfn().vkCmdPipelineBarrier(
+              c,
+              VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
+                  VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_VERTEX_SHADER_BIT |
+                  VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 1, &to_compute, 0, nullptr, 0, nullptr);
+          VkDescriptorSet set = AllocateSet(depth_copy_set_layout);
+          if (set) {
+            VkDescriptorImageInfo images[2] = {
+                {VK_NULL_HANDLE, source->sample_view, VK_IMAGE_LAYOUT_GENERAL},
+                {VK_NULL_HANDLE, dest->view, VK_IMAGE_LAYOUT_GENERAL}};
+            VkWriteDescriptorSet writes[2] = {};
+            for (uint32_t i = 0; i < 2; ++i) {
+              writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+              writes[i].dstSet = set;
+              writes[i].dstBinding = i;
+              writes[i].descriptorCount = 1;
+              writes[i].descriptorType =
+                  i ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+              writes[i].pImageInfo = &images[i];
+            }
+            dfn().vkUpdateDescriptorSets(vk, 2, writes, 0, nullptr);
+            const auto sample_select = draw_util::SanitizeCopySampleSelect(
+                copy_control.copy_sample_select, surface_info.msaa_samples, true);
+            uint32_t sample_index = 0;
+            switch (sample_select) {
+              case xenos::CopySampleSelect::k1: sample_index = 1; break;
+              case xenos::CopySampleSelect::k2: sample_index = 2; break;
+              case xenos::CopySampleSelect::k3: sample_index = 3; break;
+              default: break;
+            }
+            int32_t params[7] = {x0, y0, dest_x, dest_y, int32_t(width), int32_t(height),
+                                 int32_t(sample_index)};
+            dfn().vkCmdBindPipeline(c, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                    depth_msaa_copy_pipeline);
+            dfn().vkCmdBindDescriptorSets(c, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                          depth_msaa_copy_layout, 0, 1, &set, 0, nullptr);
+            dfn().vkCmdPushConstants(c, depth_msaa_copy_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
+                                     sizeof(params), params);
+            dfn().vkCmdDispatch(c, (width + 7) / 8, (height + 7) / 8, 1);
+            VkMemoryBarrier after_compute = {
+                VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
+                VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT |
+                    VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT};
+            dfn().vkCmdPipelineBarrier(
+                c, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT |
+                    VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT |
+                    VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT,
+                0, 1, &after_compute, 0, nullptr, 0, nullptr);
+          }
+        } else if (msaa == 0 && depth_copy_pipeline && source->sample_view && !wants_depth_words) {
           // The usual case: the game samples the resolve only as depth.
           VkMemoryBarrier to_compute = {
               VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
@@ -4882,7 +5424,7 @@ void Renderer::Impl::Resolve() {
                   resolve_layout::Rect{uint32_t(dest_x), uint32_t(dest_y), width, height});
             }
           }
-        } else {
+        } else if (!msaa_depth_written_with_words) {
           static bool logged = false;
           if (!logged) {
             logged = true;
@@ -5224,6 +5766,11 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
             const uint32_t slot = uint32_t(submission_number % kSubmissionSlots);
             const VkDeviceSize ramp_offset = sizeof(gamma_ramp) * slot;
             std::memcpy(ramp_mapping + ramp_offset, gamma_ramp, sizeof(gamma_ramp));
+            if (!ramp_memory_coherent) {
+              rex::ui::vulkan::util::FlushMappedMemoryRange(
+                  device, ramp_memory, ramp_memory_type_index, ramp_offset, ramp_allocation_size,
+                  sizeof(gamma_ramp));
+            }
             VkCommandBuffer c = cmd();
             // Keep a stable, uncorrected mailbox snapshot. Its view carries the
             // same guest/host swizzle as source_view (image copies ignore views).
@@ -5296,6 +5843,12 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
           uint32_t slot = uint32_t(submission_number % kSubmissionSlots);
           std::memcpy(ramp_mapping + 256 * sizeof(uint32_t) * slot, gamma_ramp,
                       sizeof(gamma_ramp));
+          if (!ramp_memory_coherent) {
+            const VkDeviceSize ramp_offset = 256 * sizeof(uint32_t) * slot;
+            rex::ui::vulkan::util::FlushMappedMemoryRange(
+                device, ramp_memory, ramp_memory_type_index, ramp_offset, ramp_allocation_size,
+                sizeof(gamma_ramp));
+          }
           VkDescriptorImageInfo source_info = {VK_NULL_HANDLE, source_view,
                                                VK_IMAGE_LAYOUT_GENERAL};
           VkDescriptorImageInfo dest_info = {VK_NULL_HANDLE, vulkan_context.image_view(),
@@ -5402,6 +5955,9 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
   FreeRetiredSetPools();
   for (auto it = retired_render_targets.begin(); it != retired_render_targets.end();) {
     if (it->frame <= completed_frame) {
+      if (it->stencil_sample_view) {
+        dfn().vkDestroyImageView(vk, it->stencil_sample_view, nullptr);
+      }
       if (it->sample_view) dfn().vkDestroyImageView(vk, it->sample_view, nullptr);
       dfn().vkDestroyImageView(vk, it->view, nullptr);
       dfn().vkDestroyImage(vk, it->image, nullptr);

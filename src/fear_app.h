@@ -20,6 +20,8 @@
 
 #include "native/native_system.h"
 #include "input/gyro_input.h"
+#include "game/reflections.h"
+#include "game/quality.h"
 
 REXCVAR_DECLARE(bool, gpu_implicit_lod_sampling);
 
@@ -52,6 +54,8 @@ class FearNxApp final : public rex::ReXApp {
 
   void OnPostLoadXexImage() override {
     fear_nx::input::VerifyGyroHooks(runtime()->virtual_membase());
+    fear_nx::game::VerifyReflectionHook(runtime()->virtual_membase());
+    fear_nx::game::VerifyQualityHook(runtime()->virtual_membase());
   }
 
   void OnWindowFocusChanged(bool focused) override {

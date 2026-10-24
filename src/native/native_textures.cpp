@@ -204,6 +204,20 @@ HostFormat GetHostFormat(xenos::TextureFormat format) {
   return h;
 }
 
+bool IsBc1To5Texture(xenos::TextureFormat format) {
+  using F = xenos::TextureFormat;
+  switch (rex::graphics::GetBaseFormat(format)) {
+    case F::k_DXT1:
+    case F::k_DXT2_3:
+    case F::k_DXT4_5:
+    case F::k_DXT5A:
+    case F::k_DXN:
+      return true;
+    default:
+      return false;
+  }
+}
+
 VkComponentSwizzle ComponentSwizzle(uint32_t swizzle, uint32_t component) {
   switch ((swizzle >> (3 * component)) & 0b111) {
     case 0:
@@ -482,6 +496,8 @@ struct StreamJob {
   VkDeviceMemory memory = VK_NULL_HANDLE;
   VkBuffer staging_buffer = VK_NULL_HANDLE;
   VkDeviceMemory staging_memory = VK_NULL_HANDLE;
+  uint32_t staging_memory_type = 0;
+  VkDeviceSize staging_allocation_size = 0;
   VkDeviceSize staging_size = 0;
   std::atomic<bool> done{false};
   bool ok = false;
@@ -490,6 +506,9 @@ struct StreamJob {
 REXCVAR_DEFINE_UINT32(nx_native_max_anisotropy, 16, "F.E.A.R. NX",
                       "Most anisotropic filtering any texture gets (1 turns it off); the "
                       "game asks for it on floors, where it costs the GPU the most");
+REXCVAR_DEFINE_UINT32(nx_native_texture_min_mip, 1, "F.E.A.R. NX",
+                      "Minimum mip level for large tiled BC1-BC5 2D textures (0 keeps the "
+                      "game setting, maximum 2; restart required)");
 
 // New textures made on the spot each frame, up to this many: drawn the first
 // time, not a frame or more later. Beyond it they stream in, so a new screen
@@ -524,6 +543,8 @@ struct TextureCache::Texture {
   uint64_t last_used_submission = 0;
   uint64_t key_hash = 0;
   uint64_t content_hash = 0;
+  // Frame when guest texel data was last uploaded, for dynamic linear R8 video planes.
+  uint64_t last_uploaded_frame = UINT64_MAX;
   // Still being created by the streaming worker.
   std::shared_ptr<StreamJob> stream;
   uint32_t level_count = 0;
@@ -968,6 +989,7 @@ struct TextureCache::Impl {
   uint64_t frame = 0;
   uint64_t completed_frame = 0;
   float max_anisotropy = 1.0f;
+  uint32_t texture_min_mip = 1;
 
   std::vector<uint8_t> scratch;
 
@@ -1042,7 +1064,7 @@ struct TextureCache::Impl {
         job->ok = rex::ui::vulkan::util::CreateDedicatedAllocationBuffer(
             device, job->staging_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
             rex::ui::vulkan::util::MemoryPurpose::kUpload, job->staging_buffer,
-            job->staging_memory);
+            job->staging_memory, &job->staging_memory_type, &job->staging_allocation_size);
       }
       void* mapping = nullptr;
       if (job->ok && device->functions().vkMapMemory(device->device(), job->staging_memory, 0,
@@ -1052,6 +1074,12 @@ struct TextureCache::Impl {
       if (job->ok) {
         job->untile.staging = static_cast<uint8_t*>(mapping);
         RunUntile(job->untile);
+        if (!(device->memory_types().host_coherent &
+              (uint32_t(1) << job->staging_memory_type))) {
+          rex::ui::vulkan::util::FlushMappedMemoryRange(
+              device, job->staging_memory, job->staging_memory_type, 0,
+              job->staging_allocation_size, job->staging_size);
+        }
       }
       job->done.store(true, std::memory_order_release);
     }
@@ -1283,6 +1311,7 @@ bool TextureCache::Initialize(const VulkanDevice* device, rex::memory::Memory* m
           ? std::min({16.0f, device->properties().maxSamplerAnisotropy,
                       float(std::max(REXCVAR_GET(nx_native_max_anisotropy), 1u))})
           : 1.0f;
+  im.texture_min_mip = std::min(REXCVAR_GET(nx_native_texture_min_mip), 2u);
 
   const auto& dfn = device->functions();
   VkDevice d = device->device();
@@ -2918,10 +2947,19 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     return null_view;
   }
 
-  // The content, hashed at most once per frame for each layout.
+  // Video planes are rewritten continuously; stamp them once per frame instead of
+  // letting trusted sampling stagger their updates. Layouts still use key_hash.
+  const bool linear_r8_video_plane =
+      fetch.dimension == xenos::DataDimension::k2DOrStacked && layers == 1 && !fetch.tiled &&
+      !fetch.packed_mips && mip_max_level == 0 && mip_size == 0 && base_page != 0 &&
+      base_size != 0 && host_format.unorm == VK_FORMAT_R8_UNORM;
   Impl::Checked& checked = im.checked[key_hash];
   uint64_t texture_hash;
-  if (checked.frame == im.frame) {
+  if (linear_r8_video_plane) {
+    texture_hash = im.frame;
+    checked.frame = im.frame;
+    checked.texture_hash = texture_hash;
+  } else if (checked.frame == im.frame) {
     texture_hash = checked.texture_hash;
   } else {
     uint64_t content = key_hash;
@@ -2936,13 +2974,17 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     checked.frame = im.frame;
     checked.texture_hash = texture_hash;
   }
-  const uint64_t valid_until =
-      std::min(base_size ? checked.base.TrustedUntil(im.frame, key_hash) : UINT64_MAX,
-               mip_size ? checked.mips.TrustedUntil(im.frame, key_hash >> 8) : UINT64_MAX);
+  const uint64_t valid_until = linear_r8_video_plane
+                                   ? im.frame
+                                   : std::min(
+                                         base_size ? checked.base.TrustedUntil(im.frame, key_hash)
+                                                   : UINT64_MAX,
+                                         mip_size ? checked.mips.TrustedUntil(im.frame, key_hash >> 8)
+                                                   : UINT64_MAX);
 
   Texture* texture = nullptr;
   bool reuse_image = false;
-  bool force_upload_now = false;
+  bool force_upload_now = linear_r8_video_plane;
   auto existing = im.textures.find(key_hash);
   if (existing != im.textures.end() && existing->second->stream) {
     Texture& pending = *existing->second;
@@ -2987,6 +3029,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     }
     dfn.vkCmdCopyBufferToImage(upload.setup_commands, job.staging_buffer, pending.image,
                                VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, u.level_count, regions);
+    if (linear_r8_video_plane) pending.last_uploaded_frame = im.frame;
     barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
     barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
@@ -3002,7 +3045,10 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
   }
   if (existing != im.textures.end()) {
     Texture& old = *existing->second;
-    if (old.content_hash == texture_hash) {
+    if (linear_r8_video_plane && old.last_uploaded_frame == im.frame) {
+      // Signed and unsigned views share this image upload for the frame.
+      texture = &old;
+    } else if (!linear_r8_video_plane && old.content_hash == texture_hash) {
       texture = &old;
     } else if (old.last_used_submission < upload.submission) {
       texture = &old;
@@ -3163,7 +3209,11 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     job->guest_bytes_per_block = guest_bytes_per_block;
     job->bpb_log2 = bpb_log2;
     job->host_texel_bytes = host_texel_bytes;
-    im.EnqueueUpload([job]() { RunUntile(*job); });
+    if (linear_r8_video_plane) {
+      RunUntile(*job);
+    } else {
+      im.EnqueueUpload([job]() { RunUntile(*job); });
+    }
 
     // The image.
     std::unique_ptr<Texture> created;
@@ -3251,6 +3301,7 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
     im.CountUpload(key_hash, base_page << 12, uint32_t(format), width, height, total,
                    texture_hash);
     target.content_hash = texture_hash;
+    if (linear_r8_video_plane) target.last_uploaded_frame = im.frame;
     target.key_hash = key_hash;
     if (!reuse_image) {
       ++stats_.created;
@@ -3301,13 +3352,22 @@ VkSampler TextureCache::GetSampler(const xenos::xe_gpu_texture_fetch_t& fetch,
                                                                         : binding.mip_filter;
   auto aniso = binding.aniso_filter == xenos::AnisoFilter::kUseFetchConst ? fetch.aniso_filter
                                                                           : binding.aniso_filter;
+  uint32_t width_minus_1, height_minus_1, depth_minus_1, base_page, mip_page;
   uint32_t mip_min_level = 0, mip_max_level = 0;
-  texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr,
-                                                 nullptr, &mip_min_level, &mip_max_level);
+  texture_util::GetSubresourcesFromFetchConstant(fetch, &width_minus_1, &height_minus_1,
+                                                 &depth_minus_1, &base_page, &mip_page,
+                                                 &mip_min_level, &mip_max_level);
   bool mag_linear = mag == xenos::TextureFilter::kLinear;
   bool min_linear = min == xenos::TextureFilter::kLinear;
   bool mip_linear = mip == xenos::TextureFilter::kLinear;
   bool mip_base_map = mip == xenos::TextureFilter::kBaseMap;
+  if (im.texture_min_mip && !mip_base_map &&
+      fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
+      depth_minus_1 == 0 &&
+      fetch.tiled && width_minus_1 >= 255 && height_minus_1 >= 255 && mip_max_level >= 1 &&
+      base_page != 0 && mip_page != 0 && IsBc1To5Texture(fetch.format)) {
+    mip_min_level = std::max(mip_min_level, std::min(im.texture_min_mip, mip_max_level));
+  }
   xenos::BorderColor border = xenos::ClampModeUsesBorder(clamp_x) ||
                                       xenos::ClampModeUsesBorder(clamp_y) ||
                                       xenos::ClampModeUsesBorder(clamp_z)

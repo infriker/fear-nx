@@ -1,0 +1,72 @@
+--- a/src/core/cvar.cpp
++++ b/src/core/cvar.cpp
+@@ -14,6 +14,7 @@
+ #include <fstream>
+ #include <mutex>
+ #include <optional>
++#include <sstream>
+ #include <string_view>
+ #include <unordered_map>
+ 
+@@ -543,13 +544,27 @@
+   return result;
+ }
+ 
++namespace {
++
++std::string SerializeStringToTOML(const std::string& value) {
++  // Paths and arbitrary strings must survive SaveConfig -> LoadConfig.
++  // In particular, a Windows backslash is not a literal TOML basic-string
++  // character, and can either invalidate the whole file or become an escape.
++  std::ostringstream output;
++  const toml::value<std::string> node(value);
++  output << toml::toml_formatter(node, toml::format_flags::none);
++  return output.str();
++}
++
++}  // namespace
++
+ std::string SerializeToTOML() {
+   std::lock_guard lock(GetRegistryMutex());
+   std::string result;
+   for (const auto& entry : GetRegistryStorage()) {
+     if (entry.getter() != entry.default_value) {
+       if (entry.type == FlagType::String) {
+-        result += entry.name + " = \"" + entry.getter() + "\"\n";
++        result += entry.name + " = " + SerializeStringToTOML(entry.getter()) + "\n";
+       } else {
+         result += entry.name + " = " + entry.getter() + "\n";
+       }
+@@ -564,7 +579,7 @@
+   for (const auto& entry : GetRegistryStorage()) {
+     if (entry.category == category && entry.getter() != entry.default_value) {
+       if (entry.type == FlagType::String) {
+-        result += entry.name + " = \"" + entry.getter() + "\"\n";
++        result += entry.name + " = " + SerializeStringToTOML(entry.getter()) + "\n";
+       } else {
+         result += entry.name + " = " + entry.getter() + "\n";
+       }
+--- a/tests/unit/core/cvar_test.cpp
++++ b/tests/unit/core/cvar_test.cpp
+@@ -519,6 +519,21 @@
+   CHECK(toml.find("test_bool_flag") == std::string::npos);
+ }
+ 
++TEST_CASE("cvar string serialization round-trips paths and escapes", "[cvar]") {
++  rex::cvar::testing::ResetAllForTesting();
++  const std::string expected = "D:\\FearXbox360Recomp\\logs\\test\\new.log\n\t\"quoted\"";
++  REXCVAR_SET(test_string_flag, expected);
++  const auto save_path = std::filesystem::temp_directory_path() / "cvar_escape_roundtrip.toml";
++  for (const auto& serialized : {rex::cvar::SerializeToTOML(),
++                                 rex::cvar::SerializeToTOML("Test")}) {
++    { std::ofstream file(save_path); file << serialized; }
++    rex::cvar::ResetAllToDefaults();
++    rex::cvar::LoadConfig(save_path);
++    CHECK(REXCVAR_GET(test_string_flag) == expected);
++  }
++  std::filesystem::remove(save_path);
++}
++
+ TEST_CASE("cvar metadata integration test", "[cvar][integration]") {
+   rex::cvar::testing::ResetAllForTesting();
+ 

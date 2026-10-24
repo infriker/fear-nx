@@ -1,6 +1,6 @@
 # Vulkan performance and change history
 
-Updated 2026-10-23. `main` retains the Vulkan/Mesa/NVK renderer. The separate
+Updated 2026-10-24. `main` retains the Vulkan/Mesa/NVK renderer. The separate
 [`deko3d` branch](https://github.com/infriker/fear-nx/tree/deko3d) contains the
 experimental backend and its own test history.
 
@@ -26,6 +26,19 @@ Scenes, settings and runs were not identical; no percentage advantage is claimed
 | Gamma presentation | Fuse supported gamma conversion into final presentation while retaining a stable mailbox snapshot. | Removes a separate compute pass for supported formats; fallback paths remain. |
 | Resolve barriers and full clears | Use precise resolve dependencies and attachment load clears only when the rectangle fully covers the active render area. | Focused host checks and a Switch build passed; a separate matched hardware timing is not available. |
 | Correctness audit, 2026-10-22 | Preserve resolve layout/lifetime and fallback invalidation; retain conservative handling of unsupported EDRAM cases. | Built and packaged successfully. Remaining half-screen and decal defects have unidentified triggers. |
+
+Version 0.1.1 adds constant depth/color and zero-color alias clears for weapon
+displays and other reused targets, per-frame linear R8 video-plane updates,
+correct uniform-descriptor writes, non-coherent upload flushing, MSAA depth
+sample resolves and a fix for descriptor-cache rollover. Weapon displays and
+the scene-copy effect are not hidden. The user confirmed the earlier weapon
+display correction and improved performance with the balanced quality profile;
+the final descriptor-lifetime change still needs hardware confirmation.
+
+Mesa patches 0007 (GPFIFO capacity) and 0008 (depth/stencil memory bindings)
+are included. Patch 0008 may disable compression on images needing a separate
+stencil-copy plane. No new controlled FPS result is claimed for this release.
+The Eden-only storage-buffer compatibility fix is not part of the Switch NRO.
 
 Texture-sign specialization and eligible implicit-LOD sampling remain enabled.
 The normal profile keeps profiling/tracing off, anisotropy at 2x, host MSAA off,

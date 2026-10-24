@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.25)
-project(fear_nx VERSION 0.1.0 LANGUAGES CXX)
+project(fear_nx VERSION 0.1.1 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
@@ -37,6 +37,8 @@ target_compile_options(fear_nx_recomp PRIVATE
 set(FEAR_HOST_SOURCES
     src/main.cpp
     src/input/gyro_input.cpp
+    src/game/reflections.cpp
+    src/game/quality.cpp
     src/native/native_system.cpp
     src/native/native_renderer.cpp
     src/native/native_textures.cpp

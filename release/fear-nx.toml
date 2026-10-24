@@ -1,5 +1,13 @@
 # F.E.A.R. NX release settings. See docs/native-renderer.md.
 [nx]
+# Dynamic water/mirror reflections; restart after changing.
+planar_reflections = false
+# Keep volumetric lighting, with half the Xbox 360 slice count. 0 restores game default.
+volumetric_light_slices = 128
+# Keep volumetric shadows with a smaller map. 0 restores game default.
+volumetric_light_shadow_size = 64
+# Large mipmapped BC textures: use mip 1 or coarser. 0 restores game selection.
+native_texture_min_mip = 1
 native_shared_resolves = true
 native_gpu_profile = false
 native_max_anisotropy = 2

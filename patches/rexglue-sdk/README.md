@@ -60,3 +60,9 @@ but do not identify the exhausted kernel allocator. Compact placement is intende
 to reduce page-table fragmentation; it does not reduce the number of committed
 chunks or guarantee that all metadata pressure is removed. Hardware retesting
 is required before calling the campaign freeze fixed.
+
+`0023-cvar-escape-saved-strings.patch` formats string values through toml++.
+Previously Windows paths were saved with unescaped backslashes, causing the
+next launch to reject the entire config and silently use renderer defaults.
+The patch covers both complete and category-filtered serialization and adds
+a save/load round-trip regression for paths, quotes and control characters.

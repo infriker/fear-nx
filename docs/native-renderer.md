@@ -21,6 +21,10 @@ These keys belong under `[nx]` in `fear-nx.toml`:
 | Key | Release value | Purpose |
 |---|---|---|
 | `renderer` | `"native"` | Select the app-owned Vulkan renderer |
+| `planar_reflections` | `false` | Disable dynamic water/mirror reflection targets; keep refraction and ordinary camera targets |
+| `volumetric_light_slices` | `128` | Reduce light-volume slices from 256 while keeping the effect |
+| `volumetric_light_shadow_size` | `64` | Reduce volumetric shadow maps from 128x128 to 64x64 |
+| `native_texture_min_mip` | `1` | Use mip 1 or coarser on eligible large tiled BC1-BC5 textures |
 | `native_shared_resolves` | `true` | Share validated resolve destinations |
 | `native_depth24` | `true` | D24 storage for compatible guest depth surfaces |
 | `native_msaa` | `false` | Disable host MSAA |
@@ -33,6 +37,12 @@ These keys belong under `[nx]` in `fear-nx.toml`:
 | `native_full_clear_load_op` | `true` | Clear a fully covered render area at attachment load |
 | `native_gpu_profile` | `false` | Collect GPU pass diagnostics when explicitly enabled |
 | `native_trace_output` | `false` | Record bounded renderer diagnostics when explicitly enabled |
+
+The weapon display remains enabled. The mip setting excludes linear video
+planes, render targets and textures without the required mip chain. Set the
+three quality values above to `0` to restore the game-selected levels, and
+set `planar_reflections = true` to restore dynamic reflections; restart after
+changing these settings. See [reflection handling](planar-reflections.md).
 
 The release disables profiling and trace output and uses warning-level logging
 for normal play. Enable diagnostics separately when collecting a capture. Clock selection

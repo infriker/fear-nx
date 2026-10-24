@@ -20,3 +20,4 @@
 0020-guest-memory-commit-diagnostics.patch
 0021-switch-resource-telemetry.patch
 0022-compact-shadow-arena.patch
+0023-cvar-escape-saved-strings.patch
