@@ -70,6 +70,7 @@ extern "C" {
 
 #include "native_geometry_shaders.h"
 #include "native_hash.h"
+#include "native_vertex_fresh.h"
 #include "native_textures.h"
 
 REXCVAR_DECLARE(bool, gpu_specialize_texture_signs);
@@ -105,6 +106,16 @@ REXCVAR_DEFINE_BOOL(nx_native_async_pipelines, true, "F.E.A.R. NX",
                     "draws that need them until they are ready, instead of stalling the frame");
 REXCVAR_DEFINE_BOOL(nx_native_trace_output, false, "F.E.A.R. NX",
                     "Log bounded unique native renderer swap, viewport, and Xenos resolve state for display diagnostics");
+
+// Freshness + safe-span checks adapted from Juansolo457/fear360-recomp,
+// fc5722793f71217ca888c329d654bba6f9eeeedc, port-nx/src/native/native_renderer.cpp.
+// Preserve content-based upload reuse and the local stream pin/flush safeguards.
+REXCVAR_DEFINE_BOOL(fear_vertex_fresh, true, "F.E.A.R.",
+                    "Check active vertex/index data on every draw; reuse identical uploads")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(fear_vertex_spans, true, "F.E.A.R.",
+                    "Check only reachable vertex spans when the shader proves them safe")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
 namespace fear_nx::native {
 namespace shaders {
@@ -331,6 +342,145 @@ struct VertexRangeKey {
 struct VertexRangeKeyHasher {
   size_t operator()(const VertexRangeKey& k) const { return size_t(k.hash ^ k.address); }
 };
+
+// F.E.A.R. (#27): the vertex buffers a vertex shader reads only at the vertex index, so that a
+// draw can only reach its own vertices: [first index, last index] x stride, plus the extent of the
+// last vertex's attributes. The translated shader puts the draw's vertex index (after the base
+// index and the min/max clamp) in r0.x; a buffer qualifies when every vfetch_full of it takes its
+// index from r0.x and nothing writes r0.x before, in a shader without loops, calls or jumps. Any
+// doubt and the buffer is read whole, as before.
+struct VertexSpanInfo {
+  std::array<uint32_t, 96> stride_bytes = {};
+  std::array<uint32_t, 96> extent_bytes = {};
+  std::array<bool, 96> safe = {};
+};
+
+void AnalyzeVertexSpans(const Shader& shader, VertexSpanInfo& info) {
+  namespace ucode = rex::graphics::ucode;
+  info = VertexSpanInfo();
+  std::array<bool, 96> seen = {}, bad = {};
+  for (const Shader::VertexBinding& binding : shader.vertex_bindings()) {
+    const uint32_t c = binding.fetch_constant;
+    if (c >= 96) continue;
+    uint32_t extent_words = 0;
+    bool ok = binding.stride_words != 0;
+    for (const Shader::VertexBinding::Attribute& attribute : binding.attributes) {
+      const auto& fetch = attribute.fetch_instr;
+      const uint32_t needed = xenos::GetVertexFormatNeededWords(fetch.attributes.data_format, 0b1111);
+      if (!fetch.operand_count) {
+        ok = false;
+        continue;
+      }
+      const auto& index = fetch.operands[0];
+      if (fetch.attributes.offset < 0 || !needed ||
+          index.storage_source != rex::graphics::InstructionStorageSource::kRegister ||
+          index.storage_index != 0 ||
+          index.storage_addressing_mode !=
+              rex::graphics::InstructionStorageAddressingMode::kAbsolute ||
+          index.components[0] != rex::graphics::SwizzleSource::kX) {
+        ok = false;
+        continue;
+      }
+      extent_words = std::max(extent_words, uint32_t(fetch.attributes.offset) +
+                                                uint32_t(32 - std::countl_zero(needed)));
+    }
+    const uint32_t stride = binding.stride_words * 4;
+    if (seen[c] && info.stride_bytes[c] != stride) ok = false;
+    seen[c] = true;
+    info.stride_bytes[c] = stride;
+    info.extent_bytes[c] = std::max(info.extent_bytes[c], extent_words * 4);
+    if (!ok) bad[c] = true;
+  }
+  // Program order: r0.x must still be the vertex index at each vfetch_full.
+  const std::vector<uint32_t>& code = shader.ucode_data();
+  bool written = false, linear = true, ended = false;
+  for (uint32_t pair = 0; pair < shader.cf_pair_index_bound() && linear && !ended; ++pair) {
+    if ((pair + 1) * 3 > code.size()) {
+      linear = false;
+      break;
+    }
+    ucode::ControlFlowInstruction cf[2];
+    ucode::UnpackControlFlowInstructions(code.data() + pair * 3, cf);
+    for (const ucode::ControlFlowInstruction& op : cf) {
+      if (ended) break;
+      uint32_t address = 0, count = 0, sequence = 0;
+      switch (op.opcode()) {
+        case ucode::ControlFlowOpcode::kNop:
+        case ucode::ControlFlowOpcode::kAlloc:
+        case ucode::ControlFlowOpcode::kMarkVsFetchDone:
+          continue;
+        case ucode::ControlFlowOpcode::kExec:
+        case ucode::ControlFlowOpcode::kExecEnd:
+          address = op.exec.address(), count = op.exec.count(), sequence = op.exec.sequence();
+          ended = op.opcode() == ucode::ControlFlowOpcode::kExecEnd;
+          break;
+        case ucode::ControlFlowOpcode::kCondExec:
+        case ucode::ControlFlowOpcode::kCondExecPredClean:
+          address = op.cond_exec.address(), count = op.cond_exec.count();
+          sequence = op.cond_exec.sequence();
+          break;
+        case ucode::ControlFlowOpcode::kCondExecPred:
+          address = op.cond_exec_pred.address(), count = op.cond_exec_pred.count();
+          sequence = op.cond_exec_pred.sequence();
+          break;
+        // A conditional END can fall through to more code. Reject it rather
+        // than ending this linear scan before a later r0.x write/fetch.
+        case ucode::ControlFlowOpcode::kCondExecEnd:
+        case ucode::ControlFlowOpcode::kCondExecPredCleanEnd:
+        case ucode::ControlFlowOpcode::kCondExecPredEnd:
+        default:  // loops, calls, returns, jumps
+          linear = false;
+          break;
+      }
+      if (!linear) break;
+      for (uint32_t i = 0; i < count; ++i) {
+        if ((address + i + 1) * 3 > code.size()) {
+          linear = false;
+          break;
+        }
+        const uint32_t* words = code.data() + (address + i) * 3;
+        if ((sequence >> (i * 2)) & 1) {
+          const auto& vertex = *reinterpret_cast<const ucode::VertexFetchInstruction*>(words);
+          if (vertex.opcode() == ucode::FetchOpcode::kVertexFetch) {
+            if (!vertex.is_mini_fetch()) {
+              const uint32_t c = vertex.fetch_constant_index();
+              if (c < 96 && (written || vertex.src() != 0 || vertex.is_src_relative() ||
+                             (vertex.src_swizzle() & 3) != 0)) {
+                bad[c] = true;
+              }
+            }
+            if ((vertex.dest() == 0 || vertex.is_dest_relative()) &&
+                (vertex.dest_swizzle() & 7) != 7) {
+              written = true;
+            }
+          } else {
+            const auto& texture = *reinterpret_cast<const ucode::TextureFetchInstruction*>(words);
+            if ((texture.dest() == 0 || texture.is_dest_relative()) &&
+                (texture.dest_swizzle() & 7) != 7) {
+              written = true;
+            }
+          }
+        } else {
+          const auto& alu = *reinterpret_cast<const ucode::AluInstruction*>(words);
+          if (!alu.is_export()) {
+            if ((alu.vector_dest() == 0 || alu.is_vector_dest_relative()) &&
+                (alu.vector_write_mask() & 1)) {
+              written = true;
+            }
+            if ((alu.scalar_dest() == 0 || alu.is_scalar_dest_relative()) &&
+                (alu.scalar_write_mask() & 1)) {
+              written = true;
+            }
+          }
+        }
+      }
+    }
+  }
+  for (uint32_t c = 0; c < 96; ++c) {
+    info.safe[c] = linear && seen[c] && !bad[c] && info.stride_bytes[c] && info.extent_bytes[c];
+  }
+}
+
 
 }  // namespace
 
@@ -631,6 +781,28 @@ struct Renderer::Impl {
   }
   uint64_t vertex_hash_bytes = 0;
   FlatMap64<VertexHash> vertex_hashes;
+  bool vertex_fresh = true;
+  bool vertex_spans_on = true;
+  uint64_t DrawRangeHash(VertexHash& known, const uint8_t* data, uint32_t bytes,
+                         uint32_t address) {
+    if (!vertex_fresh) return RangeHash(known, data, bytes, address);
+    // No legacy whole-buffer history hash is needed in this init-only mode.
+    // Hash the current draw's bytes and retain the normal upload deduplication.
+    vertex_hash_bytes += bytes;
+    return XXH3_64bits(data, bytes);
+  }
+  std::unordered_map<const Shader*, VertexSpanInfo> vertex_spans;
+  const VertexSpanInfo& VertexSpans(const Shader& shader) {
+    auto [it, added] = vertex_spans.try_emplace(&shader);
+    if (added) AnalyzeVertexSpans(shader, it->second);
+    return it->second;
+  }
+  struct IndexBounds {
+    VertexRangeKey key = {};
+    uint64_t packed = UINT64_MAX;
+    bool index32 = false;
+  };
+  FlatMap64<IndexBounds> index_bounds;
 
   // Swap.
   VkDescriptorSetLayout swap_layout_ramp = VK_NULL_HANDLE;
@@ -1334,7 +1506,7 @@ struct Renderer::Impl {
   }
 
   uint8_t* Allocate(VkDeviceSize size, VkDeviceSize alignment, VkDeviceSize& offset_out,
-                    bool pin_for_draw = true) {
+                    bool pin_for_draw = true, VkDeviceSize min_offset = 0) {
     if (draw_stream_active && draw_stream_failed) {
       return nullptr;
     }
@@ -1349,10 +1521,8 @@ struct Renderer::Impl {
     }
     // Allocations stay kStreamGuard short of the end, so a constant binding's
     // fixed range starting at any allocation stays inside the buffer.
-    uint64_t start = rex::align(stream_head, uint64_t(alignment));
-    if ((start % kStreamSize) + size > kStreamSize - kStreamGuard) {
-      start = NextStreamLap(start);
-    }
+    uint64_t start = VertexStreamStart(stream_head, size, alignment, kStreamSize,
+                                        kStreamGuard, min_offset);
     uint64_t end = start + size;
     if (draw_stream_active && draw_stream_oldest != kNoStreamPosition &&
         end - draw_stream_oldest > kStreamSize) {
@@ -1368,10 +1538,8 @@ struct Renderer::Impl {
       if (!stream_memory_coherent && size) {
         alignment = std::max(alignment, stream_noncoherent_atom_size);
       }
-      start = rex::align(stream_head, uint64_t(alignment));
-      if ((start % kStreamSize) + size > kStreamSize - kStreamGuard) {
-        start = NextStreamLap(start);
-      }
+      start = VertexStreamStart(stream_head, size, alignment, kStreamSize,
+                                kStreamGuard, min_offset);
       end = start + size;
       if (draw_stream_active) {
         // BeginRecording restored the unfinished draw's pin.
@@ -1576,6 +1744,8 @@ struct Renderer::Impl {
 // --- Setup -------------------------------------------------------------------------
 
 bool Renderer::Impl::Initialize() {
+  vertex_fresh = REXCVAR_GET(fear_vertex_fresh);
+  vertex_spans_on = REXCVAR_GET(fear_vertex_spans);
   device = provider->vulkan_device();
   vk = device->device();
   auto get_proc = device->vulkan_instance()->functions().vkGetDeviceProcAddr;
@@ -3673,6 +3843,42 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   };
   uint32_t draw_count = guest_count;
   bool host_indexed = indexed || convert_fan || convert_loop;
+  // Bounds follow the exact current index content, endian/reset conversion and
+  // index width. A slot-hash collision must not return another range's bounds.
+  VertexRangeKey draw_index_key = {};
+  int bounds_state = 0;
+  uint32_t index_lo = 0, index_hi = 0;
+  auto draw_index_bounds = [&]() -> bool {
+    if (bounds_state) return bounds_state == 1;
+    bounds_state = 2;
+    if (!guest_count) return false;
+    uint64_t packed = UINT64_MAX;
+    const IndexBounds* cached = draw_index_key.address
+        ? index_bounds.find(RangeSlot(draw_index_key)) : nullptr;
+    if (cached && cached->key == draw_index_key && cached->index32 == index32) {
+      packed = cached->packed;
+    } else if (!indexed) {
+      packed = uint64_t(guest_count - 1);
+    } else {
+      uint32_t lo = UINT32_MAX, hi = 0;
+      for (uint32_t i = 0; i < guest_count; ++i) {
+        const uint32_t value = read_index(i);
+        if (reset_enabled && value == reset_index) continue;
+        lo = std::min(lo, value);
+        hi = std::max(hi, value);
+      }
+      if (lo <= hi) packed = (uint64_t(lo) << 32) | hi;
+      if (draw_index_key.address) {
+        if (index_bounds.size() > 65536) index_bounds.clear();
+        index_bounds[RangeSlot(draw_index_key)] = {draw_index_key, packed, index32};
+      }
+    }
+    if (packed == UINT64_MAX) return false;
+    index_lo = uint32_t(packed >> 32);
+    index_hi = uint32_t(packed);
+    bounds_state = 1;
+    return true;
+  };
   VkIndexType index_type = index32 ? VK_INDEX_TYPE_UINT32 : VK_INDEX_TYPE_UINT16;
   VkDeviceSize index_offset = 0;
   if (host_indexed) {
@@ -3694,11 +3900,13 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     if (dma_base && !convert_fan && !convert_loop) {
       uint32_t bytes = guest_count * (index32 ? 4 : 2);
       VertexHash& known = vertex_hashes[(uint64_t(dma_base) << 32) | bytes];
-      RangeHash(known, guest_indices, bytes, dma_base);
+      const uint64_t index_hash = DrawRangeHash(known, guest_indices, bytes, dma_base);
       // The conversion also depends on the byte order and the reset index.
-      index_key = {dma_base, bytes | 0x80000000u,
-                   known.hash ^ (uint64_t(index_endian) << 60) ^
+      // Equal raw bytes can convert differently as 16- or 32-bit indices.
+      index_key = {dma_base, bytes | 0x80000000u | (index32 ? 0x40000000u : 0),
+                   index_hash ^ (uint64_t(index_endian) << 60) ^
                        (reset_enabled ? (uint64_t(reset_index) << 8) | 1 : 0)};
+      draw_index_key = index_key;
       uint64_t found = FindRange(index_key);
       if (found != UINT64_MAX && stream_head - found < kStreamSize / 2) {
         index_offset = VkDeviceSize(found % kStreamSize);
@@ -3752,6 +3960,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   // copies in the stream. Only slots written since they were last resolved,
   // or not yet resolved this frame, are looked at again.
   const Shader::ConstantRegisterMap& vs_constants = vs->constant_register_map();
+  const VertexSpanInfo* spans = vertex_fresh && vertex_spans_on ? &VertexSpans(*vs) : nullptr;
   if (fetch_words_frame != frame || fetch_words_submission != submission_number) {
     // New frame: vertex data is checked for changes again. New submission:
     // copies in older submissions may be reused, but the bookkeeping is
@@ -3782,7 +3991,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       bits &= ~(1u << bit);
       uint32_t fetch_index = word * 32 + bit;
       draw_stream_fetch_slots[fetch_index] = 1;
-      if (fetch_resolved_frame[fetch_index] == frame) {
+      if (!vertex_fresh && fetch_resolved_frame[fetch_index] == frame) {
         // The shader words still point at this stream copy even when the
         // per-frame fetch resolution is a fast hit.
         PinDrawStreamPosition(fetch_resolved_position[fetch_index]);
@@ -3802,8 +4011,42 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       }
       const uint8_t* source = memory->TranslatePhysical<const uint8_t*>(address);
       VertexHash& known = vertex_hashes[(uint64_t(address) << 32) | bytes];
-      RangeHash(known, source, bytes, address);
-      VertexRangeKey range_key = {address, bytes, known.hash};
+      // Large ranges may be narrowed only when every fetch for this slot is
+      // proven to use the unchanged vertex index. Otherwise check the full range.
+      VertexByteSpan span;
+      if (spans && bytes > 4096 && spans->safe[fetch_index] && draw_index_bounds() &&
+          ComputeVertexByteSpan(index_lo, index_hi,
+              r.Get<int32_t>(rex::graphics::XE_GPU_REG_VGT_INDX_OFFSET),
+              r[rex::graphics::XE_GPU_REG_VGT_MIN_VTX_INDX],
+              r[rex::graphics::XE_GPU_REG_VGT_MAX_VTX_INDX],
+              spans->stride_bytes[fetch_index], spans->extent_bytes[fetch_index], bytes, span) &&
+          span.offset <= kStreamSize / 4) {
+        const uint8_t* span_source = source + span.offset;
+        vertex_hash_bytes += span.size;
+        const VertexRangeKey span_key = {address + span.offset, span.size,
+                                         XXH3_64bits(span_source, span.size)};
+        const uint64_t found = FindRange(span_key);
+        VkDeviceSize span_offset;
+        uint64_t span_position;
+        if (found != UINT64_MAX && stream_head - found < kStreamSize / 2 &&
+            found % kStreamSize >= span.offset) {
+          span_offset = found % kStreamSize;
+          span_position = found;
+          PinDrawStreamPosition(span_position);
+        } else {
+          uint8_t* out = Allocate(span.size, 16, span_offset, true, span.offset);
+          if (!out) return skip(9);
+          std::memcpy(out, span_source, span.size);
+          stats().vertex_bytes_copied += span.size;
+          span_position = stream_head - span.size;
+          AddRange(span_key, span_position);
+        }
+        dword0 = (guest_dword0 & 0x3) | uint32_t(span_offset - span.offset);
+        fetch_resolved_position[fetch_index] = span_position;
+        fetch_resolved_frame[fetch_index] = frame;
+        continue;
+      }
+      VertexRangeKey range_key = {address, bytes, DrawRangeHash(known, source, bytes, address)};
       uint64_t found = FindRange(range_key);
       VkDeviceSize range_offset;
       uint64_t range_position;

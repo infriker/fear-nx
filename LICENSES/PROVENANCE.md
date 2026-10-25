@@ -15,3 +15,10 @@ ReXGlue-BSD-3-Clause.txt is copied from the pinned ReXGlue SDK source tree
 (commit c94f5ebdcb3c9d1a460ca48e04f9758448f8d518).
 Mesa-MIT.txt is copied from the Mesa source tree used by the NVK stack.
 These separate license texts retain the SDK and Mesa terms.
+
+fear360-recomp-MIT.txt is copied verbatim from Juansolo457/fear360-recomp's
+repository LICENSE, retrieved for the vertex-fresh adaptation. The adapted
+port-nx/src/native/native_renderer.cpp at commit
+fc5722793f71217ca888c329d654bba6f9eeeedc carries GPL-3.0-or-later file-level terms
+and credits Project8. These terms and the upstream repository notice are both
+retained; the MIT notice does not replace the renderer's GPL terms.

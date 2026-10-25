@@ -2835,3 +2835,18 @@ F.E.A.R. application icon
 The game icon identifies F.E.A.R. in the Homebrew Menu and installer. The
 original artwork retains its respective owners' rights and is not relicensed
 under the source-code license.
+
+
+--------------------------------------------------------------------------------
+fear360-recomp vertex/index freshness and safe spans
+--------------------------------------------------------------------------------
+
+The vertex/index freshness and safe-span logic in src/native/native_renderer.cpp
+and src/native/native_vertex_fresh.h is adapted from Juansolo457/fear360-recomp,
+commit fc5722793f71217ca888c329d654bba6f9eeeedc,
+port-nx/src/native/native_renderer.cpp:
+https://github.com/Juansolo457/fear360-recomp
+
+The source file identifies GPL-3.0-or-later and its Project8 renderer lineage.
+Those file-level terms are retained. The upstream repository's MIT copyright
+notice is also reproduced in LICENSES/fear360-recomp-MIT.txt.

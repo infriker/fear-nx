@@ -94,13 +94,21 @@ TOML (back up custom settings first); explicit settings in an old TOML still win
 For deliberate profiling, set `[switch] perf_report = true` and restart.
 No new controlled hardware FPS measurement is claimed.
 
+Version 0.1.3 fixes the reported stale-texture artifact when selecting an
+affected weapon on Switch. It prevents reuse of stale vertex/index uploads
+after the game rewrites data within a frame. Fresh content checks and safe
+vertex spans are enabled by default; unchanged uploads are
+reused, and only shader-proven spans are checked where possible. The user
+confirmed the fix on Switch with the preceding 0.1.2-vf1 build on 2026-10-25.
+Weapon displays remain enabled. No new controlled FPS comparison is available.
+
 The user's hardware observations reported on **2026-10-22**, at the tested stock
 **460 MHz GPU** setting, are 30 FPS through most gameplay, 25–27 FPS in heavy
 firefights, and lows of about 17 FPS in anomalous GPU-heavy areas. During drops
 below 30 FPS the GPU is fully occupied while the CPU has headroom. These are
 observations from the recent test builds, not a full-campaign benchmark or a
-guarantee for every level. New renderer changes still need separate hardware
-validation. See the [performance and change history](docs/performance.md).
+guarantee for every level. The weapon-fix confirmation above does not validate
+all remaining graphical issues. See the [performance and change history](docs/performance.md).
 The first encounter with a shader can cause temporary missing effects or a hitch
 while its pipeline compiles; compiled pipelines are cached on the SD card.
 
@@ -154,6 +162,8 @@ The installer and application check this hash. Other revisions are rejected.
 - [StevensND](https://github.com/StevensND) —
   [nfsmw-nx](https://github.com/StevensND/nfsmw-nx) and its installer, the
   underlying renderer and browser packaging design.
+- [Juansolo457](https://github.com/Juansolo457) — [fear360-recomp](https://github.com/Juansolo457/fear360-recomp),
+  the vertex/index freshness and safe-span implementation adapted in v0.1.3.
 - [Tom Clay / ReXGlue](https://github.com/rexglue/rexglue-sdk) and the
   [Xenia](https://github.com/xenia-project/xenia) contributors.
 - [danfromtico / mesa-switch](https://github.com/danfromtico/mesa-switch),

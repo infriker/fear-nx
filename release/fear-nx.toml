@@ -2,6 +2,12 @@
 # No shader dumps or verbose decoder output. Keep shader/pipeline caches enabled.
 dump_shaders = ""
 ffmpeg_verbose = false
+[fear]
+# Prevent stale vertex/index uploads; restart after changing.
+vertex_fresh = true
+# Limit checks to reachable vertex spans when the shader proves them safe.
+vertex_spans = true
+
 [nx]
 # Dynamic water/mirror reflections; restart after changing.
 planar_reflections = false

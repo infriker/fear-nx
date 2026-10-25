@@ -44,10 +44,40 @@ three quality values above to `0` to restore the game-selected levels, and
 set `planar_reflections = true` to restore dynamic reflections; restart after
 changing these settings. See [reflection handling](planar-reflections.md).
 
-The release disables profiling and trace output and uses warning-level logging
+The release disables profiling, trace output and routine logging
 for normal play. Enable diagnostics separately when collecting a capture. Clock selection
 is separate: `[switch] gpu_mhz = 0` leaves the system profile unchanged.
 `[input] xbox_layout` changes face-button mapping, not rendering.
+
+## Vertex/index freshness
+
+Version 0.1.3 enables these initialization-only settings under `[fear]`:
+
+```toml
+[fear]
+vertex_fresh = true
+vertex_spans = true
+```
+
+The game can rewrite vertex or index memory after its first use in a frame.
+Reusing a once-per-frame upload then supplies old geometry. The renderer now
+checks the current draw's active data and reuses uploads only when their exact
+content is unchanged and their ring-buffer allocation is still valid.
+
+For vertex buffers larger than 4096 bytes, shader analysis can restrict checks
+and uploads to the span reachable by the draw. Unknown control flow, modified
+fetch indices, wrapped indices or an out-of-bounds span keep full active-buffer
+checks. Textures are not included in these checks. No new explicit GPU
+synchronization path is added; its effect on existing upload-ring waits and
+FPS has not been measured. The user confirmed the weapon-artifact fix with the
+preceding 0.1.2-vf1 build on 2026-10-25; there is no controlled FPS comparison.
+
+The implementation is adapted from
+[fear360-recomp fc572279](https://github.com/Juansolo457/fear360-recomp/commit/fc5722793f71217ca888c329d654bba6f9eeeedc),
+retaining this renderer's upload lifetime and flush safeguards. Both settings
+also default to `true` when absent from an older TOML. For troubleshooting only,
+setting `vertex_fresh = false` and restarting restores the previous cache path;
+setting only `vertex_spans = false` retains freshness checks over full buffers.
 
 ## ZCULL
 
@@ -75,7 +105,7 @@ counter measurement. Actual activation also requires the driver's successful
 Switch ZCULL initialization. FPS improvement and visual correctness must be
 checked on hardware, especially shadows, moving lights and transitions between
 scenes. For timing runs, disable `native_gpu_profile` and `native_trace_output`
-and use warning-level logging; enable diagnostics only for a separate capture.
+and keep routine logging off; enable diagnostics only for a separate capture.
 
 The standalone `src/native/native_zcull_test.cpp` checks full-clear promotion
 against a depth/stencil sample model, including partial clears and clipping.

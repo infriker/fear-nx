@@ -1,5 +1,11 @@
 # Known issues
 
+The reported stale-texture artifact when selecting an affected weapon on
+Switch is fixed in v0.1.3 by fresh vertex/index upload checks. The user confirmed
+the preceding 0.1.2-vf1 build on Switch on 2026-10-25.
+Weapon displays remain enabled. This confirmation does not establish that the
+other symptoms below are resolved.
+
 - Intermittent graphical defects remain: incomplete or half-screen rendering,
   especially around loading, and decal artifacts during shooting. **Their
   triggers and root causes have not yet been identified.** The current Vulkan
