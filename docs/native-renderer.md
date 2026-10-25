@@ -22,6 +22,8 @@ These keys belong under `[nx]` in `fear-nx.toml`:
 |---|---|---|
 | `renderer` | `"native"` | Select the app-owned Vulkan renderer |
 | `planar_reflections` | `false` | Disable dynamic water/mirror reflection targets; keep refraction and ordinary camera targets |
+| `client_fx_detail_level` | `1` | Use the game's medium effect detail; `2` restores original detail |
+| `particle_bounce_scale` | `0.5` | Scale eligible particle bounce/splat probabilities; `1.0` restores original behavior |
 | `volumetric_light_slices` | `128` | Reduce light-volume slices from 256 while keeping the effect |
 | `volumetric_light_shadow_size` | `64` | Reduce volumetric shadow maps from 128x128 to 64x64 |
 | `native_texture_min_mip` | `1` | Use mip 1 or coarser on eligible large tiled BC1-BC5 textures |
@@ -40,9 +42,17 @@ These keys belong under `[nx]` in `fear-nx.toml`:
 
 The weapon display remains enabled. The mip setting excludes linear video
 planes, render targets and textures without the required mip chain. Set the
-three quality values above to `0` to restore the game-selected levels, and
+`volumetric_light_slices`, `volumetric_light_shadow_size` and
+`native_texture_min_mip` values to `0` to restore the game-selected levels, and
 set `planar_reflections = true` to restore dynamic reflections; restart after
 changing these settings. See [reflection handling](planar-reflections.md).
+
+The FX controls are initialization-only: fully restart after changing them.
+`client_fx_detail_level` accepts `0` (low), `1` (medium) and `2` (original).
+`particle_bounce_scale` accepts `0.0` to `1.0`; it changes eligible particle
+bounce and splat probabilities, not all physics or the total particle count.
+The defaults also apply when these keys are absent from an older TOML.
+Bloom retains the original game behavior; no bloom-disabling override is included.
 
 The release disables profiling, trace output and routine logging
 for normal play. Enable diagnostics separately when collecting a capture. Clock selection

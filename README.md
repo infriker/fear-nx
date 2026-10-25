@@ -102,26 +102,31 @@ reused, and only shader-proven spans are checked where possible. The user
 confirmed the fix on Switch with the preceding 0.1.2-vf1 build on 2026-10-25.
 Weapon displays remain enabled. No new controlled FPS comparison is available.
 
+Version 0.1.4 uses the game's medium effect detail (`ClientFXDetailLevel = 1`)
+and halves eligible particle bounce/splat probabilities (`ParticleBounceScale = 0.5`).
+Bloom uses the original game behavior. Texture mip selection and anisotropic
+filtering retain the v0.1.3 release values. The user accepted the preceding
+0.1.3-fx3 build on Switch on 2026-10-25; no controlled FPS gain is claimed.
+
 The user's hardware observations reported on **2026-10-22**, at the tested stock
 **460 MHz GPU** setting, are 30 FPS through most gameplay, 25–27 FPS in heavy
 firefights, and lows of about 17 FPS in anomalous GPU-heavy areas. During drops
 below 30 FPS the GPU is fully occupied while the CPU has headroom. These are
 observations from the recent test builds, not a full-campaign benchmark or a
-guarantee for every level. The weapon-fix confirmation above does not validate
-all remaining graphical issues. See the [performance and change history](docs/performance.md).
+guarantee for every level. See the [performance and change history](docs/performance.md).
 The first encounter with a shader can cause temporary missing effects or a hitch
 while its pipeline compiles; compiled pipelines are cached on the SD card.
 
 ## Planned features
 
 - [ ] GPU performance improvements for heavy firefights and anomalous slow areas.
-- [ ] Identify reproducible triggers for the remaining graphical defects.
+- [ ] Investigate the temporary half-screen scene at the start of level loading.
 
 ## Known issues
 
-- Intermittent graphical defects remain: incomplete/half-screen rendering and
-  decal artifacts. Their triggers have not yet been identified; the latest
-  renderer fixes do not establish that these symptoms are resolved.
+- A temporary half-screen scene may appear at the start of level loading.
+  The reported weapon, decal and screen-flicker defects have been confirmed
+  resolved by the user and are no longer listed as open issues.
 
 - GPU-heavy areas can fall below the 30 FPS target, down to about 17 FPS in testing.
 - Asynchronous pipeline compilation can briefly omit newly encountered draws.

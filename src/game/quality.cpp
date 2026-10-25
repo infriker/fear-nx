@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cmath>
 
 #include <rex/cvar.h>
 #include <rex/hook.h>
@@ -19,10 +20,23 @@ REXCVAR_DEFINE_UINT32(
     nx_volumetric_light_shadow_size, 64, "F.E.A.R. NX",
     "Volumetric shadow-map size: 64 is balanced, 128 is the Xbox 360 default, 0 keeps the game default.");
 
+// Release profile; both numeric settings use the game's own FX controls.
+REXCVAR_DEFINE_UINT32(nx_client_fx_detail_level, 1, "F.E.A.R. NX",
+                     "Client FX detail: 0 low, 1 medium, 2 original Xbox 360 detail. Restart required.")
+    .range(0u, 2u).lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_DOUBLE(nx_particle_bounce_scale, 0.5, "F.E.A.R. NX",
+                     "Scale eligible particle bounce/splat probabilities: 0 off, 1 original. Restart required.")
+    .range(0.0, 1.0).lifecycle(rex::cvar::Lifecycle::kInitOnly);
+
 namespace fear_nx::game {
 namespace {
 std::atomic<bool> verified{false};
 std::atomic<bool> logged_applied{false};
+std::atomic<bool> effects_verified{false};
+
+constexpr uint32_t kVarTrackInit = 0x822FC710;
+constexpr uint32_t kClientFxDetailName = 0x82016EC0;
+constexpr uint32_t kParticleBounceName = 0x820A6AB8;
 
 constexpr uint32_t kVolumetricResourceInit = 0x8241E338;
 constexpr uint32_t kSlicesVarTrack = 0x83374D2C;
@@ -75,9 +89,31 @@ bool SetVarTrackFloat(uint8_t* base, uint32_t track_address,
   rex::ppc::GuestToHostFunction<void>(function, client, name, requested);
   return true;
 }
+bool MatchesSignature(uint8_t* base, uint32_t address,
+                      const std::array<uint32_t, 4>& expected) {
+  for (size_t i = 0; i < expected.size(); ++i) {
+    if (REX_LOAD_U32(address + uint32_t(i * 4)) != expected[i]) return false;
+  }
+  return true;
+}
+
+void VerifyEffectHooks(uint8_t* base) {
+  // Both variables use this exact VarTrack::Init in the supported XEX:
+  // ClientFXDetailLevel: sub_8234C0A0, call at 0x8234C0F0 (default 2).
+  // ParticleBounceScale: sub_82BB8FA0, call at 0x82BB9014 (default 1).
+  effects_verified =
+      MatchesSignature(base, kVarTrackInit,
+                       {0x7D8802A6, 0x4857EDB5, 0xDBE1FFD0, 0x9421FF80}) &&
+      IsExpectedName(base, kClientFxDetailName, kClientFxDetailName, "ClientFXDetailLevel") &&
+      IsExpectedName(base, kParticleBounceName, kParticleBounceName, "ParticleBounceScale");
+  if (!effects_verified) {
+    REXLOG_ERROR("F.E.A.R. NX FX overrides disabled: guest signature/name mismatch");
+  }
+}
 }  // namespace
 
 void VerifyQualityHook(uint8_t* base) {
+  VerifyEffectHooks(base);
   verified = false;
 
   // First instructions of CVLFXResourceMgr::Init in the supported retail XEX.
@@ -144,4 +180,43 @@ REX_HOOK_RAW(sub_8241E338) {
     REXLOG_INFO("F.E.A.R. NX volumetric profile applied: slices request={}, shadow size request={} (lighting and volumetric shadows remain enabled)",
                 requested, requested_shadow_size);
   }
+}
+
+REX_EXTERN(__imp__sub_822FC710);
+
+// VarTrack::Init(this=r3, client=r4, name=r5, textDefault=r6, floatDefault=f1).
+// Match only the two verified names. Other variables retain all original inputs.
+REX_HOOK_RAW(sub_822FC710) {
+  using namespace fear_nx::game;
+  const uint32_t name = ctx.r5.u32;
+  const char* expected = nullptr;
+  float requested = 0.0f;
+  if (effects_verified) {
+    if (name == kClientFxDetailName) {
+      expected = "ClientFXDetailLevel";
+      requested = static_cast<float>(std::min(REXCVAR_GET(nx_client_fx_detail_level), 2u));
+    } else if (name == kParticleBounceName) {
+      expected = "ParticleBounceScale";
+      const double scale = REXCVAR_GET(nx_particle_bounce_scale);
+      requested = static_cast<float>(std::isfinite(scale) ? std::clamp(scale, 0.0, 1.0) : 0.5);
+    }
+  }
+  if (!expected || !IsExpectedName(base, name, name, expected)) {
+    __imp__sub_822FC710(ctx, base);
+    return;
+  }
+
+  const uint32_t track = ctx.r3.u32;
+  ctx.r6.u64 = 0;  // A text default must not override our numeric value.
+  ctx.f1.f64 = requested;
+  __imp__sub_822FC710(ctx, base);
+  if (!ctx.r3.u32 || !track) return;
+
+  // Init leaves an already existing cvar unchanged. Apply through the game's
+  // setter after successful Init as well, before the effect consumes the value.
+  const uint64_t init_result = ctx.r3.u64;
+  if (!SetVarTrackFloat(base, track, name, expected, requested)) {
+    REXLOG_WARN("F.E.A.R. NX could not apply {}={}; keeping the game value", expected, requested);
+  }
+  ctx.r3.u64 = init_result;
 }

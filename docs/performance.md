@@ -25,7 +25,7 @@ Scenes, settings and runs were not identical; no percentage advantage is claimed
 | ZCULL preparation | Make eligible depth attachments usable by the driver's depth hierarchy; retain preservation fallbacks. | Enabled by default. Allocation eligibility alone is not a measurement of GPU savings. |
 | Gamma presentation | Fuse supported gamma conversion into final presentation while retaining a stable mailbox snapshot. | Removes a separate compute pass for supported formats; fallback paths remain. |
 | Resolve barriers and full clears | Use precise resolve dependencies and attachment load clears only when the rectangle fully covers the active render area. | Focused host checks and a Switch build passed; a separate matched hardware timing is not available. |
-| Correctness audit, 2026-10-22 | Preserve resolve layout/lifetime and fallback invalidation; retain conservative handling of unsupported EDRAM cases. | Built and packaged successfully. Remaining half-screen and decal defects have unidentified triggers. |
+| Correctness audit, 2026-10-22 | Preserve resolve layout/lifetime and fallback invalidation; retain conservative handling of unsupported EDRAM cases. | Built and packaged successfully. At that checkpoint, half-screen and decal defects were unresolved; see the current status below. |
 
 Version 0.1.1 adds constant depth/color and zero-color alias clears for weapon
 displays and other reused targets, per-frame linear R8 video-plane updates,
@@ -33,7 +33,8 @@ correct uniform-descriptor writes, non-coherent upload flushing, MSAA depth
 sample resolves and a fix for descriptor-cache rollover. Weapon displays and
 the scene-copy effect are not hidden. The user confirmed the earlier weapon
 display correction and improved performance with the balanced quality profile;
-the final descriptor-lifetime change still needs hardware confirmation.
+hardware confirmation of the final descriptor-lifetime change was still pending
+at that release checkpoint. Current reported visual status is recorded below.
 
 Mesa patches 0007 (GPFIFO capacity) and 0008 (depth/stencil memory bindings)
 are included. Patch 0008 may disable compression on images needing a separate
@@ -71,9 +72,20 @@ Unsafe span analysis falls back to checking the full active buffer; it does not
 skip content validation. No new explicit GPU synchronization path is added;
 its effect on existing upload-ring waits and FPS has not been measured.
 
+Version 0.1.4 uses the game's medium effect detail (`ClientFXDetailLevel = 1`)
+and halves eligible particle bounce/splat probabilities (`ParticleBounceScale = 0.5`).
+Bloom uses the original game behavior. Texture mip selection and anisotropic
+filtering retain the v0.1.3 release values. The user accepted the preceding
+0.1.3-fx3 build on Switch on 2026-10-25; no controlled FPS gain is claimed.
+
+The user also confirmed that the previously reported weapon, decal and
+screen-flicker defects are resolved. The remaining reported visual defect is a
+temporary half-screen scene at the start of level loading. This is a user test
+report, not a full-campaign validation or a matched performance benchmark.
+
 ## Next work
 
-- Find reproducible triggers for incomplete frames and decal artifacts.
+- Investigate the temporary half-screen scene at the start of level loading.
 - Measure expensive GPU passes and resolve traffic on the same checkpoint.
 - Optimize CPU game work in the deko3d branch, whose current bottleneck differs
   from the earlier Vulkan hardware observations.

@@ -9,6 +9,10 @@ vertex_fresh = true
 vertex_spans = true
 
 [nx]
+# Game FX detail: 0 low, 1 medium, 2 original. Restart after changing.
+client_fx_detail_level = 1
+# Scale eligible particle bounce/splat probabilities. 1.0 restores original behavior.
+particle_bounce_scale = 0.5
 # Dynamic water/mirror reflections; restart after changing.
 planar_reflections = false
 # Keep volumetric lighting, with half the Xbox 360 slice count. 0 restores game default.
