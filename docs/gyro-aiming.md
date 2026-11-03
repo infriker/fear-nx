@@ -1,8 +1,10 @@
 # Gyroscope aiming
 
-Gyro aiming is on by default and only operates while F.E.A.R.'s own aim state
-is active. It follows the game's aim action, including toggle aim and alternate
-control layouts. There is no separate hold-ZL requirement.
+Gyro aiming is on by default throughout gameplay, including hip fire. Set
+`gyro_always_on = false` under `[input]` to restore aim-only behavior. That mode
+follows F.E.A.R.'s actual aim state, including toggle aim and remapped buttons.
+There is no separate hold-ZL requirement. Menus and focus changes still suppress
+motion in both modes.
 
 ## Turn off and save
 
@@ -13,7 +15,7 @@ control layouts. There is no separate hold-ZL requirement.
 3. Close the settings with the same combination and return to the game.
 
 To enable gyro again, check **input_gyro_enabled** and save. Motion is applied
-only in the game's aim mode, using your configured aim button.
+during gameplay, or only while aiming when `gyro_always_on = false`.
 
 The checkbox applies immediately. Saving writes `fear-nx.toml` beside the NRO.
 Installing this NRO alone is sufficient: an older TOML need not be replaced.
@@ -30,10 +32,12 @@ Default values in the existing `[input]` section:
 
 ```toml
 gyro_enabled = true
+gyro_always_on = true
 gyro_sensitivity = 1.0
 gyro_smoothing_ms = 16.0
 gyro_deadzone_dps = 0.15
 gyro_invert_y = false
+gyro_invert_x = false
 ```
 
 Sensitivity 1.0 means one degree of camera rotation per degree of controller
@@ -58,8 +62,8 @@ The design was studied in [EchoPatch](https://github.com/Wemino/EchoPatch/tree/e
   smoothing to gyro rates before adding pitch/yaw angles.
 
 The Switch implementation uses libnx HID directly and Horizon drift correction.
-It does not require SDL, Win32, PC hooks or a ReXGlue upgrade. The SDK snapshot
-and its patch manifest remain unchanged. It is original project code inspired
+It does not require SDL, Win32, PC hooks or a ReXGlue upgrade. The SDK base snapshot remains pinned. The separate `input-release.patch`
+overlay adds button bindings and build-time profiler/debug switches. It is original project code inspired
 by that approach; no EchoPatch source files are bundled.
 
 The supported Xbox executable was inspected locally. The relevant functions are:
@@ -80,12 +84,18 @@ original behavior to the generated `__imp__` functions.
 
 HID samples are processed oldest first, once per sampling number, using their
 nanosecond intervals. Angular velocities are converted from turns/second to
-radians/second. HID X/Z correspond to SDL pitch/yaw; this mapping is also
-visible in the local Eden SDL driver and six-axis HID implementation. The
+radians/second. Pitch uses local X. Horizontal rotation projects all three
+angular-velocity components onto the smoothed gravity direction, following the
+principle used by [BLACK-NX-PORT](https://github.com/gerisson1996/BLACK-NX-PORT/blob/main/switch/gyro.cpp).
+Thus turning an upright handheld around world up moves the view horizontally;
+banking its screen around the screen normal does not. The gravity filter uses
+sample time and rejects strong linear acceleration. `gyro_invert_x` reverses
+horizontal motion independently of vertical inversion. The
 official [libnx example](https://github.com/switchbrew/switch-examples/blob/master/hid/sixaxis/source/main.c)
 provides the handle and controller-style selection pattern.
 
-Menu input capture and application focus suppress motion. Leaving aim mode,
+Menu input capture and application focus suppress motion. Leaving aim mode
+when `gyro_always_on = false`,
 changing settings/controllers, stale samples, buffer overruns and long gaps
 reset the integrator. Motion from before aiming or from a pause is discarded.
 
@@ -93,7 +103,8 @@ reset the integrator. Motion from before aiming or from a pause is discarded.
 
 `src/input/gyro_math_test.cpp` checks units, axes, inversion, sensitivity,
 deadzone, invalid samples, equal results at 25/30/60 FPS, duplicate rejection,
-aim transitions, reconnection, gaps and buffer overruns. Run it with a C++23
+aim transitions, reconnection, gaps, buffer overruns, upright/flat/tilted
+gravity projection, and rejection of upright screen banking. Run it with a C++23
 host compiler without `NDEBUG`:
 
 ```sh
@@ -101,14 +112,18 @@ g++ -std=c++23 -Wall -Wextra -Werror -O2 src/input/gyro_math_test.cpp -o /tmp/gy
 /tmp/gyro-test
 ```
 
-The tester confirmed that gyro aiming works on Switch on 2026-10-21.
-This confirms the tested setup; it is not a claim that every controller
-style or reconnect scenario has been tested.
+The earlier aim-only implementation was confirmed on Switch on 2026-10-21.
+The gravity-projected implementation and new bindings have host logic tests
+and a cross-build; hardware testing of this revision is pending. The NRO was
+not launched during preparation.
 
 Hardware regression checks:
 
 - Off: moving the controller never affects the camera.
-- On: hip fire is unchanged; entering aim activates motion, exiting aim stops it.
+- Always on: both hip fire and aimed fire accept gyro.
+- Aim-only: entering aim activates motion; exiting aim stops it.
+- Upright handheld: rotate left/right around world up; banking the screen should
+  not substitute for horizontal aim.
 - Pause/settings/HOME: no accumulated camera jump when returning.
 - Right stick and gyro can be used together.
 - Save the setting, restart, and confirm it persists.

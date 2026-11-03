@@ -21,6 +21,25 @@ int main() {
   auto doubled = raw;
   doubled.sensitivity = 2.0;
   Near(filter.Step(0.0f, -0.5f, 0.005, doubled).yaw, 2.0 * delta.yaw);
+  auto inverted_x = raw;
+  inverted_x.invert_x = true;
+  Near(filter.Step(0.0f, -0.5f, 0.005, inverted_x).yaw, -delta.yaw);
+
+  // The same world yaw must work flat, upright and halfway between. Banking
+  // an upright screen around its normal must not turn the view horizontally.
+  for (const double tilt : {0.0, std::numbers::pi / 4, std::numbers::pi / 2}) {
+    GyroProjection projection;
+    const float y = float(std::sin(tilt)), z = float(std::cos(tilt));
+    Near(projection.Yaw(0, y * 0.25f, z * 0.25f, 0, -y, -z, 0.005), 0.25);
+  }
+  GyroProjection projection;
+  Near(projection.Yaw(0, 0, 1, 0, -1, 0, 0.005), 0);
+  Near(projection.Yaw(1, 0, 0, 0, -1, 0, 0.005), 0);
+  Near(projection.Yaw(0, 0.5, 0, 0, 0, 0, 0.005), 0.5); // free fall: retain frame
+  projection.Reset();
+  Near(projection.Yaw(0, 0.5, 0, 0, 0, 0, 0.005), 0); // no valid frame yet
+  Near(projection.Yaw(0, 0.5, 0, 0, -1, 0, 0.005), 0.5);
+  Near(projection.Yaw(0, 0.5, 0, 0, -1, 0, 1), 0); // stale time resets gravity
   const auto bad = filter.Step(std::numeric_limits<float>::quiet_NaN(), 1, 0.005, raw);
   Near(bad.pitch, 0); Near(bad.yaw, 0);
   Near(filter.Step(1, 1, 1.0, raw).yaw, 0);
@@ -64,5 +83,13 @@ int main() {
   assert(!integrator.BeginFrame(true, 51, 0.03, inverted));
   integrator.Reset();
   assert(!integrator.BeginFrame(true, 52, 0.03, raw));
+  assert(integrator.BeginFrame(true, 53, 0.03, raw));
+  Near(integrator.SampleMotion(53, 0, 0.25, 0, 0, -1, 0, 0.005).yaw,
+       -std::numbers::pi / 400);
+  // Duplicate samples must not update either gravity or the rate filter.
+  Near(integrator.SampleMotion(53, 0, 0, 1, 0, 0, -1, 0.005).yaw, 0);
+  assert(integrator.BeginFrame(true, 54, 0.03, raw));
+  Near(integrator.SampleMotion(54, 0, 0.25, 0, 0, -1, 0, 0.005).yaw,
+       -std::numbers::pi / 400);
   std::puts("Gyro tests passed: units, axes, gain, drift, frame rate, aim gates, stale samples.");
 }

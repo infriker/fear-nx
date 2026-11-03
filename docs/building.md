@@ -71,6 +71,22 @@ glslangValidator -S frag -V --target-env vulkan1.1 --vn guest_output_bilinear_ga
 glslangValidator -S frag -V --target-env vulkan1.1 -DGAMMA_DITHER --vn guest_output_bilinear_gamma_dither_ps -o third_party/rexglue-sdk/src/ui/shaders/vulkan_spirv/guest_output_bilinear_gamma_dither_ps.h third_party/rexglue-sdk/src/ui/shaders/guest_output_bilinear_gamma.frag.glsl
 ```
 
+## Input and release overlay
+
+After the base snapshot and gamma overlay, apply the input/release overlay:
+
+```text
+python -c "import hashlib,json; from pathlib import Path; p=Path('patches/native-vulkan'); m=json.loads((p/'input-release.json').read_text()); assert hashlib.sha256((p/m['patch']).read_bytes()).hexdigest()==m['sha256']"
+git -C third_party/rexglue-sdk apply --check ../../patches/native-vulkan/input-release.patch
+git -C third_party/rexglue-sdk apply ../../patches/native-vulkan/input-release.patch
+```
+
+It adds `[input.bindings]` and defaults `REXGLUE_SWITCH_PROFILING` and
+`REXGLUE_SWITCH_DIAGNOSTICS` to `OFF`. The release build has no sampling thread,
+IPC timing wrappers, A/B shortcuts or ReXGlue debug/console bindings. Settings
+and achievements remain available. External SaltyNX FPS reporting is retained.
+Developer builds can explicitly enable either option at CMake configuration.
+
 ## 2. Generate the game translation
 
 Create the `assets/` directory and copy your supported Xbox 360 executable to

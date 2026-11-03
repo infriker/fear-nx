@@ -16,7 +16,7 @@ Version 0.1.4 promotes the FX/particle profile accepted in the preceding
   expansion executables are unsupported.
 - Use title takeover mode. Album/applet mode is unsupported.
 
-Gyroscope aiming is implemented and enabled by default while aiming; see
+Gyroscope aiming is implemented and enabled by default during gameplay; see
 [gyro settings](gyro-aiming.md). Vulkan currently has more stable performance
 than the experimental deko3d branch. See [performance history](performance.md).
 

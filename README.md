@@ -64,11 +64,18 @@ therefore refer to the same letters on your controller.
 To use Xbox button positions, set `xbox_layout = true` under `[input]` in
 `fear-nx.toml`: Switch B becomes Xbox A, A becomes B, Y becomes X and X becomes Y.
 
-Gyroscope aiming is **on by default** and works only while aiming. To turn it
+Gyroscope aiming is **on by default**, including hip fire. Set
+`gyro_always_on = false` under `[input]` for aim-only control. Horizontal turns
+follow gravity so upright handheld aiming works as well as a flat controller. To turn it
 off, open the port settings with **L + R + D-pad Right**, select **Input**,
 uncheck **input_gyro_enabled**, then choose **Save to config**. Alternatively,
 set `gyro_enabled = false` under `[input]` in `fear-nx.toml`. Existing saved
 preferences are preserved. See [gyro settings](docs/gyro-aiming.md).
+
+Individual physical buttons can be remapped in `[input.bindings]`; see
+[button bindings](docs/button-bindings.md). Release builds compile out the
+Switch profiler and disable ReXGlue debug/console shortcuts. Settings
+(**L + R + Right**) and achievements (**L + R + Left**) remain available.
 
 ## Settings and performance
 
@@ -175,7 +182,7 @@ The installer and application check this hash. Other revisions are rejected.
   NaGaa95 and the Mesa/NVK/NAK contributors.
 - [devkitPro](https://devkitpro.org/) and [switchbrew/libnx](https://github.com/switchbrew/libnx).
 - [Wemino / EchoPatch](https://github.com/Wemino/EchoPatch) — the reference
-  for aim-only gyro camera integration.
+  for gyro camera integration.
 - [The Simpsons NX](https://github.com/R-drg/the-simpsons-game-nx) — an early
   reference for the Switch port structure.
 

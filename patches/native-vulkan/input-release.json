@@ -1,0 +1,9 @@
+{
+  "patch": "input-release.patch",
+  "sha256": "98999eba16fc2bd09d5e91bbe74b710e7431a741566683fb37415af477b75574",
+  "base_commit": "c94f5ebdcb3c9d1a460ca48e04f9758448f8d518",
+  "apply_after": [
+    "rexglue-sdk.patch",
+    "gamma-present.patch"
+  ]
+}

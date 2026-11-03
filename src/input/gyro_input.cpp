@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
-// EchoPatch's approach: gate on actual aim state, add radians to the local
-// player-camera rotation. Native libnx HID replaces the PC SDL/Win32 path.
+// Add radians to local player-camera rotation, optionally gated by aim state.
+// Native libnx HID supplies motion; yaw follows gravity as in BLACK-NX-PORT.
 #include "gyro_input.h"
 #include "gyro_math.h"
 #include "fear_nx_pch.h"
@@ -15,7 +15,9 @@
 #include <switch.h>
 
 REXCVAR_DEFINE_BOOL(input_gyro_enabled, true, "Input",
-                   "Gyroscope aiming (only while the weapon is aimed). Takes effect immediately.");
+                   "Gyroscope camera control. Takes effect immediately.");
+REXCVAR_DEFINE_BOOL(input_gyro_always_on, true, "Input",
+                   "Apply gyro even when not aiming. false = only while aiming.");
 REXCVAR_DEFINE_DOUBLE(input_gyro_sensitivity, 1.0, "Input",
                      "Gyro sensitivity: 1.0 = one degree of camera turn per degree of controller turn.")
     .range(0.0, 10.0);
@@ -24,6 +26,7 @@ REXCVAR_DEFINE_DOUBLE(input_gyro_smoothing_ms, 16.0, "Input",
 REXCVAR_DEFINE_DOUBLE(input_gyro_deadzone_dps, 0.15, "Input",
                      "Gyro drift deadzone in degrees per second.").range(0.0, 5.0);
 REXCVAR_DEFINE_BOOL(input_gyro_invert_y, false, "Input", "Invert vertical gyro aiming.");
+REXCVAR_DEFINE_BOOL(input_gyro_invert_x, false, "Input", "Invert horizontal gyro aiming.");
 
 namespace fear_nx::input {
 namespace {
@@ -45,7 +48,7 @@ thread_local bool rotation_consumed = false;
 
 class MotionSource {
  public:
-  GyroDelta Read(bool aiming) {
+  GyroDelta Read(bool enabled_for_camera) {
     std::lock_guard lock(mutex_);
     if (shutting_down || !verified || !REXCVAR_GET(input_gyro_enabled)) {
       Stop();
@@ -112,16 +115,19 @@ class MotionSource {
     const GyroOptions options{REXCVAR_GET(input_gyro_sensitivity),
                               REXCVAR_GET(input_gyro_smoothing_ms),
                               REXCVAR_GET(input_gyro_deadzone_dps),
-                              REXCVAR_GET(input_gyro_invert_y)};
-    const bool active = aiming && input_active && focused;
+                              REXCVAR_GET(input_gyro_invert_y),
+                              REXCVAR_GET(input_gyro_invert_x)};
+    const bool active = enabled_for_camera && input_active && focused;
     if (!integrator_.BeginFrame(active, samples[0].sampling_number, elapsed, options)) return {};
     GyroDelta delta;
     // libnx returns newest first. Integrate each fresh sample oldest first.
     for (size_t i = count; i-- > 0;) {
       const auto& sample = samples[i];
       if (!(sample.attributes & HidSixAxisSensorAttribute_IsConnected)) continue;
-      const auto part = integrator_.Sample(sample.sampling_number, sample.angular_velocity.x,
-                                          sample.angular_velocity.z, sample.delta_time * 1e-9);
+      const auto part = integrator_.SampleMotion(
+          sample.sampling_number, sample.angular_velocity.x, sample.angular_velocity.y,
+          sample.angular_velocity.z, sample.acceleration.x, sample.acceleration.y,
+          sample.acceleration.z, sample.delta_time * 1e-9);
       delta.pitch += part.pitch;
       delta.yaw += part.yaw;
     }
@@ -274,7 +280,8 @@ REX_HOOK_RAW(sub_823B70A8) {
   using namespace fear_nx::input;
   if (gameplay_camera && ctx.r3.u32 == gameplay_camera && !rotation_consumed) {
     rotation_consumed = true;
-    const auto delta = motion.Read(REX_LOAD_U8(kAimState) != 0);
+    const bool aiming = REX_LOAD_U8(kAimState) != 0;
+    const auto delta = motion.Read(aiming || REXCVAR_GET(input_gyro_always_on));
     const uint32_t offset = ctx.r4.u32;
     // The verified caller passes a stack-local float[3]. Leave roll unchanged.
     const float pitch = std::bit_cast<float>(REX_LOAD_U32(offset));
