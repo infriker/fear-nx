@@ -33,15 +33,16 @@ Default values in the existing `[input]` section:
 ```toml
 gyro_enabled = true
 gyro_always_on = true
-gyro_sensitivity = 1.0
+gyro_sensitivity = 1.5
 gyro_smoothing_ms = 16.0
 gyro_deadzone_dps = 0.15
 gyro_invert_y = false
 gyro_invert_x = false
 ```
 
-Sensitivity 1.0 means one degree of camera rotation per degree of controller
-rotation, apart from smoothing and the small drift deadzone. Sensitivity is
+The default sensitivity is 1.5: one degree of controller rotation produces
+1.5 degrees of camera rotation, apart from smoothing and the small drift
+deadzone. Sensitivity 1.0 gives a one-to-one ratio. Sensitivity is
 independent of the game's right-stick sensitivity. Zero smoothing disables the
 filter. Horizon's standard stationary drift correction is enabled; hold the
 controller still briefly if needed. Do not add a second `[input]` table.
@@ -112,10 +113,8 @@ g++ -std=c++23 -Wall -Wextra -Werror -O2 src/input/gyro_math_test.cpp -o /tmp/gy
 /tmp/gyro-test
 ```
 
-The earlier aim-only implementation was confirmed on Switch on 2026-10-21.
-The gravity-projected implementation and new bindings have host logic tests
-and a cross-build; hardware testing of this revision is pending. The NRO was
-not launched during preparation.
+An explicit `gyro_sensitivity` value in an existing configuration overrides
+the default. Set it to `1.5` to use the v0.1.5 default with an older TOML.
 
 Hardware regression checks:
 

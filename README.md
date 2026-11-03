@@ -72,6 +72,9 @@ uncheck **input_gyro_enabled**, then choose **Save to config**. Alternatively,
 set `gyro_enabled = false` under `[input]` in `fear-nx.toml`. Existing saved
 preferences are preserved. See [gyro settings](docs/gyro-aiming.md).
 
+Default gyro sensitivity is **1.5**. An explicit value in an existing TOML still
+takes priority; set `gyro_sensitivity = 1.5` under `[input]` to use the new default.
+
 Individual physical buttons can be remapped in `[input.bindings]`; see
 [button bindings](docs/button-bindings.md). Release builds compile out the
 Switch profiler and disable ReXGlue debug/console shortcuts. Settings
@@ -98,7 +101,8 @@ default. The NRO also defaults to quiet logging when no TOML is present.
 FPS/resolution overlays, shader caches and the existing graphics profile remain.
 To update an old diagnostic installation, replace both the NRO and the supplied
 TOML (back up custom settings first); explicit settings in an old TOML still win.
-For deliberate profiling, set `[switch] perf_report = true` and restart.
+In v0.1.2–v0.1.4, `[switch] perf_report = true` enabled deliberate profiling.
+The profiler is compiled out of v0.1.5 release builds.
 No new controlled hardware FPS measurement is claimed.
 
 Version 0.1.3 fixes the reported stale-texture artifact when selecting an

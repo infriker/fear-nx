@@ -9,7 +9,7 @@
 namespace fear_nx::input {
 
 struct GyroOptions {
-  double sensitivity = 1.0;
+  double sensitivity = 1.5;
   double smoothing_ms = 16.0;
   double deadzone_dps = 0.15;
   bool invert_y = false;

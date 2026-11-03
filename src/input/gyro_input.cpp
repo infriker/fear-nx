@@ -18,7 +18,7 @@ REXCVAR_DEFINE_BOOL(input_gyro_enabled, true, "Input",
                    "Gyroscope camera control. Takes effect immediately.");
 REXCVAR_DEFINE_BOOL(input_gyro_always_on, true, "Input",
                    "Apply gyro even when not aiming. false = only while aiming.");
-REXCVAR_DEFINE_DOUBLE(input_gyro_sensitivity, 1.0, "Input",
+REXCVAR_DEFINE_DOUBLE(input_gyro_sensitivity, 1.5, "Input",
                      "Gyro sensitivity: 1.0 = one degree of camera turn per degree of controller turn.")
     .range(0.0, 10.0);
 REXCVAR_DEFINE_DOUBLE(input_gyro_smoothing_ms, 16.0, "Input",

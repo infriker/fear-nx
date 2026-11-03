@@ -44,7 +44,7 @@ xbox_layout = false
 # Uses the actual weapon aim state, including toggle aim and alternate layouts.
 gyro_enabled = true
 gyro_always_on = true
-gyro_sensitivity = 1.0
+gyro_sensitivity = 1.5
 gyro_smoothing_ms = 16.0
 gyro_deadzone_dps = 0.15
 gyro_invert_y = false

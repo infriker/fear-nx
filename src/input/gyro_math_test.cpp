@@ -64,7 +64,7 @@ int main() {
     return sum;
   };
   Near(run(25), run(30)); Near(run(30), run(60));
-  const double expected = -std::numbers::pi / 2 * (1 - 0.016 * (1 - std::exp(-1 / 0.016)));
+  const double expected = -3 * std::numbers::pi / 4 * (1 - 0.016 * (1 - std::exp(-1 / 0.016)));
   Near(run(30), expected);
 
   GyroIntegrator integrator;
