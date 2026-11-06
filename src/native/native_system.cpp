@@ -6,6 +6,9 @@
 // command ring, updates register and memory state, and presents through Vulkan.
 #include "native_system.h"
 #include "native_renderer.h"
+#ifdef FEAR_PGO_RECORD
+#include "fear_pgo.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -519,27 +522,18 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
 #endif
     uint32_t read = 0;
     uint32_t generation = 0;
-    auto last_report = Clock::now();
     while (running_.load(std::memory_order_acquire)) {
       {
         if (renderer_ready_) renderer_.KickRecorder();
-        const auto idle_start = Clock::now();
         std::unique_lock<std::mutex> lock(ring_mutex_);
         ring_cv_.wait_for(lock, std::chrono::milliseconds(4), [&] {
           return !running_.load(std::memory_order_acquire) ||
                  write_pointer_.load(std::memory_order_acquire) != read ||
                  ring_generation_.load(std::memory_order_acquire) != generation;
         });
-        ring_idle_ns_ += uint64_t(
-            std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - idle_start)
-                .count());
       }
       if (!running_.load(std::memory_order_acquire)) {
         break;
-      }
-      if (Clock::now() - last_report > std::chrono::seconds(10)) {
-        last_report = Clock::now();
-        Report();
       }
       const uint32_t gen = ring_generation_.load(std::memory_order_acquire);
       if (gen != generation) {
@@ -575,98 +569,6 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     return 0;
   }
 
-  void Report() {
-    REXLOG_INFO("[native] last 10 s: {} packets, {} draws, {} copies, {} swaps, {} waits cut short",
-                packets_ - reported_packets_, draws_ - reported_draws_, copies_ - reported_copies_,
-                swaps_ - reported_swaps_, waits_cut_short_);
-    reported_packets_ = packets_;
-    reported_draws_ = draws_;
-    reported_copies_ = copies_;
-    reported_swaps_before_ = reported_swaps_;
-    reported_swaps_ = swaps_;
-    if (renderer_ready_) {
-      const RendererStats& s = renderer_.stats();
-      REXLOG_INFO(
-          "[native] renderer: {} drawn, {} skipped, {} resolves, {} passes, {} submissions, "
-          "{} shaders, {} pipelines, {} textures ({} MB), {} MB vertices",
-          s.draws - reported_render_.draws, s.draws_skipped - reported_render_.draws_skipped,
-          s.resolves - reported_render_.resolves, s.render_passes - reported_render_.render_passes,
-          s.submissions - reported_render_.submissions, s.shaders_translated,
-          s.pipelines_created, s.textures_uploaded - reported_render_.textures_uploaded,
-          (s.texture_bytes_uploaded - reported_render_.texture_bytes_uploaded) >> 20,
-          (s.vertex_bytes_copied - reported_render_.vertex_bytes_copied) >> 20);
-      REXLOG_INFO(
-          "[native] textures: {} made now, {} streamed in, {} replaced after use, {} lookups "
-          "answered empty (streaming or not handled)",
-          s.textures_created - reported_render_.textures_created,
-          s.textures_streamed - reported_render_.textures_streamed,
-          s.textures_replaced - reported_render_.textures_replaced,
-          s.textures_pending - reported_render_.textures_pending);
-      {
-        std::string uploads = renderer_.TakeTextureUploadReport();
-        if (!uploads.empty()) {
-          REXLOG_INFO("[native] most uploaded textures: {}", uploads);
-        }
-      }
-      uint64_t frames = std::max<uint64_t>(swaps_ - reported_swaps_before_, 1);
-      uint64_t gpu_count =
-          std::max<uint64_t>(s.gpu_submissions - reported_render_.gpu_submissions, 1);
-      REXLOG_INFO(
-          "[native] per frame: renderer CPU {:.1f} ms, GPU {:.1f} ms over {:.1f} submissions "
-          "(GPU time as the driver reports it)",
-          double(s.cpu_ns - reported_render_.cpu_ns) / 1e6 / double(frames),
-          double(s.gpu_ns - reported_render_.gpu_ns) / 1e6 / double(frames),
-          double(s.gpu_submissions - reported_render_.gpu_submissions) / double(frames));
-      (void)gpu_count;
-      REXLOG_INFO("[native] per frame: {:.0f} draws, {:.0f} state rebuilds, {:.0f} texture "
-                  "binding rebuilds",
-                  double(s.draws - reported_render_.draws) / double(frames),
-                  double(s.setups_built - reported_render_.setups_built) / double(frames),
-                  double(s.texture_bindings_built - reported_render_.texture_bindings_built) /
-                      double(frames));
-      REXLOG_INFO("[native] per frame: {:.1f} waits for the game, {:.1f} ms waiting",
-                  double(waits_ - reported_waits_) / double(frames),
-                  double(wait_ns_ - reported_wait_ns_) / 1e6 / double(frames));
-      reported_waits_ = waits_;
-    slow_frames_logged_ = 0;
-      REXLOG_INFO(
-          "[native] slow frames: {} over 50 ms, {} over 100 ms; in them {} pipelines, "
-          "{} shaders, {} texture uploads, {} render targets",
-          s.frames_over_50ms - reported_render_.frames_over_50ms,
-          s.frames_over_100ms - reported_render_.frames_over_100ms,
-          s.slow_frame_pipelines - reported_render_.slow_frame_pipelines,
-          s.slow_frame_shaders - reported_render_.slow_frame_shaders,
-          s.slow_frame_uploads - reported_render_.slow_frame_uploads,
-          s.slow_frame_render_targets - reported_render_.slow_frame_render_targets);
-      reported_wait_ns_ = wait_ns_;
-      {
-        // The registers that most often changed the render state.
-        std::vector<std::pair<uint32_t, uint32_t>> top;
-        for (uint32_t i = 0; i < 0x4000; ++i) {
-          if (renderer_.state_change_counts_[i]) {
-            top.emplace_back(renderer_.state_change_counts_[i], i);
-            renderer_.state_change_counts_[i] = 0;
-          }
-        }
-        std::sort(top.rbegin(), top.rend());
-        std::string list;
-        for (size_t i = 0; i < std::min<size_t>(top.size(), 12); ++i) {
-          list += fmt::format(" {:04X}:{}", top[i].second, top[i].first);
-        }
-        REXLOG_INFO("[native] state changes by register (10 s):{}", list);
-      }
-      std::string reasons;
-      for (uint32_t i = 0; i < 16; ++i) {
-        uint64_t n = s.skipped_by_reason[i] - reported_render_.skipped_by_reason[i];
-        if (n) reasons += fmt::format(" {}:{}", i, n);
-      }
-      REXLOG_INFO("[native] skipped by reason:{}", reasons);
-      reported_render_ = s;
-    }
-  }
-  RendererStats reported_render_;
-  uint64_t reported_swaps_before_ = 0;
-
   // --- PM4 packets -----------------------------------------------------------------
 
   // Consumes a whole packet, or leaves the position untouched if it is not
@@ -692,7 +594,6 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       return false;
     }
     reader.Advance(1);
-    ++packets_;
     Reader data = reader;
     reader.Advance(count);
     if (!packet) {
@@ -762,7 +663,6 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         if (REXCVAR_GET(nx_pace_before_present)) PaceFrame();
         Present();
         swap_interrupt_pending_ = true;
-        ReportSlowFrame();
         break;
       case xenos::PM4_INDIRECT_BUFFER:
       case xenos::PM4_INDIRECT_BUFFER_PFD: {
@@ -811,12 +711,6 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
           } else {
             rex::thread::Sleep(std::chrono::microseconds(50));
           }
-        }
-        if (waited) {
-          ++waits_;
-          wait_ns_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                                   Clock::now() - wait_start)
-                                   .count());
         }
         break;
       }
@@ -1013,12 +907,10 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         // A draw in copy mode is a resolve and/or a clear.
         if ((Register(rex::graphics::XE_GPU_REG_RB_MODECONTROL) & 0x7) ==
             uint32_t(xenos::EdramMode::kCopy)) {
-          ++copies_;
           if (renderer_ready_) {
             renderer_.Resolve();
           }
         } else {
-          ++draws_;
           if (renderer_ready_) {
             renderer_.Draw(immediate, immediate_words);
           }
@@ -1108,47 +1000,6 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
 
   // --- Output presentation -----------------------------------------------------------
 
-  // A frame longer than 50 ms on the ring thread, broken down, at most 12
-  // per report period: the drops left are single long frames, which the 10 s
-  // averages hide.
-  void ReportSlowFrame() {
-    const auto now = Clock::now();
-    const uint64_t game_wait_ns = wait_ns_ - frame_start_wait_ns_;
-    frame_start_wait_ns_ = wait_ns_;
-    const uint64_t idle_ns = ring_idle_ns_ - frame_start_idle_ns_;
-    frame_start_idle_ns_ = ring_idle_ns_;
-    const uint64_t hold_ns = hold_ns_ - frame_start_hold_ns_;
-    frame_start_hold_ns_ = hold_ns_;
-    const auto previous = frame_start_;
-    frame_start_ = now;
-    if (!renderer_ready_ || previous.time_since_epoch().count() == 0) return;
-    const double ms =
-        double(std::chrono::duration_cast<std::chrono::microseconds>(now - previous).count()) /
-        1000.0;
-    const RendererStats& s = renderer_.stats();
-    const uint64_t pipelines = s.pipelines_created - frame_start_pipelines_;
-    const uint64_t shaders = s.shaders_translated - frame_start_shaders_;
-    const uint64_t textures = s.textures_uploaded - frame_start_textures_;
-    const uint64_t created = s.textures_created - frame_start_created_;
-    frame_start_pipelines_ = s.pipelines_created;
-    frame_start_shaders_ = s.shaders_translated;
-    frame_start_textures_ = s.textures_uploaded;
-    frame_start_created_ = s.textures_created;
-    if (ms < 50.0 || slow_frames_logged_ >= 12) return;
-    ++slow_frames_logged_;
-    REXLOG_INFO(
-        "[native] slow frame {:.0f} ms: ring idle {:.1f} ms, pacing hold {:.1f} ms",
-        ms, double(idle_ns) / 1e6, double(hold_ns) / 1e6);
-    REXLOG_INFO(
-        "[native] slow frame {:.0f} ms: waited for the game {:.1f} ms, the GPU {:.1f} ms "
-        "({:.1f} of it for stream space), texture untiling {:.1f} ms, the draw thread {:.1f} ms; "
-        "textures {:.1f} ms; {} draws, {} texture uploads ({} made now), {} shaders, {} pipelines",
-        ms, double(game_wait_ns) / 1e6, double(s.frame_fence_wait_ns) / 1e6,
-        double(s.frame_stream_wait_ns) / 1e6, double(s.frame_upload_wait_ns) / 1e6,
-        double(s.frame_drain_wait_ns) / 1e6, double(s.frame_texture_ns) / 1e6, s.frame_draws,
-        textures, created, shaders, pipelines);
-  }
-
   // The frame rate cap (nx_min_frame_vblanks): a frame is presented at a
   // vblank at least that many after the previous present, or at once if it is
   // later than that. The hold used to come after the present, before the
@@ -1171,9 +1022,6 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
              running_.load(std::memory_order_acquire) && Clock::now() < limit) {
         rex::thread::Sleep(std::chrono::microseconds(250));
       }
-      hold_ns_ += uint64_t(
-          std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - hold_start)
-              .count());
     }
     last_swap_vblank_ = vblanks_.load(std::memory_order_acquire);
   }
@@ -1181,6 +1029,9 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   void Present() {
     const uint64_t swap = ++swaps_;
     g_swaps_presented.fetch_add(1, std::memory_order_relaxed);
+#ifdef FEAR_PGO_RECORD
+    fear_nx::pgo::OnFrame();
+#endif
     counter_.fetch_add(1, std::memory_order_relaxed);
 #if defined(__SWITCH__)
     RexSwitchPerfCount(0);
@@ -1393,12 +1244,6 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   // Vblanks delivered, and the vblank of the last swap-complete interrupt.
   std::atomic<uint64_t> vblanks_{0};
   uint64_t last_swap_vblank_ = 0;
-  Clock::time_point frame_start_{};
-  uint64_t frame_start_wait_ns_ = 0, frame_start_pipelines_ = 0, frame_start_shaders_ = 0,
-           frame_start_textures_ = 0, frame_start_created_ = 0;
-  uint32_t slow_frames_logged_ = 0;
-  uint64_t ring_idle_ns_ = 0, hold_ns_ = 0;
-  uint64_t frame_start_idle_ns_ = 0, frame_start_hold_ns_ = 0;
   bool swap_interrupt_pending_ = false;
 
   std::atomic<uint32_t> ring_base_{0};
@@ -1430,10 +1275,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   uint32_t swap_height_ = 0;
 
   // Ring thread only.
-  uint64_t packets_ = 0, draws_ = 0, copies_ = 0, swaps_ = 0, waits_cut_short_ = 0;
-  uint64_t waits_ = 0, wait_ns_ = 0, reported_waits_ = 0, reported_wait_ns_ = 0;
-  uint64_t reported_packets_ = 0, reported_draws_ = 0, reported_copies_ = 0,
-           reported_swaps_ = 0;
+  uint64_t swaps_ = 0, waits_cut_short_ = 0;
 
   struct Framebuffer {
     VkFramebuffer framebuffer = VK_NULL_HANDLE;
@@ -1450,7 +1292,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
 
 }  // namespace
 
-bool Enabled() { return REXCVAR_GET(nx_renderer) == "native"; }
+bool Enabled() { return true; }  // This NRO always uses the full-frame Vulkan backend.
 
 uint64_t SwapsPresented() { return g_swaps_presented.load(std::memory_order_relaxed); }
 

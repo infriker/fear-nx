@@ -520,6 +520,8 @@ REXCVAR_DEFINE_UINT32(nx_native_texture_min_mip, 1, "F.E.A.R. NX",
 constexpr uint32_t kSyncCreatesPerFrame = 2;
 constexpr VkDeviceSize kSyncCreateMaxBytes = 32 * 1024;
 
+constexpr bool kTraceOutput = false;
+
 // New textures with at least this much host data stream in asynchronously.
 // Nearly all of them: the cost that hitched was not the data but creating the
 // image (memory allocation and GPU mapping are each a kernel round trip), and
@@ -568,23 +570,6 @@ struct TextureCache::Impl {
     ChangeDetector mips;
   };
   FlatMap64<Checked> checked;
-  struct UploadStat {
-    uint32_t address = 0, format = 0, width = 0, height = 0, count = 0;
-    uint64_t bytes = 0, last_hash = 0;
-  };
-  std::unordered_map<uint64_t, UploadStat> upload_stats;
-  void CountUpload(uint64_t key_hash, uint32_t address, uint32_t format, uint32_t width,
-                   uint32_t height, uint64_t bytes, uint64_t content_hash) {
-    if (upload_stats.size() > 4096) return;
-    UploadStat& u = upload_stats[key_hash];
-    u.address = address;
-    u.format = format;
-    u.width = width;
-    u.height = height;
-    ++u.count;
-    u.bytes += bytes;
-    u.last_hash = content_hash;
-  }
   std::unordered_set<uint32_t> depth_words_wanted;
 
   std::unordered_map<uint32_t, std::unique_ptr<ResolveDestination>> resolve_destinations;
@@ -806,7 +791,7 @@ struct TextureCache::Impl {
                            uint32_t source_y, uint32_t copy_width, uint32_t frame_root_address,
                            const TiledResolveRenderSource* raw_render_source,
                            VkCommandBuffer commands) {
-    if (!commands || !REXCVAR_QUERY(bool, nx_native_trace_output)) return;
+    if (!commands || !kTraceOutput) return;
     static constexpr uint64_t kCaptureFrames[3] = {120, 300, 600};
     size_t index = 3;
     for (size_t i = 0; i < 3; ++i) {
@@ -1663,23 +1648,7 @@ void TextureCache::Touch(void* texture, uint64_t submission) {
   t->last_used_frame = impl_->frame;
 }
 
-std::string TextureCache::TakeUploadReport() {
-  auto& stats = impl_->upload_stats;
-  if (stats.empty()) return {};
-  std::vector<const Impl::UploadStat*> sorted;
-  for (auto& [k, u] : stats) sorted.push_back(&u);
-  std::sort(sorted.begin(), sorted.end(),
-            [](auto* a, auto* b) { return a->count > b->count; });
-  std::string line;
-  for (size_t i = 0; i < sorted.size() && i < 6; ++i) {
-    const auto& u = *sorted[i];
-    line += fmt::format("{}{:08X} fmt {} {}x{}: {} ({} KB, last {:04X})", i ? " | " : "",
-                        u.address, u.format, u.width, u.height, u.count, u.bytes >> 10,
-                        uint32_t(u.last_hash & 0xFFFF));
-  }
-  stats.clear();
-  return line;
-}
+std::string TextureCache::TakeUploadReport() { return {}; }
 
 bool TextureCache::WantsDepthWords(uint32_t address) const {
   const Impl& im = *impl_;
@@ -1913,7 +1882,7 @@ bool TextureCache::UpdateTiledResolve(ResolveDestination& source, uint32_t root_
       im.memo.clear();
       ++im.answers_epoch;
     }
-    if (REXCVAR_QUERY(bool, nx_native_trace_output) && im.tiled_copy_path_trace_count < 12) {
+    if (kTraceOutput && im.tiled_copy_path_trace_count < 12) {
       ++im.tiled_copy_path_trace_count;
       REXLOG_INFO(
           "[native][trace] tiled copy path={} role=root root={:08X} rect=({},{} {}x{}) composite={}x{}",
@@ -2081,7 +2050,7 @@ bool TextureCache::UpdateTiledResolve(ResolveDestination& source, uint32_t root_
   im.RecordTiledReadback(*root_dest_it->second, source, composite, origin_x, origin_y,
                          root.source_y, source_x, source_y, width, root_address,
                          raw_render_source, commands);
-  if (REXCVAR_QUERY(bool, nx_native_trace_output) && im.tiled_copy_path_trace_count < 12) {
+  if (kTraceOutput && im.tiled_copy_path_trace_count < 12) {
     ++im.tiled_copy_path_trace_count;
     REXLOG_INFO(
         "[native][trace] tiled copy path={} role=segment root={:08X} root_copy={} segment={:08X} "
@@ -2090,7 +2059,7 @@ bool TextureCache::UpdateTiledResolve(ResolveDestination& source, uint32_t root_
         created_composite ? copy_path_name(root_copy_path) : "previous-root-copy", source.address,
         origin_x, origin_y, width, height, composite.width, composite.height, created_composite);
   }
-  if (created_composite && REXCVAR_QUERY(bool, nx_native_trace_output) &&
+  if (created_composite && kTraceOutput &&
       im.tiled_resolve_trace_count < 8) {
     ++im.tiled_resolve_trace_count;
     REXLOG_INFO(
@@ -3176,8 +3145,6 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
       im.stream_cv.notify_one();
       ++stats_.uploads;
       stats_.upload_bytes += total;
-      im.CountUpload(key_hash, base_page << 12, uint32_t(format), width, height, total,
-                     texture_hash);
       return null_view;
     }
 
@@ -3298,8 +3265,6 @@ VkImageView TextureCache::GetViewUncached(const xenos::xe_gpu_texture_fetch_t& f
                              0, 0, nullptr, 0, nullptr, 1, &barrier);
     ++stats_.uploads;
     stats_.upload_bytes += total;
-    im.CountUpload(key_hash, base_page << 12, uint32_t(format), width, height, total,
-                   texture_hash);
     target.content_hash = texture_hash;
     if (linear_r8_video_plane) target.last_uploaded_frame = im.frame;
     target.key_hash = key_hash;

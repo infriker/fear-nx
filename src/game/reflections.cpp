@@ -64,8 +64,7 @@ void VerifyReflectionHook(uint8_t* base) {
     }
   }
   verified = true;
-  REXLOG_INFO("F.E.A.R. NX: verified planar reflection hook; reflections {} on level load",
-              REXCVAR_GET(nx_planar_reflections) ? "enabled" : "disabled");
+  REXLOG_INFO("F.E.A.R. NX: verified planar reflection hook; disabled in Vulkan full-frame build");
 }
 }  // namespace fear_nx::game
 
@@ -79,7 +78,7 @@ REX_HOOK_RAW(sub_82310AC0) {
   using namespace fear_nx::game;
   const uint32_t target = ctx.r3.u32;
   __imp__sub_82310AC0(ctx, base);
-  if (!ctx.r3.u8 || !target || !verified || REXCVAR_GET(nx_planar_reflections)) return;
+  if (!ctx.r3.u8 || !target || !verified) return;
   if (!REX_LOAD_U8(target + kMirror)) return;
   // PolyGrid sets BOTH flags on its reflection and refraction channels. The
   // material parameter distinguishes them; leave tRefractionMap enabled.

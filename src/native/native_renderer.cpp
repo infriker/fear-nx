@@ -79,7 +79,7 @@ REXCVAR_DEFINE_BOOL(nx_native_depth24, false, "F.E.A.R. NX",
                     "without) instead of 32-bit float with stencil, which NVIDIA GPUs keep "
                     "in 64");
 REXCVAR_DEFINE_BOOL(nx_native_gpu_profile, false, "F.E.A.R. NX",
-                    "Log GPU time by render pass and resolve, measured on one frame in 16");
+                    "Reserved for config compatibility. GPU timing is compiled out.");
 REXCVAR_DEFINE_BOOL(nx_native_record_thread, false, "F.E.A.R. NX",
                     "Make the Vulkan calls of draws on a second thread, so the command ring "
                     "thread prepares the next draw meanwhile");
@@ -98,14 +98,13 @@ REXCVAR_DEFINE_BOOL(nx_native_precise_resolve_barriers, true, "F.E.A.R. NX",
 REXCVAR_DEFINE_BOOL(nx_native_full_clear_load_op, true, "F.E.A.R. NX",
                     "Clear fully covered render areas at attachment load without loading old contents")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
-REXCVAR_DEFINE_BOOL(nx_native_msaa, true, "F.E.A.R. NX",
-                    "Render with the multisampling the game asks for; off draws every target "
-                    "with one sample, which costs the GPU much less memory bandwidth");
+REXCVAR_DEFINE_BOOL(nx_native_msaa, false, "F.E.A.R. NX",
+                    "Reserved for config compatibility. This full-frame build renders at 1x.");
 REXCVAR_DEFINE_BOOL(nx_native_async_pipelines, true, "F.E.A.R. NX",
                     "Native renderer: compile new pipelines on a worker thread and skip the "
                     "draws that need them until they are ready, instead of stalling the frame");
 REXCVAR_DEFINE_BOOL(nx_native_trace_output, false, "F.E.A.R. NX",
-                    "Log bounded unique native renderer swap, viewport, and Xenos resolve state for display diagnostics");
+                    "Reserved for config compatibility. Render tracing is compiled out.");
 
 // Freshness + safe-span checks adapted from Juansolo457/fear360-recomp,
 // fc5722793f71217ca888c329d654bba6f9eeeedc, port-nx/src/native/native_renderer.cpp.
@@ -250,13 +249,14 @@ VkBlendOp BlendOpToVk(xenos::BlendOp op) {
   }
 }
 
+constexpr bool kTraceOutput = false;
+
 struct RenderTargetKey {
   uint32_t base_tiles;
   uint32_t pitch;
   uint32_t format;
   uint32_t msaa;
-  // Depth aliases retain their guest layout even with host MSAA disabled.
-  // Color identity stays unchanged; its last written guest layout is tracked below.
+  // The full-width scene, single-sample HUD, and depth aliases keep their guest layouts.
   uint32_t guest_msaa;
   uint32_t is_depth;
   bool operator==(const RenderTargetKey& o) const { return !std::memcmp(this, &o, sizeof(o)); }
@@ -286,6 +286,14 @@ struct RenderTarget {
   // The last actual color write determines its guest EDRAM sample layout.
   uint32_t last_draw_guest_msaa = UINT32_MAX;
 };
+
+// Expanding the scene virtualizes these overlapping Xbox EDRAM banks.
+bool SeparateFullFrameLayouts(const RenderTarget& first, const RenderTarget& second) {
+  return first.key.pitch == 1280 && second.key.pitch == 1280 &&
+         first.key.base_tiles == second.key.base_tiles &&
+         (first.key.base_tiles == 0 || first.key.base_tiles == 1024) &&
+         first.key.guest_msaa != second.key.guest_msaa;
+}
 
 // The attachments of a rendering scope: color 0-3 and depth.
 struct PassTargets {
@@ -560,10 +568,7 @@ struct Renderer::Impl {
     bool stream_has_allocation = false;
     std::vector<VkDescriptorPool> descriptor_pools;
     size_t descriptor_pool_used = 0;
-    bool timed = false;
   };
-  VkQueryPool timestamps = VK_NULL_HANDLE;
-  float timestamp_period = 1.0f;
   Submission submissions[kSubmissionSlots];
   uint64_t submission_number = 0;  // the one being recorded, if recording
   bool recording = false;
@@ -589,7 +594,6 @@ struct Renderer::Impl {
   // Whether render targets get the game's sample count (nx_native_msaa).
   // The targets are sized in guest pixels whatever the sample count, so one
   // sample changes only the images, the pipelines and the resolves.
-  bool multisample = true;
   // D24_UNORM_S8_UINT for the game's kD24S8 buffers (nx_native_depth24).
   bool depth24 = false;
   // Float24 guest surfaces also have an S8 aspect. Keep it even with compact
@@ -623,59 +627,7 @@ struct Renderer::Impl {
                         int32_t sy, int32_t dx, int32_t dy, uint32_t width, uint32_t height);
   bool CreateDepthConversion();
 
-  // GPU time by render pass and resolve (nx_native_gpu_profile): on one
-  // frame in 16, a timestamp is written where each pass or resolve begins,
-  // and the time to the next one is charged to it.
-  static constexpr uint32_t kProfileQueries = 512;
-  VkQueryPool profile_pool = VK_NULL_HANDLE;
-  bool profile_frame = false;
-  struct ProfileSegment {
-    uint64_t key;
-    uint32_t draws;
-  };
-  std::vector<ProfileSegment> profile_segments[kSubmissionSlots];
-  bool profile_closed[kSubmissionSlots] = {};
-  struct ProfileTotal {
-    double ns = 0;
-    uint64_t count = 0;
-    uint64_t draws = 0;
-  };
-  std::unordered_map<uint64_t, ProfileTotal> profile_totals;
-  uint32_t profiled_frames = 0;
-  double profiled_ns = 0;
-  // Kinds, in the key's top 4 bits.
-  enum : uint64_t { kProfileOther = 0, kProfilePass = 1, kProfileResolve = 2 };
-  static uint64_t ProfileTargetBits(const RenderTarget* rt) {
-    if (!rt) return 0xFFFFFF;
-    return (uint64_t(rt->key.base_tiles & 0xFFF) << 12) | (uint64_t(rt->key.pitch & 0x7FF) << 1) |
-           (rt->key.format & 1);
-  }
-  void ProfileMark(uint64_t key) {
-    if (!profile_frame || !profile_pool || !recording) return;
-    uint32_t slot = uint32_t(submission_number % kSubmissionSlots);
-    auto& segments = profile_segments[slot];
-    // The last query is kept for the closing timestamp.
-    if (segments.size() + 1 >= kProfileQueries) return;
-    dfn().vkCmdWriteTimestamp(cmd(), VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profile_pool,
-                              slot * kProfileQueries + uint32_t(segments.size()));
-    segments.push_back({key, 0});
-  }
-  void ProfileDraw() {
-    if (!profile_frame) return;
-    auto& segments = profile_segments[submission_number % kSubmissionSlots];
-    if (!segments.empty()) ++segments.back().draws;
-  }
-  void ProfileCollect(uint32_t slot);
-  struct TextureTimer {
-    uint64_t& total;
-    uint64_t start;
-    explicit TextureTimer(uint64_t& t) : total(t), start(NowNs()) {}
-    ~TextureTimer() { total += NowNs() - start; }
-  };
-  void ProfileReport();
-  uint32_t HostMsaa(xenos::MsaaSamples guest) const {
-    return multisample ? uint32_t(guest) : 0;
-  }
+  static constexpr uint32_t HostMsaa(xenos::MsaaSamples) { return 0; }
   bool null_images_initialized = false;
 
   // Render targets.
@@ -695,10 +647,6 @@ struct Renderer::Impl {
   size_t driver_cache_saved_size = 0;
   std::atomic<bool> driver_cache_writing{false};
   std::thread driver_cache_writer;
-
-  // Frame time tracking.
-  std::chrono::steady_clock::time_point last_swap_time;
-  RendererStats at_last_swap;
 
   // What the main command buffer has bound.
   VkPipeline bound_pipeline = VK_NULL_HANDLE;
@@ -835,6 +783,7 @@ struct Renderer::Impl {
     VulkanShader* vs = nullptr;
     VulkanShader* ps = nullptr;
     bool primitive_polygonal = false;
+    bool scene_clear_view = false;
     reg::RB_DEPTHCONTROL depth_control = {};
     bool convert_fan = false, convert_loop = false, strip = false, reset_enabled = false;
     draw_util::Scissor scissor = {};
@@ -1227,13 +1176,11 @@ struct Renderer::Impl {
     if (!record_threaded) return;
     uint32_t head = record_head.load(std::memory_order_relaxed);
     if (record_tail.load(std::memory_order_acquire) == head) return;
-    uint64_t start = NowNs();
     uint32_t spins = 0;
     while (record_tail.load(std::memory_order_acquire) != head) {
       WakeRecorder();
       if (++spins > 32) std::this_thread::yield();
     }
-    frame_drain_wait_ns += NowNs() - start;
   }
   RendererStats& stats() { return owner->stats_; }
 
@@ -1263,34 +1210,11 @@ struct Renderer::Impl {
   void Completed(Submission& s) {
     s.pending = false;
     UpdateCompletedFrame();
-    ProfileCollect(uint32_t(&s - submissions));
-    if (s.timed && timestamps) {
-      uint32_t slot = uint32_t(&s - submissions);
-      uint64_t ticks[2] = {};
-      if (dfn().vkGetQueryPoolResults(vk, timestamps, slot * 2, 2, sizeof(ticks), ticks,
-                                      sizeof(uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS &&
-          ticks[1] > ticks[0]) {
-        stats().gpu_ns += uint64_t(double(ticks[1] - ticks[0]) * timestamp_period);
-        ++stats().gpu_submissions;
-      }
-      s.timed = false;
-    }
-  }
-
-  // This frame's waits and texture time (RendererStats::frame_*).
-  uint64_t frame_upload_wait_ns = 0, frame_fence_wait_ns = 0, frame_drain_wait_ns = 0,
-           frame_texture_ns = 0, frame_draw_count = 0, frame_stream_wait_ns = 0;
-  static uint64_t NowNs() {
-    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch())
-                        .count());
   }
 
   void WaitSubmission(Submission& s) {
     if (s.pending) {
-      uint64_t start = NowNs();
       dfn().vkWaitForFences(vk, 1, &s.fence, VK_TRUE, UINT64_MAX);
-      frame_fence_wait_ns += NowNs() - start;
       Completed(s);
     }
   }
@@ -1335,24 +1259,9 @@ struct Renderer::Impl {
     begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     dfn().vkBeginCommandBuffer(s.setup, &begin);
     dfn().vkBeginCommandBuffer(s.main, &begin);
-    if (timestamps) {
-      uint32_t slot = uint32_t(submission_number % kSubmissionSlots);
-      dfn().vkCmdResetQueryPool(s.setup, timestamps, slot * 2, 2);
-      dfn().vkCmdWriteTimestamp(s.setup, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, timestamps, slot * 2);
-      s.timed = true;
-    }
     if (!null_images_initialized) {
       textures.InitializeNullImages(s.setup);
       null_images_initialized = true;
-    }
-    {
-      uint32_t slot = uint32_t(submission_number % kSubmissionSlots);
-      profile_segments[slot].clear();
-      profile_closed[slot] = false;
-      if (profile_frame && profile_pool) {
-        dfn().vkCmdResetQueryPool(s.setup, profile_pool, slot * kProfileQueries,
-                                  kProfileQueries);
-      }
     }
     // Everything the setup command buffer uploads is visible to the draws.
     VkMemoryBarrier barrier = {};
@@ -1385,11 +1294,7 @@ struct Renderer::Impl {
     DrainRecorder();
     EndPass();
     // The setup command buffer copies staging data the upload worker fills.
-    {
-      uint64_t start = NowNs();
-      textures.WaitForUploads();
-      frame_upload_wait_ns += NowNs() - start;
-    }
+    textures.WaitForUploads();
     // Keep pending render/resolve dependencies across submissions. Queue order
     // alone does not make writes visible to later commands.
     Submission& s = current();
@@ -1411,19 +1316,6 @@ struct Renderer::Impl {
         if (head_size) flush(0, head_size);
       }
     }
-    {
-      uint32_t slot = uint32_t(submission_number % kSubmissionSlots);
-      if (profile_pool && !profile_segments[slot].empty()) {
-        dfn().vkCmdWriteTimestamp(s.main, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profile_pool,
-                                  slot * kProfileQueries +
-                                      uint32_t(profile_segments[slot].size()));
-        profile_closed[slot] = true;
-      }
-    }
-    if (s.timed) {
-      dfn().vkCmdWriteTimestamp(s.main, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, timestamps,
-                                uint32_t(submission_number % kSubmissionSlots) * 2 + 1);
-    }
     dfn().vkEndCommandBuffer(s.setup);
     dfn().vkEndCommandBuffer(s.main);
     VkCommandBuffer buffers[] = {s.setup, s.main};
@@ -1439,7 +1331,6 @@ struct Renderer::Impl {
     }
     s.pending = true;
     recording = false;
-    ++stats().submissions;
   }
 
   // Stream memory for this submission; stalls on older submissions if the
@@ -1530,7 +1421,6 @@ struct Renderer::Impl {
       return nullptr;
     }
     // The current submission itself must not wrap onto what it still reads.
-    const uint64_t fence_before = frame_fence_wait_ns;
     if (end - current().stream_oldest > kStreamSize) {
       Submit();
       WaitSubmission(submissions[submission_number % kSubmissionSlots]);
@@ -1545,7 +1435,6 @@ struct Renderer::Impl {
         // BeginRecording restored the unfinished draw's pin.
         if (draw_stream_oldest != kNoStreamPosition &&
             end - draw_stream_oldest > kStreamSize) {
-          frame_stream_wait_ns += frame_fence_wait_ns - fence_before;
           draw_stream_failed = true;
           return nullptr;
         }
@@ -1556,7 +1445,6 @@ struct Renderer::Impl {
         WaitSubmission(s);
       }
     }
-    frame_stream_wait_ns += frame_fence_wait_ns - fence_before;
     stream_head = end;
     if (!stream_memory_coherent && size) {
       Submission& s = current();
@@ -1764,9 +1652,7 @@ bool Renderer::Impl::Initialize() {
     return false;
   }
   specialize_signs = REXCVAR_GET(gpu_specialize_texture_signs);
-  multisample = REXCVAR_GET(nx_native_msaa);
-  REXLOG_INFO("[native] MSAA: {}",
-              multisample ? "honoring guest sample count" : "disabled (single-sample host targets)");
+  REXLOG_INFO("[native] Vulkan full frame 1280x720, single-sample host targets");
   ubo_alignment = std::max<VkDeviceSize>(properties.minUniformBufferOffsetAlignment, 16);
 
   translator = std::make_unique<SpirvShaderTranslator>(SpirvShaderTranslator::Features(device),
@@ -1939,17 +1825,6 @@ bool Renderer::Impl::Initialize() {
     }
   }
 
-  VkQueryPoolCreateInfo query_info = {};
-  query_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-  query_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-  query_info.queryCount = kSubmissionSlots * 2;
-  if (properties.timestampPeriod > 0.0f &&
-      dfn().vkCreateQueryPool(vk, &query_info, nullptr, &timestamps) == VK_SUCCESS) {
-    timestamp_period = properties.timestampPeriod;
-  } else {
-    timestamps = VK_NULL_HANDLE;
-  }
-
   VkPipelineCacheCreateInfo cache_info = {};
   cache_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
   dfn().vkCreatePipelineCache(vk, &cache_info, nullptr, &driver_cache);
@@ -2026,7 +1901,7 @@ bool Renderer::Impl::Initialize() {
       REXLOG_WARN("[native] 24-bit depth buffers unavailable; using 32-bit float");
     }
   }
-  if (REXCVAR_GET(nx_native_trace_output)) {
+  if (kTraceOutput) {
     REXLOG_INFO(
         "[native][trace] depth capabilities: compact_depth={} separateStencilMaskRef={} "
         "depthClamp={} guest_D24S8_host={} guest_D24FS8_host={}",
@@ -2039,15 +1914,6 @@ bool Renderer::Impl::Initialize() {
               dfn().vkCmdSetDepthBias2EXT
           ? "exact D24 UNORM quantum (VK_EXT_depth_bias_control)"
           : "legacy format-dependent offset (exact D24 bias unavailable)");
-  if (REXCVAR_GET(nx_native_gpu_profile) && timestamps) {
-    VkQueryPoolCreateInfo profile_info = {};
-    profile_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
-    profile_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
-    profile_info.queryCount = kSubmissionSlots * kProfileQueries;
-    if (dfn().vkCreateQueryPool(vk, &profile_info, nullptr, &profile_pool) != VK_SUCCESS) {
-      profile_pool = VK_NULL_HANDLE;
-    }
-  }
   // The default linear 256-entry gamma ramp (CommandProcessor::Initialize).
   for (uint32_t i = 0; i < 256; ++i) {
     uint32_t value = i * 0x3FF / 0xFF;
@@ -2262,72 +2128,6 @@ bool Renderer::Impl::ComputeColorCopy(VkCommandBuffer c, VkImageView source, VkI
   return true;
 }
 
-void Renderer::Impl::ProfileCollect(uint32_t slot) {
-  auto& segments = profile_segments[slot];
-  if (!profile_pool || !profile_closed[slot] || segments.empty()) {
-    segments.clear();
-    return;
-  }
-  profile_closed[slot] = false;
-  std::vector<uint64_t> ticks(segments.size() + 1);
-  if (dfn().vkGetQueryPoolResults(vk, profile_pool, slot * kProfileQueries, uint32_t(ticks.size()),
-                                  ticks.size() * sizeof(uint64_t), ticks.data(), sizeof(uint64_t),
-                                  VK_QUERY_RESULT_64_BIT) == VK_SUCCESS) {
-    for (size_t i = 0; i < segments.size(); ++i) {
-      if (ticks[i + 1] < ticks[i]) continue;
-      double ns = double(ticks[i + 1] - ticks[i]) * timestamp_period;
-      ProfileTotal& total = profile_totals[segments[i].key];
-      total.ns += ns;
-      ++total.count;
-      total.draws += segments[i].draws;
-      profiled_ns += ns;
-    }
-  }
-  segments.clear();
-}
-
-void Renderer::Impl::ProfileReport() {
-  if (!profile_pool || !profile_frame) return;
-  // One profiled frame in 16; report about every 10 seconds at 30 fps.
-  if (++profiled_frames < 20) return;
-  std::vector<std::pair<uint64_t, ProfileTotal>> sorted(profile_totals.begin(),
-                                                        profile_totals.end());
-  std::sort(sorted.begin(), sorted.end(),
-            [](const auto& a, const auto& b) { return a.second.ns > b.second.ns; });
-  double frames = double(profiled_frames);
-  std::string line = fmt::format("[native] GPU by pass, ms per frame (sampled, as the driver "
-                                 "reports it): total {:.1f}",
-                                 profiled_ns / 1e6 / frames);
-  auto target = [](uint64_t bits) -> std::string {
-    if (bits == 0xFFFFFF) return "-";
-    return fmt::format("t{}p{}{}", (bits >> 12) & 0xFFF, (bits >> 1) & 0x7FF,
-                       (bits & 1) ? "f" : "");
-  };
-  for (size_t i = 0; i < sorted.size() && i < 14; ++i) {
-    uint64_t key = sorted[i].first;
-    const ProfileTotal& t = sorted[i].second;
-    std::string what;
-    switch (key >> 60) {
-      case kProfilePass:
-        what = fmt::format("pass c={} d={}", target((key >> 24) & 0xFFFFFF), target(key & 0xFFFFFF));
-        break;
-      case kProfileResolve:
-        what = fmt::format("resolve{} p{} {}x{}", ((key >> 56) & 1) ? " depth" : "",
-                           (key >> 32) & 0x7FF, (key >> 16) & 0xFFFF, key & 0xFFFF);
-        break;
-      default:
-        what = "other";
-        break;
-    }
-    line += fmt::format(" | {}: {:.2f} ({:.1f}x, {:.0f} draws)", what, t.ns / 1e6 / frames,
-                        double(t.count) / frames, double(t.draws) / frames);
-  }
-  REXLOG_INFO("{}", line);
-  profile_totals.clear();
-  profiled_frames = 0;
-  profiled_ns = 0;
-}
-
 bool Renderer::Impl::CreateSwapResources() {
   // The same layout as VulkanCommandProcessor's apply-gamma compute pipeline:
   // set 0 the ramp (uniform texel buffer), set 1 the source (sampled image),
@@ -2513,7 +2313,6 @@ void Renderer::Impl::Shutdown() {
   if (depth_convert_set_layout) {
     dfn().vkDestroyDescriptorSetLayout(vk, depth_convert_set_layout, nullptr);
   }
-  if (profile_pool) dfn().vkDestroyQueryPool(vk, profile_pool, nullptr);
   if (depth_scratch) dfn().vkDestroyBuffer(vk, depth_scratch, nullptr);
   if (depth_scratch_memory) dfn().vkFreeMemory(vk, depth_scratch_memory, nullptr);
   for (auto& [key, pipeline] : pipelines) {
@@ -2564,7 +2363,6 @@ void Renderer::Impl::Shutdown() {
   if (stream_buffer) dfn().vkDestroyBuffer(vk, stream_buffer, nullptr);
   if (stream_memory) dfn().vkFreeMemory(vk, stream_memory, nullptr);
   if (driver_cache) dfn().vkDestroyPipelineCache(vk, driver_cache, nullptr);
-  if (timestamps) dfn().vkDestroyQueryPool(vk, timestamps, nullptr);
   device = nullptr;
 }
 
@@ -2645,7 +2443,6 @@ bool Renderer::Impl::EnsureTranslated(VulkanShader::VulkanTranslation* translati
     if (!REXCVAR_GET(nx_native_async_pipelines) || !translation_thread.joinable()) {
       bool ok = translator->TranslateAnalyzedShader(*translation);
       if (ok) translation->GetOrCreateShaderModule();
-      ++stats().shaders_translated;
       translation_state[translation] = 2;
       if (!ok) {
         REXLOG_ERROR("[native] Shader {:016X} did not translate",
@@ -2681,7 +2478,6 @@ void Renderer::Impl::DrainTranslations() {
   }
   for (auto* t : done) {
     translation_state[t] = 2;
-    ++stats().shaders_translated;
   }
 }
 
@@ -3122,7 +2918,6 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& requested_k
                              0, 1, &after, 0, nullptr, 0, nullptr);
   RenderTarget* result = rt.get();
   render_targets[key] = std::move(rt);
-  ++stats().render_targets_created;
   ++rt_generation;
   REXLOG_INFO("[native] Render target {}x{} {} format {} at tile {}, {}x host MSAA, "
               "depth_guest_samples={}, zcull_eligible={}, allocation_bytes={}",
@@ -3144,7 +2939,7 @@ bool Renderer::Impl::BeginPass(const PassTargets& targets, const VkClearValue* c
       if (targets.color[i] && targets.color[i] != pass.color[i]) compatible = false;
     }
     if (targets.depth && targets.depth != pass.depth) compatible = false;
-    if (compatible && !(targets == pass) && REXCVAR_GET(nx_native_trace_output) &&
+    if (compatible && !(targets == pass) && kTraceOutput &&
         trace_attachment_transitions.size() < 8) {
       std::array<uint32_t, 50> trace_key{};
       size_t trace_offset = 0;
@@ -3185,8 +2980,6 @@ bool Renderer::Impl::BeginPass(const PassTargets& targets, const VkClearValue* c
     EndPass();
   }
   FlushResolveBarrier();
-  ProfileMark((kProfilePass << 60) | (ProfileTargetBits(targets.color[0]) << 24) |
-              ProfileTargetBits(targets.depth));
   pass = targets;
   VkRenderingAttachmentInfo colors[4] = {};
   uint32_t color_count = 0;
@@ -3231,7 +3024,6 @@ bool Renderer::Impl::BeginPass(const PassTargets& targets, const VkClearValue* c
   dfn().vkCmdBeginRendering(cmd(), &info);
   in_pass = true;
   pass_extent = {width, height};
-  ++stats().render_passes;
   return true;
 }
 
@@ -3505,11 +3297,28 @@ bool Renderer::Impl::BuildDrawSetup(uint32_t initiator_value) {
   // if it is tested or written.
   bool depth_used = depth_control.z_enable || depth_control.stencil_enable;
   // The guest's sample count sizes the EDRAM below; the host's keys the targets.
-  uint32_t guest_msaa = uint32_t(surface_info.msaa_samples);
+  // XDK clears the full-width 2x scene using a 640-wide 4x view of the
+  // same color/depth banks. Route this exact helper to the scene images
+  // and scale its horizontal coordinates into full-width pixels.
+  st.scene_clear_view =
+      surface_info.surface_pitch == 640 && uint32_t(surface_info.msaa_samples) == 2 &&
+      vs->ucode_data_hash() == 0x0A6D1DD7767FDF27ULL &&
+      initiator.prim_type == xenos::PrimitiveType::kRectangleList &&
+      initiator.source_select == xenos::SourceSelect::kAutoIndex && initiator.num_indices == 3 &&
+      pa_cl_clip_cntl.clip_disable &&
+      r.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]).color_base == 0 &&
+      r.Get<reg::RB_DEPTH_INFO>().depth_base == 1024;
+  const uint32_t target_pitch = st.scene_clear_view ? 1280u : uint32_t(surface_info.surface_pitch);
+  const uint32_t guest_msaa = st.scene_clear_view ? 1u : uint32_t(surface_info.msaa_samples);
   uint32_t msaa = HostMsaa(surface_info.msaa_samples);
   draw_util::GetScissor(r, st.scissor);
-  draw_util::GetHostViewportInfo(r, 1, 1, false, properties.maxViewportDimensions[0],
-                                 properties.maxViewportDimensions[1], true, depth_control, false,
+  if (st.scene_clear_view) {
+    st.scissor.offset[0] *= 2;
+    st.scissor.extent[0] *= 2;
+  }
+  draw_util::GetHostViewportInfo(r, st.scene_clear_view ? 2u : 1u, 1, false,
+                                 properties.maxViewportDimensions[0], properties.maxViewportDimensions[1],
+                                 true, depth_control, false,
                                  true, ps && ps->writes_depth(), st.viewport);
   // Rows the draw can touch: the viewport, cut by the scissor. The scissor
   // alone is often the 8192-pixel default and made every target 2048 tall.
@@ -3519,37 +3328,44 @@ bool Renderer::Impl::BuildDrawSetup(uint32_t initiator_value) {
         std::min(needed_height, st.viewport.xy_offset[1] + st.viewport.xy_extent[1]);
   }
   PassTargets& targets = st.targets;
+  const auto target_height = [&](uint32_t base, uint32_t rows) {
+    // The full scene no longer has to fit two independent Xbox EDRAM banks.
+    if (target_pitch == 1280 && (guest_msaa == 1 || guest_msaa == 2) &&
+        (base == 0 || base == 1024)) rows = std::max(rows, 720u);
+    return std::min(needed_height, rows);
+  };
   for (uint32_t i = 0; i < 4; ++i) {
     if (!((color_mask >> (4 * i)) & 0xF)) continue;
     auto color_info = r.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
     RenderTargetKey key = {};
     key.base_tiles = color_info.color_base;
-    key.pitch = surface_info.surface_pitch;
+    key.pitch = target_pitch;
     key.format = uint32_t(color_info.color_format);
     key.msaa = msaa;
-    key.guest_msaa = 0;
+    // The single-sample HUD and the scene reuse base zero at different times.
+    key.guest_msaa = key.pitch == 1280 ? guest_msaa : 0;
     // The EDRAM below the base limits how tall the target can be.
-    uint32_t pitch_tiles = (surface_info.surface_pitch * (guest_msaa >= 2 ? 2 : 1) + 79) / 80 *
+    uint32_t pitch_tiles = (target_pitch * (guest_msaa >= 2 ? 2 : 1) + 79) / 80 *
                            (IsColorFormat64bpp(color_info.color_format) ? 2 : 1);
     uint32_t rows = pitch_tiles ? (2048 - std::min(key.base_tiles, 2047u)) / pitch_tiles *
                                       (guest_msaa >= 1 ? 8 : 16)
                                 : 2048;
-    targets.color[i] = GetRenderTarget(key, std::min(needed_height, rows));
+    targets.color[i] = GetRenderTarget(key, target_height(key.base_tiles, rows));
   }
   if (depth_used) {
     auto depth_info = r.Get<reg::RB_DEPTH_INFO>();
     RenderTargetKey key = {};
     key.base_tiles = depth_info.depth_base;
-    key.pitch = surface_info.surface_pitch;
+    key.pitch = target_pitch;
     key.format = uint32_t(depth_info.depth_format);
     key.msaa = msaa;
-    key.guest_msaa = uint32_t(surface_info.msaa_samples);
+    key.guest_msaa = guest_msaa;
     key.is_depth = 1;
-    uint32_t pitch_tiles = (surface_info.surface_pitch * (guest_msaa >= 2 ? 2 : 1) + 79) / 80;
+    uint32_t pitch_tiles = (target_pitch * (guest_msaa >= 2 ? 2 : 1) + 79) / 80;
     uint32_t rows = pitch_tiles ? (2048 - std::min(key.base_tiles, 2047u)) / pitch_tiles *
                                       (guest_msaa >= 1 ? 8 : 16)
                                 : 2048;
-    targets.depth = GetRenderTarget(key, std::min(needed_height, rows));
+    targets.depth = GetRenderTarget(key, target_height(key.base_tiles, rows));
   }
   // Creating a render target above bumped rt_generation; this setup is built
   // against the new ones.
@@ -3726,8 +3542,6 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   // 10 layout, 11 descriptors, 12 geometry shader, 13 pipeline, 14 pass,
   // 15 immediate indices.
   auto skip = [&](uint32_t reason) {
-    ++stats().draws_skipped;
-    ++stats().skipped_by_reason[reason & 15];
   };
 
   auto initiator = r.Get<reg::VGT_DRAW_INITIATOR>();
@@ -3782,7 +3596,6 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
       setup.fetch_generation = owner->fetch_generation_;
       ++setup_generation;
     } else {
-      ++stats().setups_built;
       ++setup_generation;
       BuildDrawSetup(initiator.value);
       if (setup.valid) {
@@ -4037,7 +3850,6 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
           uint8_t* out = Allocate(span.size, 16, span_offset, true, span.offset);
           if (!out) return skip(9);
           std::memcpy(out, span_source, span.size);
-          stats().vertex_bytes_copied += span.size;
           span_position = stream_head - span.size;
           AddRange(span_key, span_position);
         }
@@ -4058,7 +3870,6 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
         uint8_t* out = Allocate(bytes, 16, range_offset);
         if (!out) return skip(9);
         std::memcpy(out, source, bytes);
-        stats().vertex_bytes_copied += bytes;
         range_position = stream_head - bytes;
         AddRange(range_key, range_position);
       }
@@ -4217,9 +4028,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     tb.submission = submission_number;
   }
   if (!tb_hit) {
-    TextureTimer texture_timer(frame_texture_ns);
     const uint64_t set_generation_at_build_start = set_cache_generation;
-    ++stats().texture_bindings_built;
     tb = TextureBindings();
     tb.valid_until = UINT64_MAX;
     for (uint32_t stage = 0; stage < 2; ++stage) {
@@ -4418,7 +4227,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   sr.offset.y = int32_t(std::min(st.scissor.offset[1], pass_extent.height));
   sr.extent.width = std::min(st.scissor.extent[0], pass_extent.width - uint32_t(sr.offset.x));
   sr.extent.height = std::min(st.scissor.extent[1], pass_extent.height - uint32_t(sr.offset.y));
-  if (REXCVAR_GET(nx_native_trace_output) && trace_draw_geometries.size() < 32) {
+  if (kTraceOutput && trace_draw_geometries.size() < 32) {
     const uint32_t surface_pitch = r.Get<reg::RB_SURFACE_INFO>().surface_pitch;
     const std::array<uint32_t, 15> trace_key = {
         st.viewport.xy_offset[0], st.viewport.xy_offset[1], st.viewport.xy_extent[0],
@@ -4459,7 +4268,7 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   }
   // Only inspect stencil draws that reached command recording. Keep at most
   // 64 distinct states; camera movement alone must not produce per-frame logs.
-  if (REXCVAR_GET(nx_native_trace_output) && st.targets.depth &&
+  if (kTraceOutput && st.targets.depth &&
       st.depth_control.stencil_enable && trace_stencil_states.size() < 64) {
     const RenderTarget& depth_target = *st.targets.depth;
     const uint32_t front_raw = r[rex::graphics::XE_GPU_REG_RB_STENCILREFMASK];
@@ -4522,13 +4331,11 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   }
   SubmitDraw(d);
   draw_stream_committed = true;
-  ProfileDraw();
-  ++frame_draw_count;
-  ++stats().draws;
   for (RenderTarget* rt : targets.color) {
     if (rt) {
       rt->last_used_frame = frame;
-      rt->last_draw_guest_msaa = uint32_t(r.Get<reg::RB_SURFACE_INFO>().msaa_samples);
+      rt->last_draw_guest_msaa = rt->key.pitch == 1280 ? rt->key.guest_msaa :
+          uint32_t(r.Get<reg::RB_SURFACE_INFO>().msaa_samples);
     }
   }
   MirrorStencilClear();
@@ -4651,7 +4458,7 @@ bool Renderer::Impl::GetFastClearRectangle(StencilClearRect& rect, bool require_
       x /= w;
       y /= w;
     }
-    xs[i] = x * scale_x + offset_x;
+    xs[i] = (x * scale_x + offset_x) * (st.scene_clear_view ? 2.0f : 1.0f);
     ys[i] = y * scale_y + offset_y;
     // Partial pixel/sample coverage requires a shader transfer, not a clear.
     if (!std::isfinite(xs[i]) || !std::isfinite(ys[i]) ||
@@ -4754,7 +4561,7 @@ void Renderer::Impl::MirrorStencilClear() {
     dfn().vkCmdClearAttachments(cmd(), 1, &attachment, 1, &clear);
     EndPass();
     target.last_used_frame = frame;
-    if (REXCVAR_GET(nx_native_trace_output) && trace_stencil_clear_aliases.size() < 32) {
+    if (kTraceOutput && trace_stencil_clear_aliases.size() < 32) {
       const std::array<uint32_t, 8> key = {source->key.base_tiles, source->key.pitch,
           guest_msaa, target.key.base_tiles, target.key.pitch, target.key.guest_msaa,
           target.key.format, ref.stencilref};
@@ -4810,7 +4617,8 @@ void Renderer::Impl::MirrorZeroDepthColorClear() {
   bool has_alias = false;
   for (const auto& entry : render_targets) {
     const RenderTarget& target = *entry.second;
-    if (target.key.is_depth || target.samples != source->samples ||
+    if (SeparateFullFrameLayouts(*source, target) || target.key.is_depth ||
+        target.samples != source->samples ||
         target.key.base_tiles != source->key.base_tiles ||
         target.key.format > uint32_t(xenos::ColorRenderTargetFormat::k_8_8_8_8_GAMMA)) {
       continue;
@@ -4836,7 +4644,8 @@ void Renderer::Impl::MirrorZeroDepthColorClear() {
   for (const auto& entry : render_targets) {
     RenderTarget& target = *entry.second;
     StencilClearRect mapped{};
-    if (target.key.is_depth || target.samples != source->samples ||
+    if (SeparateFullFrameLayouts(*source, target) || target.key.is_depth ||
+        target.samples != source->samples ||
         !(zero_depth
               ? MapZeroDepthColorClearRectangle(source_layout, layout_of(target), rect, mapped)
               : MapConstantDepthColorClearRectangle(source_layout, layout_of(target), rect,
@@ -4861,7 +4670,7 @@ void Renderer::Impl::MirrorZeroDepthColorClear() {
     dfn().vkCmdClearAttachments(cmd(), 1, &attachment, 1, &clear);
     EndPass();
     target.last_used_frame = frame;
-    if (REXCVAR_GET(nx_native_trace_output) && trace_depth_color_clears.size() < 16) {
+    if (kTraceOutput && trace_depth_color_clears.size() < 16) {
       const std::array<uint32_t, 9> key = {source->key.base_tiles, source->key.pitch,
           source->key.guest_msaa, target.key.format, uint32_t(mapped.x0), uint32_t(mapped.y0),
           uint32_t(mapped.x1), uint32_t(mapped.y1),
@@ -4946,7 +4755,8 @@ void Renderer::Impl::MirrorZeroColorAliasClear() {
       source->key.base_tiles, source->key.pitch, source->last_draw_guest_msaa,
       source->key.format, source->width, source->height};
   auto is_color_alias = [&](const RenderTarget& target) {
-    if (&target == source || target.key.is_depth || target.key.base_tiles != source->key.base_tiles ||
+    if (&target == source || SeparateFullFrameLayouts(*source, target) || target.key.is_depth ||
+        target.key.base_tiles != source->key.base_tiles ||
         target.key.format != source->key.format || target.last_draw_guest_msaa > 2) {
       return false;
     }
@@ -5025,7 +4835,7 @@ void Renderer::Impl::MirrorZeroColorAliasClear() {
     dfn().vkCmdClearAttachments(cmd(), 1, &attachment, 1, &clear);
     EndPass();
     target.last_used_frame = frame;
-    if (REXCVAR_GET(nx_native_trace_output) &&
+    if (kTraceOutput &&
         trace_zero_color_alias_clears.size() < 16) {
       const std::array<uint32_t, 14> key = {
           source->key.base_tiles, source->key.pitch, source->last_draw_guest_msaa,
@@ -5095,19 +4905,16 @@ void Renderer::Impl::Resolve() {
   }
   uint32_t msaa = HostMsaa(surface_info.msaa_samples);
   bool is_depth = copy_control.copy_src_select >= 4;
-  ++stats().resolves;
 
   BeginRecording();
   EndPass();
-  ProfileMark((kProfileResolve << 60) | (uint64_t(is_depth) << 56) |
-              (uint64_t(surface_info.surface_pitch & 0x7FF) << 32) |
-              (uint64_t(uint32_t(x1 - x0) & 0xFFFF) << 16) | uint32_t(y1 - y0));
   VkCommandBuffer c = cmd();
 
   RenderTargetKey source_key = {};
   source_key.pitch = surface_info.surface_pitch;
   source_key.msaa = msaa;
-  source_key.guest_msaa = is_depth ? uint32_t(surface_info.msaa_samples) : 0;
+  source_key.guest_msaa = (is_depth || source_key.pitch == 1280) ?
+      uint32_t(surface_info.msaa_samples) : 0;
   if (is_depth) {
     auto depth_info = r.Get<reg::RB_DEPTH_INFO>();
     source_key.base_tiles = depth_info.depth_base;
@@ -5170,7 +4977,7 @@ void Renderer::Impl::Resolve() {
     dest_height = std::min(dest_height, 8192u);
     auto& trace_states = is_depth ? trace_depth_resolve_states : trace_resolve_states;
     const size_t trace_limit = is_depth ? 8 : 24;
-    if (REXCVAR_GET(nx_native_trace_output) && trace_states.size() < trace_limit) {
+    if (kTraceOutput && trace_states.size() < trace_limit) {
       const uint32_t copy_control_raw = r[rex::graphics::XE_GPU_REG_RB_COPY_CONTROL];
       const uint32_t copy_info_raw = r[rex::graphics::XE_GPU_REG_RB_COPY_DEST_INFO];
       const uint32_t copy_pitch_raw = r[rex::graphics::XE_GPU_REG_RB_COPY_DEST_PITCH];
@@ -5337,7 +5144,7 @@ void Renderer::Impl::Resolve() {
           shared.root_address, resolve_address, uint32_t(is_depth), shared.width, shared.height,
           uint32_t(x0), uint32_t(y0), uint32_t(dest_x), uint32_t(dest_y), width, height,
           uint32_t(dest != nullptr)};
-      if (REXCVAR_GET(nx_native_trace_output) && trace_shared_resolve_states.size() < 48 &&
+      if (kTraceOutput && trace_shared_resolve_states.size() < 48 &&
           trace_shared_resolve_states.insert(shared_trace_key).second) {
         REXLOG_INFO("[native][shared] direct root={:08X} alias={:08X} depth={} "
                     "extent={}x{} src=({}, {}) dst=({}, {}) size={}x{} allocated={}",
@@ -5351,7 +5158,7 @@ void Renderer::Impl::Resolve() {
             uint32_t(source->format), msaa, tiled_full_width, tiled_full_height,
             tiled_origin.x, tiled_origin.y, uint32_t(x0), uint32_t(y0), width, height,
             uint32_t(dest_info.copy_dest_array) | (uint32_t(dest_info.copy_dest_slice) << 1)};
-        if (REXCVAR_GET(nx_native_trace_output) && trace_shared_fallback_states.size() < 24 &&
+        if (kTraceOutput && trace_shared_fallback_states.size() < 24 &&
             trace_shared_fallback_states.insert(fallback_key).second) {
           REXLOG_INFO("[native][shared] independent fallback address={:08X} depth={} "
                       "format={} host_format={} msaa={} pitch={}x{} origin=({}, {}) "
@@ -5367,7 +5174,7 @@ void Renderer::Impl::Resolve() {
       dest = textures.GetResolveDestination(
           resolve_address, dest_width, dest_height, dest_format, host_swizzle, c);
     }
-    if (dest && REXCVAR_GET(nx_native_trace_output)) {
+    if (dest && kTraceOutput) {
       auto found = trace_resolve_rects.find(resolve_address);
       if (found != trace_resolve_rects.end() || trace_resolve_rects.size() < 256) {
         trace_resolve_rects[resolve_address] = {uint32_t(x0), uint32_t(y0), width, height,
@@ -5973,7 +5780,7 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
     rex::kernel::xboxkrnl::VdQueryVideoMode(&mode);
     uint32_t display_width = std::max(1u, uint32_t(mode.display_width));
     uint32_t display_height = std::max(1u, uint32_t(mode.display_height));
-    if (REXCVAR_GET(nx_native_trace_output) && trace_swap_geometries.size() < 12) {
+    if (kTraceOutput && trace_swap_geometries.size() < 12) {
       TraceResolveRect resolve_rect{};
       auto resolved = trace_resolve_rects.find(address);
       const bool has_resolve_rect = resolved != trace_resolve_rects.end();
@@ -6153,47 +5960,14 @@ void Renderer::Impl::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, u
   Submit();
   // Frame boundary.
   auto now = std::chrono::steady_clock::now();
-  if (last_swap_time.time_since_epoch().count()) {
-    auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(now - last_swap_time).count();
-    if (ms > 50) {
-      RendererStats& st = stats();
-      ++st.frames_over_50ms;
-      if (ms > 100) ++st.frames_over_100ms;
-      st.slow_frame_pipelines += st.pipelines_created - at_last_swap.pipelines_created;
-      st.slow_frame_shaders += st.shaders_translated - at_last_swap.shaders_translated;
-      st.slow_frame_uploads += textures.stats().uploads - at_last_swap.textures_uploaded;
-      st.slow_frame_render_targets +=
-          st.render_targets_created - at_last_swap.render_targets_created;
-    }
-  }
-  last_swap_time = now;
-  at_last_swap = stats();
-  at_last_swap.textures_uploaded = textures.stats().uploads;
   // Save the driver's pipeline cache once new pipelines stop appearing for a
   // while, off this thread: the file is tens of megabytes on the SD card.
   if (!driver_cache_path.empty() && stats().pipelines_created != pipelines_at_last_save &&
       now - last_pipeline_time > std::chrono::seconds(5) && !driver_cache_writing.load()) {
     SaveDriverCache();
   }
-  stats().textures_uploaded = textures.stats().uploads;
-  stats().texture_bytes_uploaded = textures.stats().upload_bytes;
-  stats().textures_created = textures.stats().created;
-  stats().textures_streamed = textures.stats().streamed;
-  stats().textures_pending = textures.stats().pending;
-  stats().textures_replaced = textures.stats().replaced;
-  stats().frame_upload_wait_ns = frame_upload_wait_ns;
-  stats().frame_fence_wait_ns = frame_fence_wait_ns;
-  stats().frame_drain_wait_ns = frame_drain_wait_ns;
-  stats().frame_texture_ns = frame_texture_ns;
-  stats().frame_draws = frame_draw_count;
-  stats().frame_stream_wait_ns = frame_stream_wait_ns;
-  frame_stream_wait_ns = 0;
-  frame_upload_wait_ns = frame_fence_wait_ns = frame_drain_wait_ns = frame_texture_ns = 0;
-  frame_draw_count = 0;
   ++frame;
-  profile_frame = profile_pool && frame % 16 == 0;
   PollCompleted();
-  ProfileReport();
   textures.BeginFrame(frame, completed_frame);
   FreeRetiredSetPools();
   for (auto it = retired_render_targets.begin(); it != retired_render_targets.end();) {
@@ -6417,32 +6191,16 @@ void Renderer::LoadShader(xenos::ShaderType type, const uint32_t* ucode, uint32_
   }
 }
 
-namespace {
-struct CpuTimer {
-  uint64_t& total;
-  std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
-  explicit CpuTimer(uint64_t& t) : total(t) {}
-  ~CpuTimer() {
-    total += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
-                          std::chrono::steady_clock::now() - start)
-                          .count());
-  }
-};
-}  // namespace
-
 void Renderer::Draw(const uint32_t* immediate_indices, uint32_t immediate_index_words) {
-  CpuTimer timer(stats_.cpu_ns);
   impl_->Draw(immediate_indices, immediate_index_words);
 }
 
 void Renderer::Resolve() {
-  CpuTimer timer(stats_.cpu_ns);
   impl_->Resolve();
 }
 
 void Renderer::Swap(rex::ui::Presenter* presenter, uint32_t frontbuffer, uint32_t width,
                     uint32_t height) {
-  CpuTimer timer(stats_.cpu_ns);
   impl_->Swap(presenter, frontbuffer, width, height);
 }
 

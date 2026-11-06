@@ -127,6 +127,41 @@ docker run --rm --mount "type=bind,source=D:/fear-nx,target=/project" -w /projec
 Outputs include `out/switch/fear_nx` (AArch64 ELF), `fear_nx.nacp` and
 `fear_nx.nro`. For configuration only, stop after the first command.
 
+### Profile-guided release build
+
+The default build uses the full-frame guest layout, direct calls and LTO.
+The distributed NRO also uses a GCC 15.2.0 branch profile recorded on Switch.
+To train a build on your own gameplay, run the following inside the toolchain
+container with the checkout mounted at `/project` and a writable directory
+mounted at `/pgo`. Use the same source revision, compiler and container paths
+for recording and playback of the profile.
+
+```sh
+cd /project
+cmake -S . -B /pgo/train -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=/project/tools/switch/toolchain.cmake \
+  -DREXGLUE_SWITCH_NVK_SDK=/project/sdk/nvk -DFEAR_CPU_WORK_DIR=/pgo -DFEAR_PGO=generate
+cmake --build /pgo/train --parallel 4 --target fear_nx
+```
+
+Copy the recorder to the game's Switch folder under the name `fear_nx_pgo.nro`.
+Play representative fights and levels. Each launch writes cumulative snapshots
+beside the NRO in `pgo/run-N/`. Copy the latest completed `profile-N.pgo` from
+the desired run to `/pgo/gameplay.pgo` on the build machine.
+
+```sh
+cmake -S /project -B /pgo/use -G Ninja -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_TOOLCHAIN_FILE=/project/tools/switch/toolchain.cmake \
+  -DREXGLUE_SWITCH_NVK_SDK=/project/sdk/nvk -DFEAR_CPU_WORK_DIR=/pgo \
+  -DFEAR_PGO=use -DFEAR_PGO_PROFILE=/pgo/gameplay.pgo
+cmake --build /pgo/use --parallel 4 --target fear_nx
+```
+
+Use `/pgo/use/fear_nx.nro` for gameplay. GCC checks profile coverage across
+all 199 translated units. The link checks each redirected call against the
+final ELF so native hooks retain control. The PGO recorder is linked only in
+the training build.
+
 Copy the NRO and `release/fear-nx.toml` into `sdmc:/switch/fear-nx/`, then place
 your executable and extracted `Game/` under its `game/` subdirectory.
 See [installation](installing.md) for the full layout.

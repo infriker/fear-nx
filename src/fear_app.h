@@ -19,6 +19,9 @@
 #endif
 
 #include "native/native_system.h"
+#ifdef FEAR_PGO_RECORD
+#include "fear_pgo.h"
+#endif
 #include "input/gyro_input.h"
 #include "game/reflections.h"
 #include "game/quality.h"
@@ -60,9 +63,23 @@ class FearNxApp final : public rex::ReXApp {
 
   void OnWindowFocusChanged(bool focused) override {
     fear_nx::input::SetGyroFocus(focused);
+#ifdef FEAR_PGO_RECORD
+    if (!focused) fear_nx::pgo::Save();
+#endif
   }
 
-  void OnShutdown() override { fear_nx::input::ShutdownGyro(); }
+#ifdef FEAR_PGO_RECORD
+  bool OnWindowCloseRequested() override {
+    fear_nx::pgo::Save();
+    return true;
+  }
+#endif
+  void OnShutdown() override {
+#ifdef FEAR_PGO_RECORD
+    fear_nx::pgo::Save();
+#endif
+    fear_nx::input::ShutdownGyro();
+  }
 
   void OnConfigurePaths(rex::PathConfig& paths) override {
 #if REX_PLATFORM_SWITCH

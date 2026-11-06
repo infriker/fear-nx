@@ -1,9 +1,8 @@
 # Dynamic planar reflections
 
-`[nx] planar_reflections = false` disables dynamic water/puddle reflection maps
-and plain mirror targets. It defaults to false in the NRO, so existing profiles
-do not need replacement. Set it to true and fully restart the game to restore
-the original behavior. The setting is applied when level FX objects are created.
+The v0.2.0 full-frame Vulkan build disables dynamic water, puddle and mirror
+reflection targets when level FX objects are created. The `[nx] planar_reflections`
+key is retained for compatibility with older configurations.
 
 This keeps water's separate `tRefractionMap`, ordinary camera render targets,
 movie/video textures, shadows, specular lighting and static environment maps.

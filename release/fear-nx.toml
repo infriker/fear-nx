@@ -13,7 +13,7 @@ vertex_spans = true
 client_fx_detail_level = 1
 # Scale eligible particle bounce/splat probabilities. 1.0 restores original behavior.
 particle_bounce_scale = 0.5
-# Dynamic water/mirror reflections; restart after changing.
+# Compatibility key. The full-frame renderer disables dynamic water/mirror reflections.
 planar_reflections = false
 # Keep volumetric lighting, with half the Xbox 360 slice count. 0 restores game default.
 volumetric_light_slices = 128
@@ -25,6 +25,7 @@ native_shared_resolves = true
 native_gpu_profile = false
 native_max_anisotropy = 2
 native_depth24 = true
+# Full-frame color and depth targets use one sample.
 native_msaa = false
 native_async_pipelines = true
 native_record_thread = false

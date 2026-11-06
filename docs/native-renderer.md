@@ -21,7 +21,7 @@ These keys belong under `[nx]` in `fear-nx.toml`:
 | Key | Release value | Purpose |
 |---|---|---|
 | `renderer` | `"native"` | Select the app-owned Vulkan renderer |
-| `planar_reflections` | `false` | Disable dynamic water/mirror reflection targets; keep refraction and ordinary camera targets |
+| `planar_reflections` | `false` | Reserved for compatibility. Dynamic water and mirror reflections are disabled in v0.2.0 |
 | `client_fx_detail_level` | `1` | Use the game's medium effect detail; `2` restores original detail |
 | `particle_bounce_scale` | `0.5` | Scale eligible particle bounce/splat probabilities; `1.0` restores original behavior |
 | `volumetric_light_slices` | `128` | Reduce light-volume slices from 256 while keeping the effect |
@@ -29,7 +29,7 @@ These keys belong under `[nx]` in `fear-nx.toml`:
 | `native_texture_min_mip` | `1` | Use mip 1 or coarser on eligible large tiled BC1-BC5 textures |
 | `native_shared_resolves` | `true` | Share validated resolve destinations |
 | `native_depth24` | `true` | D24 storage for compatible guest depth surfaces |
-| `native_msaa` | `false` | Disable host MSAA |
+| `native_msaa` | `false` | Full-frame targets always use one sample |
 | `native_max_anisotropy` | `2` | Limit anisotropic filtering to 2× |
 | `native_async_pipelines` | `true` | Compile pipelines asynchronously |
 | `native_record_thread` | `false` | Keep command recording on the current path |
@@ -37,15 +37,13 @@ These keys belong under `[nx]` in `fear-nx.toml`:
 | `native_zcull` | `true` | Allocate depth attachments eligible for persistent NVK ZCULL |
 | `native_precise_resolve_barriers` | `true` | Omit a redundant transfer wait on compute resolve/crop paths |
 | `native_full_clear_load_op` | `true` | Clear a fully covered render area at attachment load |
-| `native_gpu_profile` | `false` | Collect GPU pass diagnostics when explicitly enabled |
-| `native_trace_output` | `false` | Record bounded renderer diagnostics when explicitly enabled |
+| `native_gpu_profile` | `false` | Reserved for compatibility. The release omits per-pass timers |
+| `native_trace_output` | `false` | Reserved for compatibility. The release omits native render tracing |
 
 The weapon display remains enabled. The mip setting excludes linear video
 planes, render targets and textures without the required mip chain. Set the
 `volumetric_light_slices`, `volumetric_light_shadow_size` and
-`native_texture_min_mip` values to `0` to restore the game-selected levels, and
-set `planar_reflections = true` to restore dynamic reflections; restart after
-changing these settings. See [reflection handling](planar-reflections.md).
+`native_texture_min_mip` values to `0` to restore the game-selected levels. Restart after changing them. See [reflection handling](planar-reflections.md).
 
 The FX controls are initialization-only: fully restart after changing them.
 `client_fx_detail_level` accepts `0` (low), `1` (medium) and `2` (original).
@@ -54,10 +52,8 @@ bounce and splat probabilities, not all physics or the total particle count.
 The defaults also apply when these keys are absent from an older TOML.
 Bloom retains the original game behavior; no bloom-disabling override is included.
 
-The release disables profiling, trace output and routine logging
-for normal play. Enable diagnostics separately when collecting a capture. Clock selection
-is separate: `[switch] gpu_mhz = 0` leaves the system profile unchanged.
-`[input] xbox_layout` changes face-button mapping, not rendering.
+The release omits the PGO recorder and native renderer timers. Routine logging
+is disabled. The supplied `[switch] gpu_mhz = 0` leaves GPU clocks to the system.
 
 ## Vertex/index freshness
 
@@ -114,8 +110,7 @@ new allocation path. This reports the application's eligibility, not a GPU
 counter measurement. Actual activation also requires the driver's successful
 Switch ZCULL initialization. FPS improvement and visual correctness must be
 checked on hardware, especially shadows, moving lights and transitions between
-scenes. For timing runs, disable `native_gpu_profile` and `native_trace_output`
-and keep routine logging off; enable diagnostics only for a separate capture.
+scenes.
 
 The standalone `src/native/native_zcull_test.cpp` checks full-clear promotion
 against a depth/stencil sample model, including partial clears and clipping.
@@ -141,20 +136,17 @@ area are preserved. Ordinary draw passes continue to load existing contents.
 The standalone `native_attachment_clear_test.cpp` exercises the selection
 and sample model, including padded allocations and smaller render areas.
 
-## Tiled rendering and measured performance
+## Full-frame rendering in v0.2.0
 
-Shared resolves remove supported tile-composition copies by writing into one
-destination image. They do **not** rewrite the game's commands to draw the
-scene once. Disabling host MSAA also does not remove guest tile replay. A
-single-pass path requires a verified F.E.A.R.-specific change to target setup
-and tile scheduling; the NFSMW game-specific hook cannot be copied verbatim.
+The guest sets up full-height color and depth surfaces for the supported
+1280×720 scene and submits a single full-height rectangle to the XDK. The
+frontbuffer count, clears, resolves, and swap sequence are preserved. Other
+render-target sizes follow the original game path. This also fixes the
+half-screen image during level loading.
 
-The user's 2026-10-22 measurements at GPU **460 MHz** report **30 FPS** for
-most of the game, **25–27 FPS** in heavy firefights and about **17 FPS** in
-some anomalous areas. Below 30 FPS the GPU reaches **100%** while the CPU has
-headroom. These are observations of the preceding test builds, not measurements
-of the new clear/barrier changes. See [performance.md](performance.md) for the
-detailed NFSMW comparison, remaining questions and hardware test procedure.
+Shared resolves still reuse eligible destination images. Host attachments use
+one sample. See [Switch performance](performance.md#switch-performance-in-v020)
+for the CPU, GPU and RAM clocks used in testing.
 
 The renderer derives from Project8 SW and nfsmw-nx. The complete runtime source
 snapshot is in `patches/native-vulkan`; driver sources and patches are described

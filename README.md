@@ -5,11 +5,11 @@ The game's PowerPC code is statically recompiled to AArch64 with
 [ReXGlue](https://github.com/rexglue/rexglue-sdk). A native Vulkan renderer draws
 the game through Mesa/NVK on Horizon.
 
-The original menu and campaign are playable. In the latest on-device testing at
-**460 MHz GPU**, most gameplay runs at **30 FPS**. Heavy firefights can fall to
-**25–27 FPS**, and some unusually demanding areas reach **17 FPS**. Those drops
-are GPU-bound: GPU utilization reaches 100% while the CPU still has headroom.
-Performance work is ongoing.
+The original menu and campaign are playable. Version **0.2.0** renders the
+720p scene once and fixes the half-screen image during level loading. On Switch
+at 1020 MHz CPU and 460 MHz GPU, gameplay typically runs at **30 FPS**, with
+drops to **25 FPS** in heavy firefights. The CPU is now the main limit.
+See [performance by clock setting](docs/performance.md#switch-performance-in-v020).
 
 **Branches:** `main` contains the Vulkan/Mesa renderer. The separate
 [`deko3d` branch](https://github.com/infriker/fear-nx/tree/deko3d) contains the
@@ -82,64 +82,32 @@ Switch profiler and disable ReXGlue debug/console shortcuts. Settings
 
 ## Settings and performance
 
-Edit `fear-nx.toml` next to the NRO. The release uses the native renderer,
-shared resolve resources, D24 depth, 2× anisotropic filtering and disabled MSAA.
-The supplied profile leaves GPU clock selection to the system or your clock tool;
-it does not force a GPU clock or reduce the rendering resolution.
+Version 0.2.0 builds the main 1280×720 scene as one full frame. The Vulkan
+renderer uses single-sample targets and skips dynamic planar reflections.
+The translated game code uses direct calls, link-time optimization (LTO) and
+profile-guided optimization (PGO) from a Switch gameplay session.
 
-Version 0.1.1 keeps weapon displays enabled and carries the depth/color alias,
-video-plane update and descriptor-lifetime fixes. Its balanced profile uses
-128 volumetric-light slices, 64x64 volumetric shadow maps and mip 1 for eligible
-large compressed textures. Dynamic planar reflections are disabled by default;
-lighting and volumetric shadows remain enabled. See the
-[renderer settings](docs/native-renderer.md) to restore the original quality.
+| CPU | GPU | RAM | Observed gameplay |
+|---|---|---|---|
+| 1020 MHz (stock) | 460 MHz | — | 30 FPS in normal play, with drops to 25 FPS in heavy firefights. |
+| 1224 MHz | 460 MHz | — | Usually holds 30 FPS, with rare drops to 25 FPS in heavy firefights. |
+| 1428 MHz | 614 MHz | At least 1800 MHz | Stable 30 FPS in tested gameplay, including heavy firefights. |
 
+Clock settings are from on-device tests. RAM frequency was reported only for
+the last configuration. The port leaves clock selection to the system or the
+player's clock tool. See the [performance notes](docs/performance.md).
 
-Version 0.1.2 disables routine logging, periodic log flushing, Vulkan validation,
-GPU verification/statistics and the separate Switch performance report by
-default. The NRO also defaults to quiet logging when no TOML is present.
-FPS/resolution overlays, shader caches and the existing graphics profile remain.
-To update an old diagnostic installation, replace both the NRO and the supplied
-TOML (back up custom settings first); explicit settings in an old TOML still win.
-In v0.1.2–v0.1.4, `[switch] perf_report = true` enabled deliberate profiling.
-The profiler is compiled out of v0.1.5 release builds.
-No new controlled hardware FPS measurement is claimed.
+The release uses medium effects, 128 volumetric-light slices, 64×64 volumetric
+shadow maps, 2× anisotropic filtering and mip 1 for eligible large compressed
+textures. Weapon displays, bloom and water refraction are enabled. Edit
+`fear-nx.toml` next to the NRO to adjust the supported [renderer settings](docs/native-renderer.md).
 
-Version 0.1.3 fixes the reported stale-texture artifact when selecting an
-affected weapon on Switch. It prevents reuse of stale vertex/index uploads
-after the game rewrites data within a frame. Fresh content checks and safe
-vertex spans are enabled by default; unchanged uploads are
-reused, and only shader-proven spans are checked where possible. The user
-confirmed the fix on Switch with the preceding 0.1.2-vf1 build on 2026-10-25.
-Weapon displays remain enabled. No new controlled FPS comparison is available.
-
-Version 0.1.4 uses the game's medium effect detail (`ClientFXDetailLevel = 1`)
-and halves eligible particle bounce/splat probabilities (`ParticleBounceScale = 0.5`).
-Bloom uses the original game behavior. Texture mip selection and anisotropic
-filtering retain the v0.1.3 release values. The user accepted the preceding
-0.1.3-fx3 build on Switch on 2026-10-25; no controlled FPS gain is claimed.
-
-The user's hardware observations reported on **2026-10-22**, at the tested stock
-**460 MHz GPU** setting, are 30 FPS through most gameplay, 25–27 FPS in heavy
-firefights, and lows of about 17 FPS in anomalous GPU-heavy areas. During drops
-below 30 FPS the GPU is fully occupied while the CPU has headroom. These are
-observations from the recent test builds, not a full-campaign benchmark or a
-guarantee for every level. See the [performance and change history](docs/performance.md).
 The first encounter with a shader can cause temporary missing effects or a hitch
 while its pipeline compiles; compiled pipelines are cached on the SD card.
 
-## Planned features
-
-- [ ] GPU performance improvements for heavy firefights and anomalous slow areas.
-- [ ] Investigate the temporary half-screen scene at the start of level loading.
-
 ## Known issues
 
-- A temporary half-screen scene may appear at the start of level loading.
-  The reported weapon, decal and screen-flicker defects have been confirmed
-  resolved by the user and are no longer listed as open issues.
-
-- GPU-heavy areas can fall below the 30 FPS target, down to about 17 FPS in testing.
+- Heavy firefights can reach 25 FPS at 1020 or 1224 MHz CPU with a 460 MHz GPU.
 - Asynchronous pipeline compilation can briefly omit newly encountered draws.
 - Only the executable revision listed below is supported.
 - Applet mode and emulators are not supported release targets.

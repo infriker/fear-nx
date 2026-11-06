@@ -168,7 +168,6 @@ class Renderer {
       return;
     }
     ++state_generation_;
-    ++state_change_counts_[index];
     // The render state is the context block; its hash is kept up to date one
     // register at a time (each register contributes Mix(index, value), and
     // an XOR swaps the old contribution for the new one).
