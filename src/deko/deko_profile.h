@@ -8,6 +8,26 @@
 
 namespace fear_nx::deko {
 
+#if defined(FEAR_NX_DEKO_RETAIL)
+inline constexpr bool kCollectRendererStats = false;
+// Keep instrumentation at its original call sites for diagnostic builds.
+// Retail hot paths have no counter storage accesses or clock reads.
+struct ProfileCounter {
+  constexpr ProfileCounter(uint64_t = 0) {}
+  constexpr operator uint64_t() const { return 0; }
+  void operator++() {}
+  void operator+=(uint64_t) {}
+};
+constexpr uint64_t ProfileClockNs() { return 0; }
+class ProfileScope {
+ public:
+  template<class Counter> explicit ProfileScope(Counter&, bool = false) {}
+  void Stop() {}
+  template<class Counter> void Next(Counter&) {}
+};
+#else
+inline constexpr bool kCollectRendererStats = true;
+using ProfileCounter = uint64_t;
 // Horizon's 19.2 MHz monotonic counter; no service calls in the draw hot path.
 inline uint64_t ProfileClockNs() {
 #if defined(__aarch64__)
@@ -47,5 +67,6 @@ class ProfileScope {
   bool enabled_;
   uint64_t start_;
 };
+#endif
 
 }  // namespace fear_nx::deko

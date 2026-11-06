@@ -15,13 +15,20 @@ void LocalCache() {
   for(uint32_t i=0;i<100000;++i) {
     const decltype(cache)::Key key{rng()%64,rng()%8,rng()%64};
     if(i%419==0){oracle.clear();cache.Clear();}
-    if(rng()%3==0){cache.Store(key,i);oracle.insert_or_assign(key,i);}
+    if(rng()%3==0){
+      cache.Store(key,i);
+      if(oracle.size()<cache.kMaxEntries || oracle.contains(key))oracle.insert_or_assign(key,i);
+    }
     else {
       const auto* hit=cache.Find(key);auto it=oracle.find(key);
       CHECK(bool(hit)==(it!=oracle.end()));if(hit)CHECK(*hit==it->second);
     }
   }
-  decltype(cache)::Key key{1,2,3};cache.Store(key,7);CHECK(*cache.Find(key)==7);
+  cache.Clear();
+  for(uint64_t i=0;i<cache.kMaxEntries;++i)cache.Store({i,0,0},i);
+  CHECK(!cache.Find({99,0,0}));cache.Store({99,0,0},99);CHECK(!cache.Find({99,0,0}));
+  cache.Store({0,0,0},17);CHECK(*cache.Find({0,0,0})==17);
+  cache.Clear();decltype(cache)::Key key{1,2,3};cache.Store(key,7);CHECK(*cache.Find(key)==7);
   CHECK(cache.fast_hits);cache.Store(key,9);CHECK(*cache.Find(key)==9);
   cache.Clear();CHECK(!cache.Find(key));
 }

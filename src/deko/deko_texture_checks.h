@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+
+#include "deko_profile.h"
 // Texture scheduling follows NFSMW 266f943: nfsmw_dk_texturas.cpp and
 // nfsmw_nativo_xenos.h. Geometry epochs and their quarantines are independent.
 #ifndef XXH_INLINE_ALL
@@ -23,9 +25,11 @@ class TextureChecks {
     bool valid=false, sample_valid=false;
   };
   struct Stats {
-    uint64_t lookups=0, frame_hits=0, scheduled_hits=0, full_checks=0, full_bytes=0;
-    uint64_t sample_checks=0, sample_bytes=0, sample_hits=0, guard_checks=0, guard_misses=0;
-    uint64_t budget_deferrals=0, changes=0, excluded_bases=0;
+    ProfileCounter lookups=0, frame_hits=0, scheduled_hits=0, full_checks=0, full_bytes=0;
+    ProfileCounter sample_checks=0, sample_bytes=0, sample_hits=0;
+    uint64_t guard_checks=0, guard_misses=0;
+    ProfileCounter budget_deferrals=0, changes=0;
+    uint64_t excluded_bases=0;
     uint32_t training=0;
     bool sampling_disabled=false;
   };

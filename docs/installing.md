@@ -11,6 +11,7 @@ be present. The PC edition cannot be substituted.
 Use title takeover mode (hold R when starting an installed game). Keep
 `userdata/` when updating and back up custom settings before replacing the TOML.
 Vulkan and deko3d NROs have distinct names and can coexist in this folder.
-The profile does not force overclocking; the reported 20–30 FPS used overclocking.
+Clock settings are left to the system. The 20–30 FPS report in the history
+applies to the October build.
 
 See [known issues](known-issues.md) for performance and reporting limitations.

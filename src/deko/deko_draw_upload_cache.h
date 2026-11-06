@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+
+#include "deko_profile.h"
 #include "deko_cpu_compare.h"
 
 #include "deko_vertex_range.h"
@@ -22,7 +24,7 @@ namespace fear_nx::deko {
 // writes at any byte within a work, including immediate command buffer reuse.
 class IndexValidationMemo {
  public:
-  struct Stats { uint64_t candidates=0, hits=0, rejected=0; };
+  struct Stats { ProfileCounter candidates=0, hits=0, rejected=0; };
   template <typename Verify>
   bool TryReuse(std::span<const uint8_t> source, Verify&& verify) {
     if (source.empty()) return false;
@@ -431,8 +433,8 @@ class ConstantPackingPlan {
   bool versions_valid_=false,partial_packable_=false;
   const uint64_t* version_source_=nullptr;
   const uint64_t* group_source_=nullptr;
-  uint64_t version_checks_=0,version_skips_=0,version_group_checks_=0,version_group_skips_=0;
-  uint64_t packed_copy_bytes_=0,partial_packs_=0,version_bulk_updates_=0;
+  ProfileCounter version_checks_=0,version_skips_=0,version_group_checks_=0,version_group_skips_=0;
+  ProfileCounter packed_copy_bytes_=0,partial_packs_=0,version_bulk_updates_=0;
   std::vector<ConstantCopyRange> ranges_,reads_;
   std::vector<uint8_t> source_, packed_;
   size_t used_bytes_=0;

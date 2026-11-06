@@ -15,6 +15,7 @@
 
 #include <xxhash.h>
 
+#include <rex/cvar.h>
 #include <rex/graphics/pipeline/texture/conversion.h>
 #include <rex/graphics/pipeline/texture/info.h>
 #include <rex/graphics/pipeline/texture/util.h>
@@ -22,6 +23,11 @@
 #include <rex/math.h>
 #include <rex/system/xmemory.h>
 #include <rex/ui/deko3d/nucleo.h>
+
+REXCVAR_DEFINE_UINT32(nx_native_max_anisotropy, 2, "F.E.A.R. NX",
+                      "Maximum anisotropy for deko3d texture sampling (1 disables anisotropy).");
+REXCVAR_DEFINE_UINT32(nx_native_texture_min_mip, 1, "F.E.A.R. NX",
+                      "Minimum mip for large 2D block-compressed textures (0 uses guest selection).");
 
 namespace fear_nx::deko {
 
@@ -437,12 +443,19 @@ float GetAnisotropy(xenos::AnisoFilter filter) {
   }
 }
 
+bool IsBc1To5Texture(xenos::TextureFormat format) {
+  using F = xenos::TextureFormat;
+  return format == F::k_DXT1 || format == F::k_DXT2_3 || format == F::k_DXT4_5 ||
+         format == F::k_DXT5A || format == F::k_DXN;
+}
+
 }  // namespace
 
 struct TextureCache::Texture {
   TextureKey key{};
   uint64_t layout_hash = 0;
   uint64_t content_hash = 0;
+  uint32_t sampling_min_mip = 0;
   TextureChecks::State check_state{};
   GuestMemoryLease guest_memory{};
   uint64_t last_frame = 0;
@@ -466,6 +479,8 @@ bool TextureCache::Initialize() {
   if (!memory_ || !nucleo_.TrabajoAbierto()) {
     return false;
   }
+  max_anisotropy_ = float(std::clamp(REXCVAR_GET(nx_native_max_anisotropy), 1u, 16u));
+  texture_min_mip_ = std::min(REXCVAR_GET(nx_native_texture_min_mip), 2u);
   auto make_null = [&](DkImageType type, uint32_t layers, uint32_t slot) -> bool {
     auto created = CreateImage(DkImageFormat_RGBA8_Unorm, 1, 1, type, layers, 1);
     if (!created) {
@@ -614,7 +629,7 @@ void TextureCache::Touch(Image& image, uint64_t work) {
 std::optional<Image> TextureCache::CreateImage(DkImageFormat format, uint32_t width,
                                                 uint32_t height, DkImageType type,
                                                 uint32_t layers, uint32_t mip_levels,
-                                                uint32_t flags) {
+                                                uint32_t flags, DkMsMode samples) {
   ProfileScope image_alloc_scope(profile_.image_alloc_ns, profiling_enabled_);
   if (profiling_enabled_) {
     ++profile_.image_alloc_calls;
@@ -626,6 +641,7 @@ std::optional<Image> TextureCache::CreateImage(DkImageFormat format, uint32_t wi
   DkImageLayoutMaker maker;
   dkImageLayoutMakerDefaults(&maker, nucleo_.dispositivo());
   maker.type = type;
+  maker.msMode = samples;
   maker.flags = flags;
   maker.format = format;
   maker.dimensions[0] = width;
@@ -658,6 +674,7 @@ std::optional<Image> TextureCache::CreateImage(DkImageFormat format, uint32_t wi
   Image image;
   image.format = format;
   image.type = type;
+  image.samples = samples;
   image.flags = flags;
   image.width = width;
   image.height = height;
@@ -784,7 +801,7 @@ std::optional<uint32_t> TextureCache::GetTextureImageView(
 
 std::optional<uint32_t> TextureCache::GetSampler(
     const xenos::xe_gpu_texture_fetch_t& fetch,
-    const rex::graphics::SpirvShader::SamplerBinding& binding, bool force_point) {
+    const rex::graphics::SpirvShader::SamplerBinding& binding, bool force_point, uint32_t sampling_min_mip) {
   xenos::ClampMode clamp_x, clamp_y, clamp_z;
   texture_util::GetClampModesForDimension(fetch, clamp_x, clamp_y, clamp_z);
   xenos::TextureFilter mag = binding.mag_filter == xenos::TextureFilter::kUseFetchConst
@@ -818,6 +835,9 @@ std::optional<uint32_t> TextureCache::GetSampler(
   uint32_t mip_min = 0, mip_max = 0;
   texture_util::GetSubresourcesFromFetchConstant(fetch, nullptr, nullptr, nullptr, nullptr, nullptr,
                                                 &mip_min, &mip_max);
+  if (!mip_base_map) {
+    mip_min = std::max(mip_min, std::min(sampling_min_mip, mip_max));
+  }
   uint32_t key_words[6] = {
       uint32_t(clamp_x) | (uint32_t(clamp_y) << 3) | (uint32_t(clamp_z) << 6),
       uint32_t(mag_linear) | (uint32_t(min_linear) << 1) | (uint32_t(mip_linear) << 2) |
@@ -851,7 +871,7 @@ std::optional<uint32_t> TextureCache::GetSampler(
   sampler.lodClampMin = float(mip_min);
   sampler.lodClampMax = mip_base_map ? float(mip_min) + 0.25f : float(mip_max);
   sampler.lodBias = float(fetch.lod_bias) / 32.0f;
-  sampler.maxAnisotropy = GetAnisotropy(aniso);
+  sampler.maxAnisotropy = std::min(GetAnisotropy(aniso), max_anisotropy_);
   if (xenos::ClampModeUsesBorder(clamp_x) || xenos::ClampModeUsesBorder(clamp_y) ||
       xenos::ClampModeUsesBorder(clamp_z)) {
     const bool white = fetch.border_color == xenos::BorderColor::k_ABGR_White;
@@ -1071,7 +1091,8 @@ std::optional<TextureResourceBinding> TextureCache::GetTexture(
       texture.guest_memory=guest_memory;
       texture.last_frame=frame_;Touch(texture.image,work_);
       const auto image_slot=GetImageView(texture.image,fetch.swizzle,image_type);
-      const auto sampler_slot=GetSampler(sampler_fetch?*sampler_fetch:fetch,sampler_binding);
+      const auto sampler_slot=GetSampler(sampler_fetch?*sampler_fetch:fetch,sampler_binding,
+                                         false, texture.sampling_min_mip);
       if(!image_slot||!sampler_slot)return std::nullopt;
       return remember(texture,TextureResourceBinding{*image_slot,*sampler_slot,width,height});
     }
@@ -1193,6 +1214,13 @@ std::optional<TextureResourceBinding> TextureCache::GetTexture(
 
   auto texture = std::make_unique<Texture>();
   texture->key = texture_key;
+  // Apply the material texture policy to the image being sampled. Sampler
+  // instructions may refer to a separate fetch constant with another layout.
+  if (fetch.dimension == xenos::DataDimension::k2DOrStacked && !fetch.stacked &&
+      depth_minus_1 == 0 && fetch.tiled && width >= 256 && height >= 256 &&
+      base_page && mip_page && IsBc1To5Texture(format)) {
+    texture->sampling_min_mip = std::min(texture_min_mip_, mip_max_level);
+  }
   texture->layout_hash = layout_hash;
   texture->content_hash = content_hash;
   texture->check_state = check_state;
@@ -1204,7 +1232,8 @@ std::optional<TextureResourceBinding> TextureCache::GetTexture(
   textures_.emplace(layout_hash, std::move(texture));
   Touch(stored.image, work_);
   const auto image_slot = GetImageView(stored.image, fetch.swizzle, image_type);
-  const auto sampler_slot = GetSampler(sampler_fetch ? *sampler_fetch : fetch, sampler_binding);
+  const auto sampler_slot = GetSampler(sampler_fetch ? *sampler_fetch : fetch, sampler_binding,
+                                       false, stored.sampling_min_mip);
   if (!image_slot || !sampler_slot) {
     return std::nullopt;
   }

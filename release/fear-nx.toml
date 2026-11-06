@@ -1,5 +1,17 @@
-# F.E.A.R. NX deko3d release settings. See README.md.
+# F.E.A.R. NX deko3d branch settings. See README.md.
 [nx]
+# Game FX detail: 0 low, 1 medium, 2 original. Restart after changing.
+client_fx_detail_level = 1
+# Scale eligible particle bounce/splat probabilities. 1.0 restores original behavior.
+particle_bounce_scale = 0.5
+# Compatibility key. The full-frame renderer disables dynamic water/mirror reflections.
+planar_reflections = false
+# Keep volumetric lighting, with half the Xbox 360 slice count. 0 restores game default.
+volumetric_light_slices = 128
+# Keep volumetric shadows with a smaller map. 0 restores game default.
+volumetric_light_shadow_size = 64
+# Large mipmapped BC textures: use mip 1 or coarser. 0 restores game selection.
+native_texture_min_mip = 1
 native_shared_resolves = true
 native_gpu_profile = false
 native_cpu_profile = false
@@ -13,15 +25,24 @@ native_trace_output = false
 
 [input]
 xbox_layout = false
-# Gyro is on by default and works only while aiming.
+# Gyro works during normal gameplay, including hip fire.
+# Set gyro_always_on = false for the previous aim-only behavior.
 # To disable: L + R + D-pad Right -> Input -> uncheck input_gyro_enabled
 # -> Save to config, or set gyro_enabled = false below.
 # Uses the actual weapon aim state, including toggle aim and alternate layouts.
 gyro_enabled = true
-gyro_sensitivity = 1.0
+gyro_always_on = true
+gyro_sensitivity = 1.5
 gyro_smoothing_ms = 16.0
 gyro_deadzone_dps = 0.15
 gyro_invert_y = false
+gyro_invert_x = false
+
+# Optional physical Switch button overrides; see docs/button-bindings.md.
+# Example: exchange ZL and right-stick click (Xbox LT and RS):
+# [input.bindings]
+# zl = "rs"
+# r3 = "lt"
 
 [audio]
 switch_bomba = false
@@ -34,11 +55,12 @@ gpu_mhz = 0
 allow_ram_1600 = false
 nvmap_mb = 0
 ab_lap_after_s = 0
+perf_report = false
 
 [log]
-level = "warn"
-flush_level = "error"
-flush_interval = 5
+level = "off"
+flush_level = "off"
+flush_interval = 0
 
 [gpu]
 specialize_texture_signs = true

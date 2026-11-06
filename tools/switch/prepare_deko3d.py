@@ -109,6 +109,12 @@ def apply_sdk_patches(repo_root: Path, sdk: Path) -> None:
         (patch_dir / "0033-prove-vertex-index-register.patch",
          sdk / "include/rex/graphics/pipeline/shader/shader.h",
          "vertex_fetch_indices_unmodified() const"),
+        (patch_dir / "0034-deko-retail-profiling.patch",
+         sdk / "cmake/rexglue_switch.cmake", "if(FEAR_NX_DEKO_RETAIL)"),
+        (patch_dir / "0035-deko-input-bindings.patch",
+         sdk / "src/input/switch/switch_input_driver.cpp", "input_bindings_zr"),
+        (patch_dir / "0036-deko-retail-overlays.patch",
+         sdk / "src/ui/rex_app.cpp", "#if !defined(FEAR_NX_DEKO_RETAIL)"),
     ]
     for patch_file, marker_file, marker in commands:
         if marker in marker_file.read_text(encoding="utf-8", errors="ignore"):

@@ -141,7 +141,11 @@ class Renderer {
   void SetGammaRamp256(const uint32_t* entries);
 
   const RendererStats& stats() const { return stats_; }
+#if defined(FEAR_NX_DEKO_RETAIL)
+  static constexpr bool CpuProfilingEnabled() { return false; }
+#else
   bool CpuProfilingEnabled() const;
+#endif
   // Publish a guest-progress epoch; the ring thread revalidates on its next
   // draw. Sampling history and strict physical ranges survive this boundary.
   void InvalidateGuestMemory(GuestMemoryBoundary reason = GuestMemoryBoundary::kWrite);

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+
+#include "deko_profile.h"
 #include <array>
 #include <algorithm>
 #include <cstdint>
@@ -57,7 +59,7 @@ template<class Value, size_t Buckets=8192> class LocalVertexLookup {
     uint64_t h=key[2]^(key[0]*0x9E3779B185EBCA87ULL)^(key[1]*0xC2B2AE3D27D4EB4FULL);
     h^=h>>32;return size_t(h)&(kTableSize-1);
   }
-  uint64_t fast_hits=0,map_lookups=0;
+  ProfileCounter fast_hits=0,map_lookups=0;
  private:
   struct Entry {Key key{};Value value{};uint64_t epoch=0;};
   std::array<Entry,kTableSize> entries_{};

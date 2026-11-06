@@ -11,7 +11,10 @@ REXCVAR_DEFINE_BOOL(nx_native_cpu_fixed_flush,true,"F.E.A.R. NX","Keep guest FP 
 REXCVAR_DEFINE_BOOL(nx_native_cpu_yield_backoff,true,"F.E.A.R. NX","Sleep 100 us after sustained repeated yields").lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(nx_native_cpu_adapter_profile,false,"F.E.A.R. NX","Collect guest CPU adapter counters; adds work to every FP-mode request").lifecycle(rex::cvar::Lifecycle::kInitOnly);
 namespace fear_nx::cpu {
-bool local_interrupts=false,fixed_flush=false,yield_backoff=false,counters_enabled=false;
+bool local_interrupts=false,fixed_flush=false,yield_backoff=false;
+#if !defined(FEAR_NX_DEKO_RETAIL)
+bool counters_enabled=false;
+#endif
 constinit thread_local Counters counters;
 static std::array<std::atomic<uint64_t>,7> totals{};
 void Publish() {
@@ -21,11 +24,15 @@ void Publish() {
   counters={};
 }
 void Configure() {
+#if !defined(FEAR_NX_DEKO_SHARED_GUEST)
   local_interrupts=REXCVAR_GET(nx_native_cpu_local_interrupts);
   fixed_flush=REXCVAR_GET(nx_native_cpu_fixed_flush);
+#endif
   yield_backoff=REXCVAR_GET(nx_native_cpu_yield_backoff);
+#if !defined(FEAR_NX_DEKO_RETAIL)
   counters_enabled=REXCVAR_GET(nx_native_cpu_adapter_profile);
-  REXLOG_INFO("[fear-cpu] adapter v2: local interrupts {} (89 CAS-only regions, original fences); fixed flush {}; yield backoff {}; adapter profile={}; SDK unchanged",
+#endif
+  REXLOG_INFO("[fear-cpu] guest policy: local interrupts {}; fixed flush {}; yield backoff {}; adapter profile={}",
       local_interrupts,fixed_flush,yield_backoff,counters_enabled);
 }
 void Report() {

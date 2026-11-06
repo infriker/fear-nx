@@ -1,5 +1,5 @@
-bool Renderer::Impl::GetFastClearRectangle(StencilClearRect& rect, bool require_zero_depth) {
-  const DrawSetup& st = setup;
+bool Renderer::Impl::ReadClearRectangle(const SpirvShader& vs, bool require_zero_depth,
+                                        uint32_t horizontal_scale, StencilClearRect& rect) {
   const RegisterFile& r = *regs;
   // Derive the actual three corners, never assume the whole scissor is cleared.
   // This uses the same interpreter and guest viewport mapping as the SDK's
@@ -18,7 +18,7 @@ bool Renderer::Impl::GetFastClearRectangle(StencilClearRect& rect, bool require_
     uint32_t written = 0;
   } sink;
   rex::graphics::ShaderInterpreter interpreter(r, *memory);
-  interpreter.SetShader(*st.vs);
+  interpreter.SetShader(vs);
   interpreter.SetExportSink(&sink);
   const auto vte = r.Get<reg::PA_CL_VTE_CNTL>();
   if (require_zero_depth && vte.vport_z_offset_ena &&
@@ -69,7 +69,7 @@ bool Renderer::Impl::GetFastClearRectangle(StencilClearRect& rect, bool require_
       x /= w;
       y /= w;
     }
-    xs[i] = x * scale_x + offset_x;
+    xs[i] = (x * scale_x + offset_x) * float(horizontal_scale);
     ys[i] = y * scale_y + offset_y;
     // Partial pixel/sample coverage requires a shader transfer, not a clear.
     if (!std::isfinite(xs[i]) || !std::isfinite(ys[i]) ||
@@ -81,20 +81,27 @@ bool Renderer::Impl::GetFastClearRectangle(StencilClearRect& rect, bool require_
   const float y0 = std::min({ys[0], ys[1], ys[2]});
   const float y1 = std::max({ys[0], ys[1], ys[2]});
   if (!(x0 < x1 && y0 < y1)) return false;
-  // Avoid interpreting clip-plane intersections or partial viewport coverage.
-  if (x0 < st.vp.x || y0 < st.vp.y || x1 > st.vp.x + st.vp.width ||
-      y1 > st.vp.y + st.vp.height) return false;
   uint32_t corners = 0;
   for (uint32_t i = 0; i < 3; ++i) {
     if ((xs[i] != x0 && xs[i] != x1) || (ys[i] != y0 && ys[i] != y1)) return false;
     corners |= 1u << (uint32_t(xs[i] == x1) | (uint32_t(ys[i] == y1) << 1));
   }
   if (rex::bit_count(corners) != 3) return false;
+  rect = {int32_t(x0), int32_t(y0), int32_t(x1), int32_t(y1)};
+  return true;
+}
+
+bool Renderer::Impl::GetFastClearRectangle(StencilClearRect& rect, bool require_zero_depth) {
+  if (!ReadClearRectangle(*setup.vs, require_zero_depth, setup.double_clear_x ? 2u : 1u, rect))
+    return false;
+  const auto& vp = setup.vp;
+  if (rect.x0 < vp.x || rect.y0 < vp.y || rect.x1 > vp.x + vp.width ||
+      rect.y1 > vp.y + vp.height) return false;
   rect = {
-      std::max(int32_t(x0), bound_scissor.offset.x),
-      std::max(int32_t(y0), bound_scissor.offset.y),
-      std::min(int32_t(x1), int32_t(bound_scissor.offset.x + bound_scissor.extent.width)),
-      std::min(int32_t(y1), int32_t(bound_scissor.offset.y + bound_scissor.extent.height))};
+      std::max(rect.x0, bound_scissor.offset.x),
+      std::max(rect.y0, bound_scissor.offset.y),
+      std::min(rect.x1, int32_t(bound_scissor.offset.x + bound_scissor.extent.width)),
+      std::min(rect.y1, int32_t(bound_scissor.offset.y + bound_scissor.extent.height))};
 
   return rect.x0 < rect.x1 && rect.y0 < rect.y1;
 }

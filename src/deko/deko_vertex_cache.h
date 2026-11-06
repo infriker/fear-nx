@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "deko_profile.h"
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -30,12 +32,12 @@ class PersistentVertexCache {
   };
 
   struct Stats {
-    uint64_t hits = 0;
-    uint64_t misses = 0;
-    uint64_t copied_bytes = 0;
-    uint64_t evictions = 0;
-    uint64_t capacity_misses = 0;
-    uint64_t candidate_evictions = 0;
+    ProfileCounter hits = 0;
+    ProfileCounter misses = 0;
+    ProfileCounter copied_bytes = 0;
+    ProfileCounter evictions = 0;
+    ProfileCounter capacity_misses = 0;
+    ProfileCounter candidate_evictions = 0;
   };
 
   explicit PersistentVertexCache(uint32_t capacity_bytes = kDefaultCapacityBytes)

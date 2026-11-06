@@ -1,11 +1,24 @@
 # deko3d test and optimization history
 
-Updated 2026-10-23. This document consolidates the renderer experiments into
-one history. It records unsuccessful changes as well as improvements.
+## Full-frame branch build, 6 November 2026
 
-**Current Switch report: 20–30 FPS with overclocking, with frequent drops.
-Vulkan currently provides more stable performance.** Exact overclock values
-were not supplied for this report. This is not a stock-clock benchmark.
+The 720p game scene now submits one full-height rectangle and sizes color and
+depth together. The renderer preserves the level-loading clear and the
+frontbuffer resolve. Single-sample targets, disabled dynamic reflections and
+reduced effects match the Vulkan gameplay configuration. Eligible opaque
+shaders may use early depth testing. Depth copies and redundant scene passes
+are avoided where the deko3d target layout permits.
+
+The game code is linked with LTO and trained with the Switch recording for
+the shared guest code. Direct guest calls retain the public entry point for
+the gyro, effects and reflection hooks. The hardware comparisons below
+predate this build.
+
+## October 2026 baseline
+
+The October Switch report recorded 20–30 FPS with overclocking and frequent
+drops. Vulkan was more stable in that comparison. The tester did not record
+the exact clocks. This section documents the earlier optimization experiments.
 
 ## How to read the results
 

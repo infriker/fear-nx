@@ -3,7 +3,12 @@
 #include <cstdint>
 #include "fear_cpu_policy.h"
 namespace fear_nx::cpu {
-extern bool local_interrupts,fixed_flush,yield_backoff,counters_enabled;
+extern bool local_interrupts,fixed_flush,yield_backoff;
+#if defined(FEAR_NX_DEKO_RETAIL)
+inline constexpr bool counters_enabled = false;
+#else
+extern bool counters_enabled;
+#endif
 struct Counters {uint64_t local_regions=0,global_regions=0,flush_elided=0,flush_written=0,yields=0,sleeps=0,sleep_ns=0;uint32_t pending=0;};
 // The zero-initialized counters never need a per-thread initialization thunk.
 extern constinit thread_local Counters counters;

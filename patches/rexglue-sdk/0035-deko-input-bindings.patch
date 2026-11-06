@@ -1,0 +1,234 @@
+diff --git a/include/rex/input/switch/button_bindings.h b/include/rex/input/switch/button_bindings.h
+new file mode 100644
+index 0000000..833ebe2
+--- /dev/null
++++ b/include/rex/input/switch/button_bindings.h
+@@ -0,0 +1,30 @@
++// SPDX-License-Identifier: BSD-3-Clause
++#pragma once
++#include <cstdint>
++#include <string_view>
++
++namespace rex::input::nx {
++constexpr uint32_t kBindingLT = 1u << 16;
++constexpr uint32_t kBindingRT = 1u << 17;
++// XInput buttons occupy the low 16 bits; digital triggers use two extra bits.
++// Unknown values inherit the standard layout so a typo cannot disable a key.
++constexpr uint32_t ResolveBinding(std::string_view name, uint32_t fallback) {
++  struct Entry { std::string_view name; uint32_t value; };
++  constexpr Entry entries[] = {
++      {"none", 0}, {"up", 1}, {"down", 2}, {"left", 4}, {"right", 8},
++      {"start", 0x10}, {"back", 0x20}, {"ls", 0x40}, {"rs", 0x80},
++      {"lb", 0x100}, {"rb", 0x200}, {"a", 0x1000}, {"b", 0x2000},
++      {"x", 0x4000}, {"y", 0x8000}, {"lt", kBindingLT}, {"rt", kBindingRT}};
++  for (const auto& entry : entries) {
++    if (name.size() != entry.name.size()) continue;
++    bool equal = true;
++    for (size_t i = 0; i < name.size(); ++i) {
++      char c = name[i];
++      if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
++      if (c != entry.name[i]) { equal = false; break; }
++    }
++    if (equal) return entry.value;
++  }
++  return fallback;
++}
++}  // namespace rex::input::nx
+diff --git a/src/input/switch/switch_input_driver.cpp b/src/input/switch/switch_input_driver.cpp
+index e0668fe..3bbc914 100644
+--- a/src/input/switch/switch_input_driver.cpp
++++ b/src/input/switch/switch_input_driver.cpp
+@@ -7,6 +7,7 @@
+  */
+
+ #include <rex/input/switch/switch_input_driver.h>
++#include <rex/input/switch/button_bindings.h>
+
+ #include <algorithm>
+ #include <array>
+@@ -31,6 +32,55 @@ REXCVAR_DEFINE_BOOL(input_xbox_layout, false, "Input",
+                     "Face buttons by position, as on an Xbox pad (the bottom button, B, acts as A). "
+                     "false = by letter: A accepts and B goes back");
+
++REXCVAR_DEFINE_STRING(input_bindings_a, "default", "Input/Bindings",
++                     "Switch a: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(input_bindings_b, "default", "Input/Bindings",
++                     "Switch b: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(input_bindings_x, "default", "Input/Bindings",
++                     "Switch x: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(input_bindings_y, "default", "Input/Bindings",
++                     "Switch y: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(input_bindings_l, "default", "Input/Bindings",
++                     "Switch l: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(input_bindings_r, "default", "Input/Bindings",
++                     "Switch r: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(input_bindings_zl, "default", "Input/Bindings",
++                     "Switch zl: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(input_bindings_zr, "default", "Input/Bindings",
++                     "Switch zr: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(input_bindings_l3, "default", "Input/Bindings",
++                     "Switch l3: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(input_bindings_r3, "default", "Input/Bindings",
++                     "Switch r3: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(input_bindings_plus, "default", "Input/Bindings",
++                     "Switch plus: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(input_bindings_minus, "default", "Input/Bindings",
++                     "Switch minus: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(input_bindings_up, "default", "Input/Bindings",
++                     "Switch up: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(input_bindings_down, "default", "Input/Bindings",
++                     "Switch down: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(input_bindings_left, "default", "Input/Bindings",
++                     "Switch left: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++REXCVAR_DEFINE_STRING(input_bindings_right, "default", "Input/Bindings",
++                     "Switch right: default, none, a/b/x/y, lb/rb, lt/rt, ls/rs, start/back, up/down/left/right. Restart to change.")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace rex::input::nx {
+
+ namespace {
+@@ -44,42 +94,6 @@ constexpr uint32_t kRepeatRateMs = 100;
+ // counter, so a pad that reconnects never gets an id it had before.
+ constexpr uint64_t kDeviceIdTag = 0x4E5800;  // "NX"
+
+-struct ButtonMapping {
+-  uint64_t npad;
+-  uint16_t xinput;
+-};
+-
+-// Face buttons by letter (the default): the Switch's A is the Xbox A.
+-constexpr std::array<ButtonMapping, 4> kFrontalesPorLetra = {{
+-    {HidNpadButton_A, X_INPUT_GAMEPAD_A},
+-    {HidNpadButton_B, X_INPUT_GAMEPAD_B},
+-    {HidNpadButton_X, X_INPUT_GAMEPAD_X},
+-    {HidNpadButton_Y, X_INPUT_GAMEPAD_Y},
+-}};
+-
+-// By position (input_xbox_layout), as on an Xbox pad: the bottom one is A.
+-// On Switch pads that button is labelled B.
+-constexpr std::array<ButtonMapping, 4> kFrontalesPorPosicion = {{
+-    {HidNpadButton_B, X_INPUT_GAMEPAD_A},
+-    {HidNpadButton_A, X_INPUT_GAMEPAD_B},
+-    {HidNpadButton_Y, X_INPUT_GAMEPAD_X},
+-    {HidNpadButton_X, X_INPUT_GAMEPAD_Y},
+-}};
+-
+-// The other buttons are the same with both layouts.
+-constexpr std::array<ButtonMapping, 10> kButtonMappings = {{
+-    {HidNpadButton_Up, X_INPUT_GAMEPAD_DPAD_UP},
+-    {HidNpadButton_Down, X_INPUT_GAMEPAD_DPAD_DOWN},
+-    {HidNpadButton_Left, X_INPUT_GAMEPAD_DPAD_LEFT},
+-    {HidNpadButton_Right, X_INPUT_GAMEPAD_DPAD_RIGHT},
+-    {HidNpadButton_Plus, X_INPUT_GAMEPAD_START},
+-    {HidNpadButton_Minus, X_INPUT_GAMEPAD_BACK},
+-    {HidNpadButton_L, X_INPUT_GAMEPAD_LEFT_SHOULDER},
+-    {HidNpadButton_R, X_INPUT_GAMEPAD_RIGHT_SHOULDER},
+-    {HidNpadButton_StickL, X_INPUT_GAMEPAD_LEFT_THUMB},
+-    {HidNpadButton_StickR, X_INPUT_GAMEPAD_RIGHT_THUMB},
+-}};
+-
+ // The order of this list is also the order in which events are sent if
+ // multiple buttons change at once. Same table as the SDL driver.
+ constexpr std::array<rex::ui::VirtualKey, 34> kVkLookup = {
+@@ -291,23 +305,30 @@ void SwitchInputDriver::Poll(size_t index) {
+   const uint64_t held = padGetButtons(&slot.pad);
+   DispatchMenuShortcuts(slot, held);
+   X_INPUT_GAMEPAD gamepad{};
+-  uint16_t buttons = 0;
+-  const auto& frontales =
+-      REXCVAR_GET(input_xbox_layout) ? kFrontalesPorPosicion : kFrontalesPorLetra;
+-  for (const ButtonMapping& mapping : frontales) {
+-    if (held & mapping.npad) {
+-      buttons |= mapping.xinput;
+-    }
+-  }
+-  for (const ButtonMapping& mapping : kButtonMappings) {
+-    if (held & mapping.npad) {
+-      buttons |= mapping.xinput;
+-    }
+-  }
+-  gamepad.buttons = buttons;
+-  // ZL and ZR are digital.
+-  gamepad.left_trigger = (held & HidNpadButton_ZL) ? 0xFF : 0;
+-  gamepad.right_trigger = (held & HidNpadButton_ZR) ? 0xFF : 0;
++  uint32_t mapped = 0;
++  const bool xbox = REXCVAR_GET(input_xbox_layout);
++  const auto apply = [&](uint64_t physical, const std::string& target, uint32_t fallback) {
++    if (held & physical) mapped |= ResolveBinding(target, fallback);
++  };
++  apply(HidNpadButton_A, REXCVAR_GET(input_bindings_a), xbox ? X_INPUT_GAMEPAD_B : X_INPUT_GAMEPAD_A);
++  apply(HidNpadButton_B, REXCVAR_GET(input_bindings_b), xbox ? X_INPUT_GAMEPAD_A : X_INPUT_GAMEPAD_B);
++  apply(HidNpadButton_X, REXCVAR_GET(input_bindings_x), xbox ? X_INPUT_GAMEPAD_Y : X_INPUT_GAMEPAD_X);
++  apply(HidNpadButton_Y, REXCVAR_GET(input_bindings_y), xbox ? X_INPUT_GAMEPAD_X : X_INPUT_GAMEPAD_Y);
++  apply(HidNpadButton_L, REXCVAR_GET(input_bindings_l), X_INPUT_GAMEPAD_LEFT_SHOULDER);
++  apply(HidNpadButton_R, REXCVAR_GET(input_bindings_r), X_INPUT_GAMEPAD_RIGHT_SHOULDER);
++  apply(HidNpadButton_ZL, REXCVAR_GET(input_bindings_zl), kBindingLT);
++  apply(HidNpadButton_ZR, REXCVAR_GET(input_bindings_zr), kBindingRT);
++  apply(HidNpadButton_StickL, REXCVAR_GET(input_bindings_l3), X_INPUT_GAMEPAD_LEFT_THUMB);
++  apply(HidNpadButton_StickR, REXCVAR_GET(input_bindings_r3), X_INPUT_GAMEPAD_RIGHT_THUMB);
++  apply(HidNpadButton_Plus, REXCVAR_GET(input_bindings_plus), X_INPUT_GAMEPAD_START);
++  apply(HidNpadButton_Minus, REXCVAR_GET(input_bindings_minus), X_INPUT_GAMEPAD_BACK);
++  apply(HidNpadButton_Up, REXCVAR_GET(input_bindings_up), X_INPUT_GAMEPAD_DPAD_UP);
++  apply(HidNpadButton_Down, REXCVAR_GET(input_bindings_down), X_INPUT_GAMEPAD_DPAD_DOWN);
++  apply(HidNpadButton_Left, REXCVAR_GET(input_bindings_left), X_INPUT_GAMEPAD_DPAD_LEFT);
++  apply(HidNpadButton_Right, REXCVAR_GET(input_bindings_right), X_INPUT_GAMEPAD_DPAD_RIGHT);
++  gamepad.buttons = static_cast<uint16_t>(mapped);
++  gamepad.left_trigger = (mapped & kBindingLT) ? 0xFF : 0;
++  gamepad.right_trigger = (mapped & kBindingRT) ? 0xFF : 0;
+   // HID reports up as positive Y, like XInput, so no inversion is needed.
+   const HidAnalogStickState left = padGetStickPos(&slot.pad, 0);
+   const HidAnalogStickState right = padGetStickPos(&slot.pad, 1);
+@@ -351,9 +372,13 @@ void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
+   };
+   constexpr uint64_t kModificador = HidNpadButton_L | HidNpadButton_R;
+   static const Atajo kAtajos[] = {
++#if defined(REXGLUE_SWITCH_DIAGNOSTICS)
+       {HidNpadButton_Up, rex::ui::VirtualKey::kF3},
++#endif
+       {HidNpadButton_Right, rex::ui::VirtualKey::kF4},
++#if defined(REXGLUE_SWITCH_DIAGNOSTICS)
+       {HidNpadButton_Down, rex::ui::VirtualKey::kOem3},
++#endif
+       {HidNpadButton_Left, rex::ui::VirtualKey::kF7},
+   };
+
+@@ -388,6 +413,7 @@ void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
+    * to the game: it talks directly to the profiler, which is why it is kept out
+    * of the loop above, which translates buttons into keys.
+    */
++#if defined(REXGLUE_SWITCH_PROFILING)
+   const uint64_t kBitAb = uint64_t(1) << 8;
+   const bool ab_ahora = modificador && (held & HidNpadButton_ZL) != 0;
+   const bool ab_antes = (slot.menu_shortcuts & kBitAb) != 0;
+@@ -398,6 +424,8 @@ void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
+   slot.menu_shortcuts =
+       ab_ahora ? (slot.menu_shortcuts | kBitAb) : (slot.menu_shortcuts & ~kBitAb);
+
++#endif
++#if defined(REXGLUE_SWITCH_DIAGNOSTICS)
+   // L+R+ZR: capture a draw census of the next frames (gpu_census_dir must be
+   // set), to see how a scene is built where it is slow.
+   const uint64_t kBitCensus = uint64_t(1) << 9;
+@@ -408,6 +436,7 @@ void SwitchInputDriver::DispatchMenuShortcuts(Slot& slot, uint64_t held) {
+   }
+   slot.menu_shortcuts = census_ahora ? (slot.menu_shortcuts | kBitCensus)
+                                      : (slot.menu_shortcuts & ~kBitCensus);
++#endif
+ }
+
+ SwitchInputDriver::Slot* SwitchInputDriver::FindSlot(DeviceId id) {

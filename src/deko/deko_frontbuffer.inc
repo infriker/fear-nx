@@ -39,7 +39,8 @@ bool Renderer::Impl::DeferFrontbuffer(RenderTarget& source,ResolveImage& destina
       destination.image.width,destination.image.height,sx,sy,dx,dy,width,height,
       !destination.is_depth && source.image.format==destination.image.format,
       swapped,alias};
-  if(!REXCVAR_GET(nx_native_deferred_frontbuffer)||!CanDeferFrontbuffer(plan))return false;
+  if(source.image.samples != DkMsMode_1x ||
+     !REXCVAR_GET(nx_native_deferred_frontbuffer)||!CanDeferFrontbuffer(plan))return false;
   if(frontbuffer.source) {
     if(frontbuffer.destination==&destination) {frontbuffer={};++profile.front_replaced;}
     else MaterializeFrontbuffer();

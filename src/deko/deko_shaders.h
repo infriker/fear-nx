@@ -98,6 +98,7 @@ struct GlslShader {
 // bindings 0..4, shared-memory storage set 0, vertex textures set 2, and
 // fragment textures set 3. The returned metadata maps the remapped resources
 // back to their original Vulkan set/binding pairs.
-GlslShader ConvertSpirv(std::span<const uint32_t> spirv, ShaderStage expected_stage);
+GlslShader ConvertSpirv(std::span<const uint32_t> spirv, ShaderStage expected_stage,
+                        bool read_only_early_tests = false);
 
 }  // namespace fear_nx::deko

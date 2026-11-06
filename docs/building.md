@@ -23,7 +23,7 @@ separately rather than checking out another revision over your changes.
 
 ```text
 python -c "import hashlib,json; from pathlib import Path; p=Path('patches/native-vulkan'); m=json.loads((p/'manifest.json').read_text()); assert hashlib.sha256((p/m['patch']).read_bytes()).hexdigest()==m['sha256'], 'SDK patch checksum mismatch'"
-git clone --no-checkout https://github.com/rexglue/rexglue-sdk.git third_party/rexglue-sdk
+git clone --config core.autocrlf=false --no-checkout https://github.com/rexglue/rexglue-sdk.git third_party/rexglue-sdk
 git -C third_party/rexglue-sdk checkout --detach c94f5ebdcb3c9d1a460ca48e04f9758448f8d518
 git -C third_party/rexglue-sdk apply --check ../../patches/native-vulkan/rexglue-sdk.patch
 git -C third_party/rexglue-sdk apply --index ../../patches/native-vulkan/rexglue-sdk.patch
@@ -64,7 +64,7 @@ preserve gamma-before-filter ordering, so the FPS benefit needs device testing.
 The Switch build now defaults to `FEAR_NX_RENDERER=DEKO3D`. During CMake
 configuration, `tools/switch/prepare_deko3d.py` adds the pinned Deko3D provider,
 UAM and SPIRV-Cross sources to the ignored SDK copy and applies patches 0023
-through 0033. It preserves the existing runtime source and patches. No Vulkan
+through 0036. It preserves the existing runtime source and patches. No Vulkan
 driver build is required for this backend. Set `FEAR_NX_RENDERER=VULKAN` to
 build the existing Vulkan renderer instead.
 
@@ -144,6 +144,42 @@ workflow target the Vulkan release in `main`; do not use them to silently
 replace that release with this experimental backend. Publishing a separate
 binary release requires explicit deko3d naming and its matching notices.
 
-The CPU adapter is generated into the build directory by
-`tools/switch/prepare_cpu_adapter.py`; original generated inputs are retained.
+## Gameplay optimization and profile builds
+
+The standard deko3d build enables full-frame rendering, direct guest calls
+and LTO. Its default `FEAR_DEKO_GUEST_POLICY=deko` also applies the deko3d
+guest FPSCR and atomic-region adaptations. The downloadable PGO build uses
+`FEAR_DEKO_GUEST_POLICY=shared` to match the original Switch recording for
+the game code shared with Vulkan. Both policies use deko3d for graphics
+and retain the deko3d host-side polling backoff.
+
+To record and rebuild with PGO, create `out/deko-pgo` on the host and mount it
+at `/pgo` **in addition to** the normal `/project` mount in every Docker
+command. Use the same toolchain, guest policy and in-container `/pgo` path
+for training and use. Inside the container:
+
+```sh
+cmake -S /project -B /project/out/deko-train -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=/project/tools/switch/toolchain.cmake \
+  -DFEAR_CPU_WORK_DIR=/pgo -DFEAR_DEKO_GUEST_POLICY=shared -DFEAR_PGO=generate
+cmake --build /project/out/deko-train --target fear_nx --parallel 4
+```
+
+Run `fear_nx_deko3d_pgo.nro` on Switch, play through representative scenes and
+copy a completed `profile-*.pgo` from the game's `pgo/run-*/` directory to
+`out/deko-pgo/gameplay.pgo`. A compatible recording from the Vulkan shared
+guest build can be used directly. Build the gameplay NRO in a separate directory:
+
+```sh
+cmake -S /project -B /project/out/deko-use -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=/project/tools/switch/toolchain.cmake \
+  -DFEAR_CPU_WORK_DIR=/pgo -DFEAR_DEKO_GUEST_POLICY=shared \
+  -DFEAR_PGO=use -DFEAR_PGO_PROFILE=/pgo/gameplay.pgo -DFEAR_LTO=ON
+cmake --build /project/out/deko-use --target fear_nx --parallel 4
+```
+
+GCC 15.2.0 checks all 199 translation units against the recording. The build
+fails on missing or mismatched counters and verifies the direct-call targets
+in the final ELF. Only `fear_nx_deko3d_pgo.nro` records a new profile.
+
 Optional host regression checks and cache preparation live in `tools/deko/`.

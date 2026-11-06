@@ -20,6 +20,13 @@
 
 #include "native/native_system.h"
 #include "input/gyro_input.h"
+#ifdef FEAR_NX_RENDERER_DEKO3D
+#include "game/quality.h"
+#include "game/reflections.h"
+#endif
+#ifdef FEAR_PGO_RECORD
+#include "fear_pgo.h"
+#endif
 #if defined(FEAR_NX_CPU_ADAPTER)
 #include "cpu/fear_cpu.h"
 #endif
@@ -36,6 +43,9 @@ class FearNxApp final : public rex::ReXApp {
     // Apply the Switch default before SetupEnvironment loads the user's TOML,
     // so an explicit false there can still select the original sampling path.
     REXCVAR_SET(gpu_implicit_lod_sampling, true);
+#if defined(FEAR_NX_DEKO_RETAIL)
+    REXCVAR_SET(log_level, "off");
+#endif
 #endif
     return std::unique_ptr<FearNxApp>(
         new FearNxApp(ctx, "fear-nx", PPCImageConfig));
@@ -58,13 +68,31 @@ class FearNxApp final : public rex::ReXApp {
 
   void OnPostLoadXexImage() override {
     fear_nx::input::VerifyGyroHooks(runtime()->virtual_membase());
+#ifdef FEAR_NX_RENDERER_DEKO3D
+    fear_nx::game::VerifyQualityHook(runtime()->virtual_membase());
+    fear_nx::game::VerifyReflectionHook(runtime()->virtual_membase());
+#endif
   }
 
   void OnWindowFocusChanged(bool focused) override {
     fear_nx::input::SetGyroFocus(focused);
+#ifdef FEAR_PGO_RECORD
+    if (!focused) fear_nx::pgo::Save();
+#endif
   }
 
-  void OnShutdown() override { fear_nx::input::ShutdownGyro(); }
+#ifdef FEAR_PGO_RECORD
+  bool OnWindowCloseRequested() override {
+    fear_nx::pgo::Save();
+    return true;
+  }
+#endif
+  void OnShutdown() override {
+#ifdef FEAR_PGO_RECORD
+    fear_nx::pgo::Save();
+#endif
+    fear_nx::input::ShutdownGyro();
+  }
 
   void OnConfigurePaths(rex::PathConfig& paths) override {
 #if REX_PLATFORM_SWITCH

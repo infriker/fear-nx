@@ -20,6 +20,12 @@ endif()
 if(FEAR_NX_RENDERER STREQUAL "DEKO3D")
     set(REXGLUE_USE_DEKO3D ON CACHE BOOL "Deko3D graphics backend" FORCE)
     set(REXGLUE_USE_VULKAN OFF CACHE BOOL "Vulkan graphics backend" FORCE)
+    if(NOT REXGLUE_SWITCH_DEKO3D_DEBUG)
+        set(FEAR_NX_DEKO_RETAIL ON)
+        set(REXGLUE_ENABLE_PERF_COUNTERS OFF CACHE BOOL "SDK performance counters" FORCE)
+        set(REXGLUE_ENABLE_TRACY OFF CACHE BOOL "SDK Tracy profiler" FORCE)
+        add_compile_definitions(FEAR_NX_DEKO_RETAIL=1)
+    endif()
 else()
     set(REXGLUE_USE_DEKO3D OFF CACHE BOOL "Deko3D graphics backend" FORCE)
     set(REXGLUE_USE_VULKAN ON CACHE BOOL "Vulkan graphics backend" FORCE)
@@ -28,14 +34,10 @@ if(FEAR_NX_RENDERER STREQUAL "DEKO3D")
     find_package(Python3 REQUIRED COMPONENTS Interpreter)
     option(FEAR_DEKO_SKIP_SETUP "Use already prepared pinned SDK without rerunning setup" OFF)
     if(NOT FEAR_DEKO_SKIP_SETUP)
-    execute_process(
-        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/switch/prepare_deko3d.py"
-            --repo-root "${CMAKE_CURRENT_SOURCE_DIR}" --sdk-dir "${REXSDK_DIR}"
-        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-        RESULT_VARIABLE FEAR_DEKO_SETUP_RESULT)
-    if(NOT FEAR_DEKO_SETUP_RESULT EQUAL 0)
-        message(FATAL_ERROR "Could not prepare the pinned Deko3D dependencies.")
-    endif()
+        execute_process(
+            COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/switch/prepare_deko3d.py"
+                --repo-root "${CMAKE_CURRENT_SOURCE_DIR}" --sdk-dir "${REXSDK_DIR}"
+            WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" COMMAND_ERROR_IS_FATAL ANY)
     endif()
 endif()
 if(NOT EXISTS "${FEAR_GENERATED_DIR}/sources.cmake")
@@ -47,22 +49,6 @@ if(NOT FEAR_XEX_SHA256 STREQUAL "e7fccdf6dd57bb58d10efbdd0b2ca567b8cece5b6a3fc69
 endif()
 add_subdirectory("${REXSDK_DIR}" rexglue-sdk)
 include("${FEAR_GENERATED_DIR}/sources.cmake")
-if(FEAR_NX_RENDERER STREQUAL "DEKO3D")
-    set(FEAR_CPU_GENERATED "${CMAKE_CURRENT_BINARY_DIR}/fear-cpu")
-    execute_process(COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/tools/switch/prepare_cpu_adapter.py"
-        --source "${FEAR_GENERATED_DIR}" --output "${FEAR_CPU_GENERATED}" COMMAND_ERROR_IS_FATAL ANY)
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
-        "${CMAKE_CURRENT_SOURCE_DIR}/tools/switch/prepare_cpu_adapter.py")
-    file(GLOB FEAR_CPU_INPUTS CONFIGURE_DEPENDS "${FEAR_GENERATED_DIR}/fear_xbox360_recomp.*.cpp")
-    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${FEAR_CPU_INPUTS})
-    foreach(FEAR_SOURCE IN LISTS GENERATED_SOURCES)
-        get_filename_component(FEAR_FILENAME "${FEAR_SOURCE}" NAME)
-        if(FEAR_FILENAME MATCHES "^fear_xbox360_recomp[.][0-9]+[.]cpp$")
-            list(REMOVE_ITEM GENERATED_SOURCES "${FEAR_SOURCE}")
-            list(APPEND GENERATED_SOURCES "${FEAR_CPU_GENERATED}/${FEAR_FILENAME}")
-        endif()
-    endforeach()
-endif()
 
 # This generated function contains ~95,000 registration calls and runs once at
 # startup. Optimizing that single giant function costs disproportionate time
@@ -70,18 +56,29 @@ endif()
 set_source_files_properties("${FEAR_GENERATED_DIR}/fear_xbox360_register.cpp"
     PROPERTIES COMPILE_OPTIONS "-O0" SKIP_PRECOMPILE_HEADERS ON)
 
-add_library(fear_nx_recomp OBJECT ${GENERATED_SOURCES})
-target_include_directories(fear_nx_recomp PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/src"
-    "${FEAR_GENERATED_DIR}" "${FEAR_GENERATED_INCLUDE_ROOT}")
-target_link_libraries(fear_nx_recomp PRIVATE rex::runtime)
-target_precompile_headers(fear_nx_recomp PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/fear_nx_pch.h")
+set(guest_targets fear_nx_recomp)
 if(FEAR_NX_RENDERER STREQUAL "DEKO3D")
-    target_compile_definitions(fear_nx_recomp PRIVATE FEAR_NX_CPU_ADAPTER=1)
+    include(tools/switch/guest-build.cmake)
+    add_library(fear_nx_tables OBJECT ${guest_tables})
+    list(PREPEND guest_targets fear_nx_tables)
+    add_library(fear_nx_recomp OBJECT ${guest_units})
+    target_compile_options(fear_nx_recomp PRIVATE ${guest_flags})
+    if(FEAR_DEKO_GUEST_POLICY STREQUAL "deko")
+        target_compile_definitions(fear_nx_recomp PRIVATE FEAR_NX_CPU_ADAPTER=1)
+    endif()
+    if(TARGET fear_pgo_data)
+        add_dependencies(fear_nx_recomp fear_pgo_data)
+    endif()
+else()
+    add_library(fear_nx_recomp OBJECT ${GENERATED_SOURCES})
 endif()
-# Guest-memory fault recovery must preserve the original register semantics.
-target_compile_options(fear_nx_recomp PRIVATE
-    -ffp-contract=off -fno-tree-slp-vectorize -fno-tree-vectorize)
+foreach(target IN LISTS guest_targets)
+    target_include_directories(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}" "${CMAKE_CURRENT_SOURCE_DIR}/src"
+        "${FEAR_GENERATED_DIR}" "${FEAR_GENERATED_INCLUDE_ROOT}")
+    target_link_libraries(${target} PRIVATE rex::runtime)
+    target_precompile_headers(${target} PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src/fear_nx_pch.h")
+    target_compile_options(${target} PRIVATE -ffp-contract=off -fno-tree-slp-vectorize -fno-tree-vectorize)
+endforeach()
 
 set(FEAR_HOST_SOURCES
     src/main.cpp
@@ -90,6 +87,8 @@ set(FEAR_HOST_SOURCES
 if(FEAR_NX_RENDERER STREQUAL "DEKO3D")
     list(APPEND FEAR_HOST_SOURCES
         src/cpu/fear_cpu.cpp
+        src/game/quality.cpp
+        src/game/reflections.cpp
         src/deko/deko_renderer.cpp
         src/deko/deko_textures.cpp
         src/deko/deko_shaders.cpp
@@ -117,6 +116,14 @@ target_include_directories(fear_nx PRIVATE
 if(FEAR_NX_RENDERER STREQUAL "DEKO3D")
     target_compile_definitions(fear_nx PRIVATE FEAR_NX_RENDERER_DEKO3D=1)
     target_compile_definitions(fear_nx PRIVATE FEAR_NX_CPU_ADAPTER=1)
+    if(FEAR_DEKO_GUEST_POLICY STREQUAL "shared")
+        target_compile_definitions(fear_nx PRIVATE FEAR_NX_DEKO_SHARED_GUEST=1)
+    endif()
+    if(FEAR_PGO STREQUAL "generate")
+        target_sources(fear_nx PRIVATE src/fear_pgo.cpp)
+        target_compile_definitions(fear_nx PRIVATE FEAR_PGO_RECORD=1)
+        target_link_libraries(fear_nx PRIVATE gcov)
+    endif()
     target_link_options(fear_nx PRIVATE "-Wl,--wrap=_ZN3rex6thread10MaybeYieldEv")
     target_include_directories(fear_nx PRIVATE
         "${REXSDK_DIR}/thirdparty/vulkan-headers/include"
@@ -126,7 +133,7 @@ if(FEAR_NX_RENDERER STREQUAL "DEKO3D")
 else()
     target_compile_definitions(fear_nx PRIVATE FEAR_NX_RENDERER_VULKAN=1)
 endif()
-target_link_libraries(fear_nx PRIVATE fear_nx_recomp)
+target_link_libraries(fear_nx PRIVATE ${guest_targets})
 rexglue_switch_configure_target(fear_nx GPU_PLUGINS xenos)
 if(FEAR_NX_RENDERER STREQUAL "DEKO3D")
     # libdeko3d depends on libnx services; the existing helper links deko3d,
@@ -135,7 +142,7 @@ if(FEAR_NX_RENDERER STREQUAL "DEKO3D")
 endif()
 if(REXGLUE_SWITCH_COMPILE_ONLY)
     # OBJECT targets have no link step to pull in their library dependencies.
-    add_dependencies(fear_nx fear_nx_recomp rexruntime rexgpu-xenos rexglue_switch_startup)
+    add_dependencies(fear_nx ${guest_targets} rexruntime rexgpu-xenos rexglue_switch_startup)
 else()
     # The SDK links these by -l name, which does not tell Ninja when an
     # externally rebuilt driver changes. Always relink and repackage the NRO
@@ -148,9 +155,18 @@ else()
     set(FEAR_NX_ICON "${CMAKE_CURRENT_SOURCE_DIR}/resources/icon.jpg")
     set_property(TARGET fear_nx APPEND PROPERTY LINK_DEPENDS "${FEAR_NX_ICON}")
     if(FEAR_NX_RENDERER STREQUAL "DEKO3D")
+        target_link_options(fear_nx PRIVATE ${guest_link_flags})
+        set(check_calls "${CMAKE_CURRENT_SOURCE_DIR}/tools/switch/check-guest-calls.py")
+        set_property(TARGET fear_nx APPEND PROPERTY LINK_DEPENDS "${check_calls}")
+        add_custom_command(TARGET fear_nx POST_BUILD
+            COMMAND "${FEAR_PYTHON}" "${check_calls}" "${CMAKE_NM}" "$<TARGET_FILE:fear_nx>" "${FEAR_GUEST_DIR}"
+            VERBATIM)
         set(FEAR_NX_PACKAGE_NAME "fear_nx_deko3d")
-        set(FEAR_NX_PACKAGE_TITLE "F.E.A.R. NX deko3d")
-        if(REXGLUE_SWITCH_DEKO3D_DEBUG)
+        set(FEAR_NX_PACKAGE_TITLE "F.E.A.R. NX deko3d Full Frame")
+        if(FEAR_PGO STREQUAL "generate")
+            set(FEAR_NX_PACKAGE_NAME "fear_nx_deko3d_pgo")
+            set(FEAR_NX_PACKAGE_TITLE "F.E.A.R. NX deko3d PGO Recorder")
+        elseif(REXGLUE_SWITCH_DEKO3D_DEBUG)
             set(FEAR_NX_PACKAGE_NAME "fear_nx_deko3d_diag")
             set(FEAR_NX_PACKAGE_TITLE "F.E.A.R. NX deko3d diagnostic")
         endif()

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+
+#include "deko_profile.h"
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -16,7 +18,7 @@ namespace fear_nx::deko {
 template<class Value, size_t Buckets=16384> class VertexEpochCache {
  public:
   static_assert(Buckets && !(Buckets & (Buckets-1)));
-  struct Stats { uint64_t lookups=0,hits=0,bytes=0,collisions=0,invalidations=0; };
+  struct Stats { ProfileCounter lookups=0,hits=0,bytes=0,collisions=0,invalidations=0; };
   void BeginEpoch(uint64_t work,uint64_t frame,uint64_t ownership,
                   uint64_t validation,uint64_t guards) {
     // Ownership can end at a GPU coherency wait without expiring the content

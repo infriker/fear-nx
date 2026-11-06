@@ -5,6 +5,9 @@
 // Native Xenos graphics system for F.E.A.R. NX. It consumes the Xbox 360 GPU
 // command ring, updates register and memory state, and presents through the selected backend.
 #include "native_system.h"
+#ifdef FEAR_PGO_RECORD
+#include "fear_pgo.h"
+#endif
 #if defined(FEAR_NX_RENDERER_DEKO3D)
 #include "../deko/deko_renderer.h"
 #include "../deko/deko_profile.h"
@@ -98,6 +101,11 @@ namespace {
 namespace xenos = rex::graphics::xenos;
 using rex::X_STATUS;
 using Clock = std::chrono::steady_clock;
+#if defined(FEAR_NX_DEKO_RETAIL)
+constexpr bool kRingStats = false;
+#else
+constexpr bool kRingStats = true;
+#endif
 #if defined(FEAR_NX_RENDERER_DEKO3D)
 using BackendProvider = rex::deko3d::ProveedorDeko3d;
 using ActiveRenderer = fear_nx::deko::Renderer;
@@ -572,13 +580,13 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
     bool partial_packet = false;
     const auto kick_before_wait = [&] {
       if (!renderer_ready_) return;
-      ++ring_idle_kicks_;
+      if constexpr (kRingStats) ++ring_idle_kicks_;
       fear_nx::deko::ProfileScope profile(ring_kick_recorder_ns_,
                                          renderer_.CpuProfilingEnabled());
       renderer_.KickRecorder();
     };
 #endif
-    auto last_report = Clock::now();
+    auto last_report = kRingStats ? Clock::now() : Clock::time_point{};
     while (running_.load(std::memory_order_acquire)) {
 #if defined(FEAR_NX_RENDERER_DEKO3D)
       // A write-pointer snapshot is not a guest fence. If the producer has
@@ -595,21 +603,21 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
 #else
         if (renderer_ready_) renderer_.KickRecorder();
 #endif
-        const auto idle_start = Clock::now();
+        const auto idle_start = kRingStats ? Clock::now() : Clock::time_point{};
         std::unique_lock<std::mutex> lock(ring_mutex_);
         ring_cv_.wait_for(lock, std::chrono::milliseconds(4), [&] {
           return !running_.load(std::memory_order_acquire) ||
                  write_pointer_.load(std::memory_order_acquire) != read ||
                  ring_generation_.load(std::memory_order_acquire) != generation;
         });
-        ring_idle_ns_ += uint64_t(
+        if constexpr (kRingStats) ring_idle_ns_ += uint64_t(
             std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - idle_start)
                 .count());
       }
       if (!running_.load(std::memory_order_acquire)) {
         break;
       }
-      if (Clock::now() - last_report > std::chrono::seconds(10)) {
+      if (kRingStats && Clock::now() - last_report > std::chrono::seconds(10)) {
         last_report = Clock::now();
         Report();
       }
@@ -625,7 +633,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         read = 0;  // InitializeRingBuffer leaves the read pointer at zero
       }
 #if defined(FEAR_NX_RENDERER_DEKO3D)
-      else if (continue_batch) ++ring_backlog_coalesced_;
+      else if (kRingStats && continue_batch) ++ring_backlog_coalesced_;
 #endif
       const uint32_t base = ring_base_.load(std::memory_order_acquire);
       const uint32_t words = ring_words_.load(std::memory_order_acquire);
@@ -913,7 +921,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       return false;
     }
     reader.Advance(1);
-    ++packets_;
+    if constexpr (kRingStats) ++packets_;
     Reader data = reader;
     reader.Advance(count);
     if (!packet) {
@@ -986,7 +994,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         if (REXCVAR_GET(nx_pace_before_present)) PaceFrame();
         Present();
         swap_interrupt_pending_ = true;
-        ReportSlowFrame();
+        if constexpr (kRingStats) ReportSlowFrame();
         break;
       case xenos::PM4_INDIRECT_BUFFER:
       case xenos::PM4_INDIRECT_BUFFER_PFD: {
@@ -1058,7 +1066,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
             rex::thread::Sleep(std::chrono::microseconds(50));
           }
         }
-        if (waited) {
+        if (kRingStats && waited) {
           ++waits_;
           wait_ns_ += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
                                    Clock::now() - wait_start)
@@ -1145,7 +1153,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       case xenos::PM4_EVENT_WRITE_EXT: {
         if (words < 2) break;
 #if defined(FEAR_NX_RENDERER_DEKO3D)
-        ++visibility_.extent_reports;
+        if constexpr (kRingStats) ++visibility_.extent_reports;
 #endif
         const uint32_t initiator = data.Read();
         const uint32_t address = data.Read();
@@ -1164,7 +1172,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
       case xenos::PM4_EVENT_WRITE_ZPD: {
         if (words < 1) break;
 #if defined(FEAR_NX_RENDERER_DEKO3D)
-        ++visibility_.zpd_reports;
+        if constexpr (kRingStats) ++visibility_.zpd_reports;
 #endif
         WriteRegister(rex::graphics::XE_GPU_REG_VGT_EVENT_INITIATOR, data.Read() & 0x3F);
         const uint32_t address = Register(rex::graphics::XE_GPU_REG_RB_SAMPLE_COUNT_ADDR);
@@ -1250,12 +1258,12 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         const uint32_t id = value & 0x3F;
         if (!(value & 0x100)) {
 #if defined(FEAR_NX_RENDERER_DEKO3D)
-          ++visibility_.viz_begin;
+          if constexpr (kRingStats) ++visibility_.viz_begin;
 #endif
           WriteRegister(rex::graphics::XE_GPU_REG_VGT_EVENT_INITIATOR, xenos::VIZQUERY_START);
         } else {
 #if defined(FEAR_NX_RENDERER_DEKO3D)
-          ++visibility_.viz_end;
+          if constexpr (kRingStats) ++visibility_.viz_end;
 #endif
           WriteRegister(rex::graphics::XE_GPU_REG_VGT_EVENT_INITIATOR, xenos::VIZQUERY_END);
           const uint32_t reg = id < 32 ? uint32_t(rex::graphics::XE_GPU_REG_PA_SC_VIZ_QUERY_STATUS_0)
@@ -1295,18 +1303,20 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
         // A draw in copy mode is a resolve and/or a clear.
         if ((Register(rex::graphics::XE_GPU_REG_RB_MODECONTROL) & 0x7) ==
             uint32_t(xenos::EdramMode::kCopy)) {
-          ++copies_;
+          if constexpr (kRingStats) ++copies_;
           if (renderer_ready_) {
             renderer_.Resolve();
           }
         } else {
-          ++draws_;
+          if constexpr (kRingStats) ++draws_;
 #if defined(FEAR_NX_RENDERER_DEKO3D)
-          const uint32_t viz = Register(rex::graphics::XE_GPU_REG_PA_SC_VIZ_QUERY);
-          visibility_.conditional_draws += (visibility_token & 0x100u) != 0;
-          visibility_.query_enabled_draws += (viz & 0x1u) != 0;
-          visibility_.kill_hi_z_draws += (viz & 0x80u) != 0;
-          visibility_.kill_detail_draws += (viz & 0x100u) != 0;
+          if constexpr (kRingStats) {
+            const uint32_t viz = Register(rex::graphics::XE_GPU_REG_PA_SC_VIZ_QUERY);
+            visibility_.conditional_draws += (visibility_token & 0x100u) != 0;
+            visibility_.query_enabled_draws += (viz & 0x1u) != 0;
+            visibility_.kill_hi_z_draws += (viz & 0x80u) != 0;
+            visibility_.kill_detail_draws += (viz & 0x100u) != 0;
+          }
 #endif
           if (renderer_ready_) {
             renderer_.Draw(immediate, immediate_words);
@@ -1483,7 +1493,7 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
              running_.load(std::memory_order_acquire) && Clock::now() < limit) {
         rex::thread::Sleep(std::chrono::microseconds(250));
       }
-      hold_ns_ += uint64_t(
+      if constexpr (kRingStats) hold_ns_ += uint64_t(
           std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - hold_start)
               .count());
     }
@@ -1493,6 +1503,9 @@ class NativeGraphicsSystem final : public rex::system::IGraphicsSystem {
   void Present() {
     const uint64_t swap = ++swaps_;
     g_swaps_presented.fetch_add(1, std::memory_order_relaxed);
+#ifdef FEAR_PGO_RECORD
+    fear_nx::pgo::OnFrame();
+#endif
     counter_.fetch_add(1, std::memory_order_relaxed);
 #if defined(__SWITCH__)
     RexSwitchPerfCount(0);

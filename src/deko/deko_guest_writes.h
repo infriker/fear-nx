@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+
+#include "deko_profile.h"
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -18,7 +20,7 @@ class GuestMemoryWrites {
   static constexpr uint32_t kExtentBytes=12;
   static constexpr size_t kMaxAddresses=65536;
   static constexpr uint64_t kRecentQueryWrites=8;
-  struct Stats {uint64_t writes=0,queries=0,overlaps=0,history_resets=0,history_misses=0,history_evictions=0,recent_queries=0;};
+  struct Stats {ProfileCounter writes=0,queries=0,overlaps=0,history_resets=0,history_misses=0,history_evictions=0,recent_queries=0;};
   GuestMemoryWrites()=default;
   // Intrusive recency links point into this journal's stable map nodes.
   GuestMemoryWrites(const GuestMemoryWrites&)=delete;

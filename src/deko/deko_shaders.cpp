@@ -635,7 +635,8 @@ bool ValidateStage(const spirv_cross::Compiler& compiler, ShaderStage expected,
 
 }  // namespace
 
-GlslShader ConvertSpirv(std::span<const uint32_t> spirv, ShaderStage expected_stage) {
+GlslShader ConvertSpirv(std::span<const uint32_t> spirv, ShaderStage expected_stage,
+                        bool read_only_early_tests) {
   GlslShader result;
   result.stage = expected_stage;
   if (spirv.size() < 5 || spirv.front() != spv::MagicNumber) {
@@ -647,6 +648,9 @@ GlslShader ConvertSpirv(std::span<const uint32_t> spirv, ShaderStage expected_st
     std::vector<uint32_t> words(spirv.begin(), spirv.end());
     spirv_cross::CompilerGLSL compiler(std::move(words));
     if (!ValidateStage(compiler, expected_stage, result.error)) return result;
+    if (read_only_early_tests && expected_stage == ShaderStage::kFragment) {
+      compiler.set_execution_mode(spv::ExecutionModeEarlyFragmentTests);
+    }
 
     const auto original_resources = compiler.get_shader_resources();
     if (!CheckNoUnsupportedResources(original_resources, result.error)) return result;

@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+
+#include "deko_profile.h"
 #include "deko_vertex_cache.h"
 #include <array>
 #include <map>
@@ -171,13 +173,14 @@ class SharedGeometryCache {
   uint32_t next_=UINT32_MAX;
   bool sequential_=false;
   uint64_t sequential_allocations_=0,best_fit_allocations_=0;
-  uint64_t work_=0,completed_before_=0,cross_work_hits_=0,cross_slot_hits_=0;
+  uint64_t work_=0,completed_before_=0;
+  ProfileCounter cross_work_hits_=0,cross_slot_hits_=0;
   std::vector<uint64_t> blocked_;
   Order order_,candidate_order_;
   std::unordered_map<Key,Entry,Hash> entries_;
   std::array<FastEntry,8192> fast_{};
   bool fast_enabled_=true;
-  uint64_t fast_hits_=0,table_lookups_=0;
+  ProfileCounter fast_hits_=0,table_lookups_=0;
   std::unordered_map<Key,Order::iterator,Hash> candidates_;
   Frees free_;Sizes sizes_;Stats stats_{};
 };

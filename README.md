@@ -7,34 +7,34 @@ uses **deko3d** for rendering on Horizon and builds **`fear_nx_deko3d.nro`**.
 The original menu, cutscenes and campaign are playable. This is an experimental
 alternative to the [Vulkan/Mesa renderer in `main`](https://github.com/infriker/fear-nx/tree/main).
 
-## Performance
+[Download fear_nx_deko3d.nro](https://raw.githubusercontent.com/infriker/fear-nx/refs/heads/deko3d/builds/deko3d/fear_nx_deko3d.nro) · [Default settings](release/fear-nx.toml)
 
-**Current Switch testing: 20–30 FPS with overclocking, with frequent drops.**
-**Vulkan currently provides more stable performance.** The overclock settings
-were not recorded with this report, so these numbers are observations rather
-than a reproducible benchmark. They are not stock-clock results or a claim
-that every level maintains 20 FPS.
+## Rendering and performance
 
-The current implementation includes persistent geometry and index caches,
-16-bit indices, bounded texture validation, NEON uploads, retained constants,
-deferred clears, 3D copies and finer image dependencies. Shader variants can
-be cached and prepared on a PC. Sustained slow scenes in the recorded tests
-also occurred with zero shader compilations; precompilation alone does not
-remove those drops.
+The game submits the 1280×720 scene as a single full-height region. Color and
+depth cover the same rectangle, including during level loading. Scene clears,
+resolves and presentation still run. The deko3d renderer uses single-sample
+targets and skips dynamic mirror and water reflections. Water refraction and
+camera feeds keep their own passes.
 
-See the single [test and optimization history](docs/deko3d-history.md) for
-what changed, what helped, and which attempts regressed or remain unproven.
+The defaults use medium effects detail, half the original particle bounce/splat
+probability, 128 volumetric light slices and 64-pixel volumetric shadow maps.
+Large mipmapped block-compressed textures start at mip 1, with anisotropy
+limited to 2×. The translated game code uses direct calls, LTO and a gameplay
+profile recorded on Switch. The downloadable NRO has no runtime PGO recorder
+or renderer performance counters.
+
+The October deko3d build reached 20–30 FPS with overclocking and frequent
+drops. A comparable Switch measurement for this full-frame build is pending.
+See the [deko3d test history](docs/deko3d-history.md).
 
 ## How to install
 
-Use a deko3d NRO built from this branch or explicitly labelled as deko3d.
-The [browser installer](https://infriker.github.io/fear-nx/) and its pinned
-release still provide the **Vulkan build**; selecting this Git branch does
-not change that download.
-
-For an existing installation, add `fear_nx_deko3d.nro` beside `fear_nx.nro`
-and launch the deko3d entry. Both use the same game and save layout. Back up
-custom settings before applying this branch's `release/fear-nx.toml`.
+Place `fear_nx_deko3d.nro` beside `fear_nx.nro` in `sdmc:/switch/fear-nx/`
+and select **F.E.A.R. NX deko3d Full Frame** in Homebrew Menu. Both executables
+use the same game files and saves. You can keep your existing
+`fear-nx.toml` or merge settings from the [branch configuration](release/fear-nx.toml).
+The [browser installer](https://infriker.github.io/fear-nx/) supplies Vulkan.
 
 ```text
 /switch/fear-nx/
@@ -69,11 +69,12 @@ therefore refer to the same letters on your controller.
 To use Xbox button positions, set `xbox_layout = true` under `[input]` in
 `fear-nx.toml`: Switch B becomes Xbox A, A becomes B, Y becomes X and X becomes Y.
 
-Gyroscope aiming is **on by default** and works only while aiming. To turn it
-off, open the port settings with **L + R + D-pad Right**, select **Input**,
-uncheck **input_gyro_enabled**, then choose **Save to config**. Alternatively,
-set `gyro_enabled = false` under `[input]` in `fear-nx.toml`. Existing saved
-preferences are preserved. See [gyro settings](docs/gyro-aiming.md).
+Gyro works during normal play and hip fire by default. The default sensitivity
+is 1.5. Turning a handheld left or right steers horizontally even when held
+upright. Set `gyro_always_on = false` for aim-only mode or
+`gyro_enabled = false` to turn motion off. Both horizontal and vertical
+inversion are available under `[input]`. See [gyro settings](docs/gyro-aiming.md)
+and [button remapping](docs/button-bindings.md).
 
 ## Settings
 
@@ -83,31 +84,13 @@ profile leaves clocks to the system/user and does not force overclocking.
 It disables profiling and verbose tracing for normal play. User configurations
 remain in effect when replacing only the NRO.
 
-For diagnostics, enable `native_cpu_profile = true` and/or
-`native_gpu_profile = true` under `[nx]`, and `level = "info"` under `[log]`.
-Profiling affects measurements; use a separate run for clean FPS comparisons.
-See [shader tools](tools/deko/README.md) for cache preparation.
-
-## Planned work
-
-- [ ] **Optimize CPU work in the game**, including guest execution, waits and
-  synchronization, using measured hot paths.
-- [ ] Reduce render-thread queue waits and remaining constant/texture work.
-- [ ] Validate performance and image correctness across more levels on Switch.
-
-The existing bounded CPU adapter is retained; it is not a completed optimization
-of the game's CPU workload. Current caches and the separate Vulkan path remain.
+Build the diagnostic NRO to enable renderer profiling or GPU validation.
+See [build options](docs/building.md) and [shader cache tools](tools/deko/README.md).
 
 ## Known issues
 
-- Frequent frame-rate drops, especially with complex scenes and combat.
-- New shader variants may stall on first use; existing cache entries help only
-  the variants already observed or prepared.
-- Only the Xbox 360 executable revision below is supported.
-- Menu and campaign testing does not establish that every mission is correct.
-
-See [known issues](docs/known-issues.md). Vulkan's unresolved graphical defects
-are tracked separately in `main`; their triggers have not yet been identified.
+First use of a new shader variant can stall. Campaign coverage and hardware
+performance measurements are documented in [known issues](docs/known-issues.md).
 
 ## Build and documentation
 

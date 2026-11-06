@@ -10,8 +10,13 @@ bool DekoHasStencil(VkFormat format) {
 
 constexpr char kDepthResolveGlsl[] = R"glsl(#version 460
 layout(local_size_x = 8, local_size_y = 8) in;
+#ifdef FEAR_MULTISAMPLED
+layout(binding = 0) uniform sampler2DMS depth_buffer;
+layout(binding = 1) uniform usampler2DMS stencil_buffer;
+#else
 layout(binding = 0) uniform sampler2D depth_buffer;
 layout(binding = 1) uniform usampler2D stencil_buffer;
+#endif
 layout(binding = 0, r32f) writeonly uniform image2D depth_output;
 layout(binding = 1, rgba8) writeonly uniform image2D words_output;
 layout(binding = 0) uniform Params {
@@ -23,10 +28,10 @@ void main() {
   if (p.x >= params.extent_flags.x || p.y >= params.extent_flags.y) return;
   ivec2 source_pixel = params.source_destination_origin.xy + ivec2(p);
   ivec2 destination_pixel = params.source_destination_origin.zw + ivec2(p);
-  float depth = clamp(texelFetch(depth_buffer, source_pixel, 0).r, 0.0, 1.0);
+  float depth = clamp(texelFetch(depth_buffer, source_pixel, int(params.extent_flags.w)).r, 0.0, 1.0);
   imageStore(depth_output, destination_pixel, vec4(depth, 0.0, 0.0, 1.0));
   uint depth24 = uint(depth * 16777215.0 + 0.5);
-  uint stencil = texelFetch(stencil_buffer, source_pixel, 0).r & 0xFFu;
+  uint stencil = texelFetch(stencil_buffer, source_pixel, int(params.extent_flags.w)).r & 0xFFu;
   uvec4 bytes = uvec4(stencil, depth24 & 0xFFu, (depth24 >> 8u) & 0xFFu,
                       (depth24 >> 16u) & 0xFFu);
   imageStore(words_output, destination_pixel, vec4(bytes) * (1.0 / 255.0));
@@ -35,7 +40,11 @@ void main() {
 
 constexpr char kDepthFloatResolveGlsl[] = R"glsl(#version 460
 layout(local_size_x = 8, local_size_y = 8) in;
+#ifdef FEAR_MULTISAMPLED
+layout(binding = 0) uniform sampler2DMS depth_buffer;
+#else
 layout(binding = 0) uniform sampler2D depth_buffer;
+#endif
 layout(binding = 0, r32f) writeonly uniform image2D depth_output;
 layout(binding = 0) uniform Params {
   ivec4 source_destination_origin;
@@ -46,7 +55,7 @@ void main() {
   if (p.x >= params.extent_flags.x || p.y >= params.extent_flags.y) return;
   ivec2 source_pixel = params.source_destination_origin.xy + ivec2(p);
   ivec2 destination_pixel = params.source_destination_origin.zw + ivec2(p);
-  float depth = clamp(texelFetch(depth_buffer, source_pixel, 0).r, 0.0, 1.0);
+  float depth = clamp(texelFetch(depth_buffer, source_pixel, int(params.extent_flags.w)).r, 0.0, 1.0);
   imageStore(depth_output, destination_pixel, vec4(depth, 0.0, 0.0, 1.0));
 }
 )glsl";
@@ -64,13 +73,19 @@ bool Renderer::Impl::DispatchDepthResolve(RenderTarget& source, ResolveImage& de
                                           ResolveImage* words, uint32_t source_x,
                                           uint32_t source_y, uint32_t destination_x,
                                           uint32_t destination_y, uint32_t width,
-                                          uint32_t height, bool unorm_guest) {
+                                          uint32_t height, bool unorm_guest,
+                                          uint32_t first_sample) {
   if (!width || !height || !DekoHasStencil(source.format)) {
     return false;
   }
 
-  CompiledShader* shader = CompileText(
-      unorm_guest ? kDepthResolveGlsl : kDepthFloatResolveGlsl, ShaderStage::kCompute);
+  const char* shader_source = unorm_guest ? kDepthResolveGlsl : kDepthFloatResolveGlsl;
+  if (source.image.samples != DkMsMode_1x) {
+    static const auto packed_ms = MultisampledShader(kDepthResolveGlsl);
+    static const auto float_ms = MultisampledShader(kDepthFloatResolveGlsl);
+    shader_source = (unorm_guest ? packed_ms : float_ms).c_str();
+  }
+  CompiledShader* shader = CompileText(shader_source, ShaderStage::kCompute);
   if (!shader) return false;
 
   const ClearRect read_area{source_x,source_y,width,height},write_area{destination_x,destination_y,width,height};
@@ -84,12 +99,12 @@ bool Renderer::Impl::DispatchDepthResolve(RenderTarget& source, ResolveImage& de
   if (unorm_guest && !words) return false;
   for (uint32_t attempt = 0; attempt < 2; ++attempt) {
     depth_view = textures->GetImageView(source.image, xenos::XE_GPU_TEXTURE_SWIZZLE_RRRR,
-                                        DkImageType_2D, DkDsSource_Depth, false);
+                                        source.image.type, DkDsSource_Depth, false);
     depth_output_view = textures->GetImageView(depth.image, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA,
                                                DkImageType_2D, DkDsSource_Depth, true);
     if (unorm_guest) {
       stencil_view = textures->GetImageView(source.image, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA,
-                                            DkImageType_2D, DkDsSource_Stencil, false);
+                                            source.image.type, DkDsSource_Stencil, false);
       words_view = textures->GetImageView(words->image, xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA,
                                           DkImageType_2D, DkDsSource_Depth, true);
     }
@@ -110,7 +125,7 @@ bool Renderer::Impl::DispatchDepthResolve(RenderTarget& source, ResolveImage& de
     uint32_t extent_flags[4];
   } params{{int32_t(source_x), int32_t(source_y), int32_t(destination_x),
             int32_t(destination_y)},
-           {width, height, uint32_t(unorm_guest), 0}};
+           {width, height, uint32_t(unorm_guest), first_sample}};
   auto upload = core.Reservar(sizeof(params), 256);
   if (!upload) {
     Flush();
@@ -313,11 +328,23 @@ void Renderer::Impl::Resolve() {
   if (x0 >= x1 || y0 >= y1 || x1 <= 0 || y1 <= 0) return;
 
   const bool is_depth = copy_control.copy_src_select >= 4;
-  const uint32_t host_msaa = HostMsaa(surface_info.msaa_samples);
+  const uint32_t guest_msaa = uint32_t(surface_info.msaa_samples);
+  const uint32_t host_msaa = HostMsaa(surface_info.surface_pitch, guest_msaa);
+  // Xbox selects one sample, a pair, or all four. If the quality override
+  // promotes 2x to 4x, each guest sample covers two physical samples.
+  uint32_t first_sample = 0, sample_count = 1;
+  if (host_msaa) {
+    const uint32_t select = uint32_t(copy_control.copy_sample_select);
+    const uint32_t guest_samples = 1u << guest_msaa;
+    const uint32_t scale = 1u << (host_msaa - guest_msaa);
+    first_sample = (select < 4 ? select : (select == 5 ? 2u : 0u)) % guest_samples * scale;
+    sample_count = std::min(guest_samples, select < 4 ? 1u : (select == 6 ? 4u : 2u)) * scale;
+  }
   RenderTargetKey source_key{};
   source_key.pitch = surface_info.surface_pitch;
   source_key.msaa = host_msaa;
-  source_key.guest_msaa = is_depth ? uint32_t(surface_info.msaa_samples) : 0;
+  source_key.guest_msaa = (is_depth || source_key.pitch == 1280)
+                              ? uint32_t(surface_info.msaa_samples) : 0;
   if (is_depth) {
     const auto depth_info = r.Get<reg::RB_DEPTH_INFO>();
     source_key.base_tiles = depth_info.depth_base;
@@ -497,7 +524,8 @@ void Renderer::Impl::Resolve() {
         if (DispatchDepthResolve(*source, *destination, words_destination,
                                  uint32_t(x0), uint32_t(y0), dest_x, dest_y,
                                  width, height,
-                                 format_key == uint32_t(xenos::DepthRenderTargetFormat::kD24S8))) {
+                                 format_key == uint32_t(xenos::DepthRenderTargetFormat::kD24S8),
+                                 first_sample)) {
           destination->version = ++resolve_version_clock;
           destination->last_frame = frame;
           if (words_destination) {
@@ -511,13 +539,15 @@ void Renderer::Impl::Resolve() {
         destination->image.host_format_swizzle = dest_info.copy_dest_swap
             ? XE_GPU_MAKE_TEXTURE_SWIZZLE(B, G, R, A)
             : xenos::XE_GPU_TEXTURE_SWIZZLE_RGBA;
-        if(!DeferFrontbuffer(*source,*destination,float_root,uint32_t(x0),uint32_t(y0),dest_x,dest_y,
-                            width,height,root_address!=resolve_address||origin.x||origin.y,dest_info.copy_dest_swap))
+        const bool written=DeferFrontbuffer(*source,*destination,float_root,uint32_t(x0),uint32_t(y0),dest_x,dest_y,
+                            width,height,root_address!=resolve_address||origin.x||origin.y,dest_info.copy_dest_swap) ||
           Copy(source->image, destination->image, uint32_t(x0), uint32_t(y0), dest_x, dest_y,
-               width, height);
-        destination->version = ++resolve_version_clock;
-        destination->last_frame = frame;
-        set_alias(resolve_address, float_root, origin);
+               width, height, first_sample, sample_count);
+        if (written) {
+          destination->version = ++resolve_version_clock;
+          destination->last_frame = frame;
+          set_alias(resolve_address, float_root, origin);
+        }
       }
     }
   }

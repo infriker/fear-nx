@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+
+#include "deko_profile.h"
 #include <algorithm>
 #include <array>
 #include <cstdint>
@@ -18,8 +20,8 @@ class DeferredIndexUploadBatch {
   static constexpr uint32_t kCapacity=64u<<10;
   static constexpr uint32_t kEntries=kCapacity/64;
   struct Stats {
-    uint64_t flushes=0,capacity_flushes=0,payloads=0,writes=0,merged=0;
-    uint64_t sorted_flushes=0,assembled_bytes=0;
+    ProfileCounter flushes=0,capacity_flushes=0,payloads=0,writes=0,merged=0;
+    ProfileCounter sorted_flushes=0,assembled_bytes=0;
   };
   DeferredIndexUploadBatch()=default;
   DeferredIndexUploadBatch(const DeferredIndexUploadBatch&)=delete;

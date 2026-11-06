@@ -80,7 +80,8 @@ REXCVAR_DEFINE_BOOL(nx_native_zcull, true, "F.E.A.R. NX", "Enable depth hierarch
 REXCVAR_DEFINE_BOOL(nx_native_shared_resolves, true, "F.E.A.R. NX", "Preserve shared resolve destinations");
 REXCVAR_DEFINE_BOOL(nx_native_precise_resolve_barriers, true, "F.E.A.R. NX", "Preserve ordered resolve dependencies");
 REXCVAR_DEFINE_BOOL(nx_native_full_clear_load_op, true, "F.E.A.R. NX", "Full guest clears discard prior attachment contents");
-REXCVAR_DEFINE_BOOL(nx_native_msaa, false, "F.E.A.R. NX", "Guest sample-layout tracking; test backend uses single host samples");
+REXCVAR_DEFINE_BOOL(nx_native_msaa, false, "F.E.A.R. NX", "Diagnostic multisampling for the full-width scene. Gameplay uses one sample.");
+REXCVAR_DEFINE_UINT32(nx_native_scene_samples, 2, "F.E.A.R. NX", "Physical scene samples with native_msaa enabled: 2 or 4.");
 REXCVAR_DEFINE_BOOL(nx_native_async_pipelines, false, "F.E.A.R. NX", "Compatibility option; deko correctness build waits for compilation");
 REXCVAR_DEFINE_BOOL(nx_native_trace_output, false, "F.E.A.R. NX", "Log deko rendering diagnostics");
 REXCVAR_DEFINE_BOOL(nx_native_shader_warmup, true, "F.E.A.R. NX", "Prepare previously observed deko shader variants before starting the game");
@@ -125,6 +126,7 @@ REXCVAR_DEFINE_BOOL(nx_native_constant_dirty_ranges, true, "F.E.A.R. NX", "Scan 
 REXCVAR_DEFINE_BOOL(nx_native_partial_kicks, true, "F.E.A.R. NX", "Submit idle work without retiring the upload slot, bounded to three partial sends");
 REXCVAR_DEFINE_BOOL(nx_native_clear_coalesce, true, "F.E.A.R. NX", "Merge compatible clear regions and avoid splitting mostly consumed rectangles");
 REXCVAR_DEFINE_BOOL(nx_native_color_compression, true, "F.E.A.R. NX", "Compress compatible color targets (startup option)");
+REXCVAR_DEFINE_BOOL(nx_native_depth_compression, true, "F.E.A.R. NX", "Use Maxwell compression for D24S8 targets. Restart after changing.");
 
 namespace fear_nx::deko {
 namespace xenos = rex::graphics::xenos;
@@ -180,6 +182,9 @@ struct PipelineKey {
   uint32_t stencil_front[4],stencil_back[4],blend[4],write_masks,texture_signs[8]; uint64_t layout;
 };
 struct CompiledShader { DkShader shader{}; GlslShader info; };
+// The pinned translator uses bits 0..48 for pixel modifications. Keep its
+// regular alpha-test program and specialize only its hardware execution mode.
+constexpr uint64_t kReadOnlyEarlyTests = uint64_t{1} << 63;
 struct Pipeline { PipelineKey key{}; CompiledShader *vs=nullptr,*ps=nullptr,*gs=nullptr; };
 struct PipelineLayout { uint64_t layout=0; };
 struct Capabilities {
@@ -191,6 +196,7 @@ struct DrawSetup {
   SpirvShader *active_vs=nullptr,*active_ps=nullptr,*vs=nullptr,*ps=nullptr;
   uint32_t initiator_state=0,skip_reason=UINT32_MAX;
   bool primitive_polygonal=false; reg::RB_DEPTHCONTROL depth_control{};
+  bool extent_from_clear=false, double_clear_x=false;
   bool convert_fan=false,convert_loop=false,strip=false,reset_enabled=false;
   draw_util::Scissor scissor{}; draw_util::ViewportInfo viewport{}; PassTargets targets;
   PipelineLayout* layout=nullptr; uint32_t counts[4]{}; Pipeline* pipeline=nullptr;
@@ -380,6 +386,7 @@ struct Renderer::Impl {
   std::vector<uint32_t> index_staging;
   std::vector<uint16_t> index16_staging;
   bool color_compression_enabled=true;
+  bool depth_compression_enabled=true;
   std::vector<uint8_t> index_source_staging;
   PersistentVertexCache vertex_cache;
   SharedGeometryCache shared_vertices{kWorkSlots,kUploadBytes,4096,(16u<<20)-4096};
@@ -397,79 +404,84 @@ struct Renderer::Impl {
   ZeroPrefixTracker<kWorkSlots> zero_prefixes;
   std::filesystem::path cache_root,prepared_cache_root,warmup_root;
   std::string compiler_id=rex::deko3d::IdCompilador();
+  const std::string read_only_compiler_id = compiler_id + "/read-only-early-v1";
   std::set<std::pair<uint64_t,uint64_t>> recorded_variants;
   bool warming_up=false;
   std::chrono::steady_clock::time_point variant_retry_time{};
   uint64_t shader_code_budget_used=0;
+#if defined(FEAR_NX_DEKO_RETAIL)
+  static constexpr bool cpu_profile_enabled = false, gpu_profile_enabled = false;
+#else
   bool cpu_profile_enabled=true,gpu_profile_enabled=false;
+#endif
   struct CpuProfile {
-    uint64_t draw_ns=0,resolve_ns=0,swap_ns=0,load_shader_ns=0;
-    uint64_t draw_begin_ns=0,setup_ns=0,index_ns=0,vertex_ns=0,constants_ns=0;
-    uint64_t texture_ns=0,record_ns=0,mirror_ns=0;
-    uint64_t vertex_hash_ns=0,vertex_hash_bytes=0,vertex_hash_calls=0,vertex_copy_ns=0;
-    uint64_t geometry_push_uploads=0,geometry_push_commands=0,geometry_push_bytes=0,geometry_push_fallbacks=0;
-    uint64_t zero_prefix_writes=0,zero_prefix_reuses=0,zero_prefix_avoided_bytes=0;
-    uint64_t vertex_declared_bytes=0,vertex_window_bytes=0,vertex_clipped=0,vertex_range_fallbacks=0;
-    uint64_t vertex_local_hits=0,vertex_local_misses=0,vertex_padding_bytes=0;
-    uint64_t dynamic_reuse_hits=0,dynamic_reuse_bytes=0,dynamic_copy_bytes=0;
-    uint64_t index_hits=0,index_misses=0,index_uncached=0,index_copy_bytes=0,index_avoided_bytes=0;
-    uint64_t index_hash_ns=0,index_convert_ns=0,index_copy_ns=0,index_hash_bytes=0;
-    uint64_t vertex_grid_reduced=0,vertex_grid_selected_saved=0,vertex_grid_copy_saved=0;
-    uint64_t index_batch_payloads=0,index_batch_payload_bytes=0,index_batch_writes=0,index_batch_write_bytes=0;
-    uint64_t index_batch_capture_ns=0,index_batch_write_ns=0,index_batch_submit_ns=0,index_direct_writes=0,index_batch_reserve_bytes=0;
-    uint64_t index_resident_payloads=0,index_resident_payload_bytes=0,index_resident_writes=0,index_resident_written_bytes=0;
-    uint64_t index_resident_capture_ns=0,index_resident_drain_ns=0,index_resident_submit_ns=0;
-    uint64_t index_write_size_count[3]{},index_write_size_bytes[3]{},index_write_size_ns[3]{};
-    uint64_t index_direct_resident_ns=0,index_direct_transient_ns=0,index_direct_bytes=0,index_direct_written_bytes=0;
-    uint64_t index_direct_unaligned_sources=0,index_direct_tails=0;
-    uint64_t vertex_batch_payloads=0,vertex_batch_bytes=0,vertex_batch_writes=0,vertex_batch_write_bytes=0,vertex_batch_reserved=0;
-    uint64_t vertex_batch_capture_ns=0,vertex_batch_write_ns=0,vertex_batch_submit_ns=0,vertex_direct_writes=0;
-    uint64_t vertex_resident_payloads=0,vertex_resident_payload_bytes=0,vertex_resident_writes=0,vertex_resident_written_bytes=0;
-    uint64_t vertex_resident_capture_ns=0,vertex_resident_drain_ns=0,vertex_resident_submit_ns=0;
-    uint64_t vertex_direct_resident_ns=0,vertex_direct_transient_ns=0,vertex_direct_resident_writes=0,vertex_direct_transient_writes=0;
-    uint64_t vertex_direct_resident_bytes=0,vertex_direct_transient_bytes=0,vertex_direct_written_bytes=0,vertex_direct_unaligned_sources=0,vertex_direct_tails=0;
-    uint64_t index_validation_probe_ns=0,index_validation_candidates=0,index_validation_hits=0,index_validation_rejected=0,index_full_hashes=0;
-    uint64_t index_compact_attempts=0,index_compact_accepted=0,index_compact_rejected=0,index_compact_ns=0,index_compact_draws=0;
-    uint64_t index16_draws=0,index32_draws=0,index16_saved_bytes=0;
-    uint64_t clears_deferred=0,clears_materialized=0,clears_elided=0,clears_executed=0;
-    uint64_t copy3d_calls=0,copy3d_pixels=0,copy3d_compressed=0,copy_transfer_calls=0;
-    uint64_t front_deferred=0,front_direct=0,front_copies=0,front_exchanges=0,front_replaced=0;
-    uint64_t front_deferred_pixels=0,front_copy_pixels=0;
-    uint64_t image_fragments=0,image_primitives=0,image_barriers_skipped=0;
-    uint64_t clears_rectangles=0,clears_masked=0,clears_repeated=0,clears_capacity_drains=0;
-    uint64_t clear_pixels_queued=0,clear_pixels_executed=0,clear_partial_consumes=0;
-    uint64_t clear_regions_merged=0,clear_expanded_pixels=0,clear_expanded_consumes=0;
-    uint64_t constant_slot_allocations=0,constant_slot_reuses=0,constant_slot_unchanged=0;
-    uint64_t constant_slot_initial_avoided=0,constant_slot_reentry_push_bytes=0,constant_slot_fallbacks=0;
-    uint64_t constant_hits=0,constant_misses=0,constant_uncached=0,constant_copy_bytes=0,constant_avoided_bytes=0;
-    uint64_t constant_lookup_ns=0,constant_copy_ns=0,vertex_cache_ns=0;
-    uint64_t constant_initial_ns=0,constant_scan_ns=0,constant_push_ns=0;
-    uint64_t texture_set_hits=0,texture_set_misses=0,texture_set_ineligible=0;
-    uint64_t setup_hits=0,setup_misses=0,setup_state_misses=0,setup_target_misses=0,setup_shader_misses=0,setup_sign_misses=0;
-    uint64_t constant_version_checks=0,constant_version_skips=0,texture_dependency_misses=0;
-    uint64_t constant_group_checks=0,constant_group_skips=0,constant_revision_hits=0;
-    uint64_t constant_packed_copy_bytes=0,constant_partial_packs=0,constant_bulk_updates=0;
-    uint64_t system_generation_hits=0;
-    uint64_t constant_content_hashes=0,constant_content_hash_bytes=0;
-    uint64_t index_cpu_hits=0,index_cpu_misses=0,index_cpu_resets=0,index_cpu_lookup_ns=0;
-    uint64_t constant_generation_hits=0,constant_pack_ns=0,constant_packs=0,system_pack_reuses=0;
-    uint64_t constant_pack_bank_bytes=0,constant_pack_used_bytes=0;
-    uint64_t vertex_fast_hits=0,vertex_table_lookups=0,index_fast_hits=0,index_table_lookups=0;
-    uint64_t upload_cache_clear_ns=0;
-    uint64_t vertex_dynamic_windows=0,vertex_dynamic_window_saved=0,vertex_dynamic_copy_saved=0;
-    uint64_t vertex_epoch_lookup_ns=0,vertex_epoch_dynamic_hits=0,vertex_epoch_dynamic_bytes=0;
-    uint64_t range_write_ns=0;
-    uint64_t index_gpu_hits=0,index_gpu_misses=0,index_gpu_avoided_bytes=0,index_gpu_lookup_ns=0;
-    uint64_t constant_initial_bytes=0,constant_push_bytes=0,constant_push_commands=0,constant_delta_unchanged=0;
-    uint64_t constant_scan_extent_bytes=0,constant_scan_skipped_bytes=0,constant_narrow_scans=0;
-    uint64_t state_emitted=0,state_skipped=0,draw_full=0,draw_data_invalidations=0,draw_no_barrier=0;
-    uint64_t guest_samples[4]{},max_target_width=0,max_target_height=0;
-    uint64_t begin_ns=0,submit_ns=0,maintenance_ns=0,barriers=0;
-    uint64_t swap_prepare_ns=0,refresh_ns=0;
-    uint64_t queue_partial_sends=0,queue_final_sends=0,queue_empty_kicks=0;
-    uint64_t queue_slot_checks=0,queue_slot_blocked=0,queue_blocked_ns=0,queue_ready_ns=0;
-    uint64_t queue_reuse_age_ns=0,queue_wait_draws=0,queue_wait_pushes=0;
-    uint64_t queue_begin_cpu_ns=0,queue_begin_cpu_samples=0,ring_cpu_ns=0;
+    ProfileCounter draw_ns=0,resolve_ns=0,swap_ns=0,load_shader_ns=0;
+    ProfileCounter draw_begin_ns=0,setup_ns=0,index_ns=0,vertex_ns=0,constants_ns=0;
+    ProfileCounter texture_ns=0,record_ns=0,mirror_ns=0;
+    ProfileCounter vertex_hash_ns=0,vertex_hash_bytes=0,vertex_hash_calls=0,vertex_copy_ns=0;
+    ProfileCounter geometry_push_uploads=0,geometry_push_commands=0,geometry_push_bytes=0,geometry_push_fallbacks=0;
+    ProfileCounter zero_prefix_writes=0,zero_prefix_reuses=0,zero_prefix_avoided_bytes=0;
+    ProfileCounter vertex_declared_bytes=0,vertex_window_bytes=0,vertex_clipped=0,vertex_range_fallbacks=0;
+    ProfileCounter vertex_local_hits=0,vertex_local_misses=0,vertex_padding_bytes=0;
+    ProfileCounter dynamic_reuse_hits=0,dynamic_reuse_bytes=0,dynamic_copy_bytes=0;
+    ProfileCounter index_hits=0,index_misses=0,index_uncached=0,index_copy_bytes=0,index_avoided_bytes=0;
+    ProfileCounter index_hash_ns=0,index_convert_ns=0,index_copy_ns=0,index_hash_bytes=0;
+    ProfileCounter vertex_grid_reduced=0,vertex_grid_selected_saved=0,vertex_grid_copy_saved=0;
+    ProfileCounter index_batch_payloads=0,index_batch_payload_bytes=0,index_batch_writes=0,index_batch_write_bytes=0;
+    ProfileCounter index_batch_capture_ns=0,index_batch_write_ns=0,index_batch_submit_ns=0,index_direct_writes=0,index_batch_reserve_bytes=0;
+    ProfileCounter index_resident_payloads=0,index_resident_payload_bytes=0,index_resident_writes=0,index_resident_written_bytes=0;
+    ProfileCounter index_resident_capture_ns=0,index_resident_drain_ns=0,index_resident_submit_ns=0;
+    ProfileCounter index_write_size_count[3]{},index_write_size_bytes[3]{},index_write_size_ns[3]{};
+    ProfileCounter index_direct_resident_ns=0,index_direct_transient_ns=0,index_direct_bytes=0,index_direct_written_bytes=0;
+    ProfileCounter index_direct_unaligned_sources=0,index_direct_tails=0;
+    ProfileCounter vertex_batch_payloads=0,vertex_batch_bytes=0,vertex_batch_writes=0,vertex_batch_write_bytes=0,vertex_batch_reserved=0;
+    ProfileCounter vertex_batch_capture_ns=0,vertex_batch_write_ns=0,vertex_batch_submit_ns=0,vertex_direct_writes=0;
+    ProfileCounter vertex_resident_payloads=0,vertex_resident_payload_bytes=0,vertex_resident_writes=0,vertex_resident_written_bytes=0;
+    ProfileCounter vertex_resident_capture_ns=0,vertex_resident_drain_ns=0,vertex_resident_submit_ns=0;
+    ProfileCounter vertex_direct_resident_ns=0,vertex_direct_transient_ns=0,vertex_direct_resident_writes=0,vertex_direct_transient_writes=0;
+    ProfileCounter vertex_direct_resident_bytes=0,vertex_direct_transient_bytes=0,vertex_direct_written_bytes=0,vertex_direct_unaligned_sources=0,vertex_direct_tails=0;
+    ProfileCounter index_validation_probe_ns=0,index_validation_candidates=0,index_validation_hits=0,index_validation_rejected=0,index_full_hashes=0;
+    ProfileCounter index_compact_attempts=0,index_compact_accepted=0,index_compact_rejected=0,index_compact_ns=0,index_compact_draws=0;
+    ProfileCounter index16_draws=0,index32_draws=0,index16_saved_bytes=0;
+    ProfileCounter clears_deferred=0,clears_materialized=0,clears_elided=0,clears_executed=0;
+    ProfileCounter copy3d_calls=0,copy3d_pixels=0,copy3d_compressed=0,copy_transfer_calls=0;
+    ProfileCounter front_deferred=0,front_direct=0,front_copies=0,front_exchanges=0,front_replaced=0;
+    ProfileCounter front_deferred_pixels=0,front_copy_pixels=0;
+    ProfileCounter image_fragments=0,image_primitives=0,image_barriers_skipped=0;
+    ProfileCounter clears_rectangles=0,clears_masked=0,clears_repeated=0,clears_capacity_drains=0;
+    ProfileCounter clear_pixels_queued=0,clear_pixels_executed=0,clear_partial_consumes=0;
+    ProfileCounter clear_regions_merged=0,clear_expanded_pixels=0,clear_expanded_consumes=0;
+    ProfileCounter constant_slot_allocations=0,constant_slot_reuses=0,constant_slot_unchanged=0;
+    ProfileCounter constant_slot_initial_avoided=0,constant_slot_reentry_push_bytes=0,constant_slot_fallbacks=0;
+    ProfileCounter constant_hits=0,constant_misses=0,constant_uncached=0,constant_copy_bytes=0,constant_avoided_bytes=0;
+    ProfileCounter constant_lookup_ns=0,constant_copy_ns=0,vertex_cache_ns=0;
+    ProfileCounter constant_initial_ns=0,constant_scan_ns=0,constant_push_ns=0;
+    ProfileCounter texture_set_hits=0,texture_set_misses=0,texture_set_ineligible=0;
+    ProfileCounter setup_hits=0,setup_misses=0,setup_state_misses=0,setup_target_misses=0,setup_shader_misses=0,setup_sign_misses=0;
+    ProfileCounter constant_version_checks=0,constant_version_skips=0,texture_dependency_misses=0;
+    ProfileCounter constant_group_checks=0,constant_group_skips=0,constant_revision_hits=0;
+    ProfileCounter constant_packed_copy_bytes=0,constant_partial_packs=0,constant_bulk_updates=0;
+    ProfileCounter system_generation_hits=0;
+    ProfileCounter constant_content_hashes=0,constant_content_hash_bytes=0;
+    ProfileCounter index_cpu_hits=0,index_cpu_misses=0,index_cpu_resets=0,index_cpu_lookup_ns=0;
+    ProfileCounter constant_generation_hits=0,constant_pack_ns=0,constant_packs=0,system_pack_reuses=0;
+    ProfileCounter constant_pack_bank_bytes=0,constant_pack_used_bytes=0;
+    ProfileCounter vertex_fast_hits=0,vertex_table_lookups=0,index_fast_hits=0,index_table_lookups=0;
+    ProfileCounter upload_cache_clear_ns=0;
+    ProfileCounter vertex_dynamic_windows=0,vertex_dynamic_window_saved=0,vertex_dynamic_copy_saved=0;
+    ProfileCounter vertex_epoch_lookup_ns=0,vertex_epoch_dynamic_hits=0,vertex_epoch_dynamic_bytes=0;
+    ProfileCounter range_write_ns=0;
+    ProfileCounter index_gpu_hits=0,index_gpu_misses=0,index_gpu_avoided_bytes=0,index_gpu_lookup_ns=0;
+    ProfileCounter constant_initial_bytes=0,constant_push_bytes=0,constant_push_commands=0,constant_delta_unchanged=0;
+    ProfileCounter constant_scan_extent_bytes=0,constant_scan_skipped_bytes=0,constant_narrow_scans=0;
+    ProfileCounter state_emitted=0,state_skipped=0,draw_full=0,draw_data_invalidations=0,draw_no_barrier=0;
+    ProfileCounter guest_samples[4]{},max_target_width=0,max_target_height=0;
+    ProfileCounter begin_ns=0,submit_ns=0,maintenance_ns=0,barriers=0;
+    ProfileCounter swap_prepare_ns=0,refresh_ns=0;
+    ProfileCounter queue_partial_sends=0,queue_final_sends=0,queue_empty_kicks=0;
+    ProfileCounter queue_slot_checks=0,queue_slot_blocked=0,queue_blocked_ns=0,queue_ready_ns=0;
+    ProfileCounter queue_reuse_age_ns=0,queue_wait_draws=0,queue_wait_pushes=0;
+    ProfileCounter queue_begin_cpu_ns=0,queue_begin_cpu_samples=0,ring_cpu_ns=0;
   } profile,reported_profile;
   QueueWorkState queue_work;
   struct SubmittedWork {uint64_t time=0,draws=0,pushes=0;};
@@ -503,7 +515,11 @@ struct Renderer::Impl {
   SpirvShaderTranslator::SystemConstants system_constants{};
   VkRect2D bound_scissor{};
   RendererStats& stats(){return owner->stats_;}
-  uint32_t HostMsaa(xenos::MsaaSamples) const {return 0;}
+  uint32_t scene_msaa = 0;
+  uint32_t HostMsaa(uint32_t pitch, uint32_t guest_msaa) const {
+    return (pitch == 1280 && guest_msaa && guest_msaa <= 2 && scene_msaa)
+               ? std::max(scene_msaa, guest_msaa) : 0;
+  }
   void SyncGuestMemory() {
     const uint64_t ownership=vertex_reuse_epoch.load(std::memory_order_acquire);
     if(ownership!=observed_vertex_reuse_epoch) {
@@ -540,9 +556,12 @@ struct Renderer::Impl {
       if(cpu_before && cpu_after>=cpu_before){profile.queue_begin_cpu_ns+=cpu_after-cpu_before;++profile.queue_begin_cpu_samples;}
       (ready?profile.queue_ready_ns:profile.queue_blocked_ns)+=core.NsEsperandoValla()-fence_before;
     }
-    queue_work.Begin();work_draw_begin=stats().draws;work_push_begin=profile.constant_push_commands;
+    queue_work.Begin();
+    if constexpr (kCollectRendererStats) {
+      work_draw_begin=stats().draws;work_push_begin=profile.constant_push_commands;
+    }
     command_state.Invalidate();draw_textures.Invalidate();draw_barriers.BeginWork();image_barriers.BeginWork();
-    gpu_profile.BeginWork(core,work,gpu_profile_enabled);
+    if constexpr (kCollectRendererStats) gpu_profile.BeginWork(core,work,gpu_profile_enabled);
     timer.Next(profile.maintenance_ns);
     textures->BeginWork(work);textures->BeginFrame(frame);TrimCaches();vertex_copies.Clear();
     { ProfileScope clear_timer(profile.upload_cache_clear_ns,cpu_profile_enabled);
@@ -698,10 +717,10 @@ struct Renderer::Impl {
   void Flush() {if(core.TrabajoAbierto()){
     DrainGeometryUploads();
     ProfileScope timer(profile.submit_ns,cpu_profile_enabled);
-    gpu_profile.EndWork(core,work,stats().draws-work_draw_begin);
+    if constexpr (kCollectRendererStats) gpu_profile.EndWork(core,work,stats().draws-work_draw_begin);
     if(cpu_profile_enabled)submitted_work[work%kWorkSlots]={ProfileClockNs(),stats().draws-work_draw_begin,profile.constant_push_commands-work_push_begin};
     core.TerminarTrabajo();++profile.queue_final_sends;
-    queue_work.Closed();++work;++stats().submissions;
+    queue_work.Closed();++work;if constexpr (kCollectRendererStats) ++stats().submissions;
   }}
   void Kick() {
     if(!core.TrabajoAbierto())return;
@@ -716,7 +735,7 @@ struct Renderer::Impl {
     // Preserve the former idle/work boundary's guest-memory validation. Only
     // immutable upload residency and ordered GPU state survive this send.
     validation_cache.Revalidate();
-    ++profile.queue_partial_sends;++stats().submissions;
+    ++profile.queue_partial_sends;if constexpr (kCollectRendererStats) ++stats().submissions;
   }
   void Barrier(){if(cpu_profile_enabled)++profile.barriers;dkCmdBufBarrier(core.comandos(),DkBarrier_Full,DkInvalidateFlags_Image|DkInvalidateFlags_Descriptors|DkInvalidateFlags_Shader|DkInvalidateFlags_Zcull);draw_barriers.FullBarrier();image_barriers.FullBarrier();}
   void ImageBarrier(ImageBarrierPolicy::Action action) {
@@ -760,7 +779,8 @@ struct Renderer::Impl {
   }
   void FinishProfileFrame();
   void TrimCaches();
-  CompiledShader* Compile(std::span<const uint32_t> words,ShaderStage stage);
+  CompiledShader* Compile(std::span<const uint32_t> words,ShaderStage stage,
+                          bool read_only_early_tests=false);
   CompiledShader* CompileText(std::string_view source,ShaderStage stage);
   bool LoadDksh(CompiledShader& shader,ShaderStage stage,std::vector<uint8_t>* saved_binary=nullptr);
   bool LoadShaderCode(CompiledShader& shader,std::span<const uint8_t> binary,const char* label);
@@ -777,30 +797,34 @@ struct Renderer::Impl {
   void MaterializeFrontbuffer();
   void BeforeImageWrite(Image&,bool discard_whole_color=false);
   bool DeferFrontbuffer(RenderTarget&,ResolveImage&,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,bool,bool);
-  bool CopyColor3D(Image&,Image&,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
-  void Copy(Image& from,Image& to,uint32_t sx,uint32_t sy,uint32_t dx,uint32_t dy,uint32_t width,uint32_t height);
+  bool CopyImage3D(Image&,Image&,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t);
+  bool Copy(Image& from,Image& to,uint32_t sx,uint32_t sy,uint32_t dx,uint32_t dy,uint32_t width,uint32_t height,
+            uint32_t first_sample=0,uint32_t sample_count=1);
   void UpdateSystemConstants(bool,const draw_util::ViewportInfo&,uint32_t,uint32_t,const SpirvShader*,const SpirvShader*);
   bool BuildDrawSetup(uint32_t initiator);
   bool GetFastClearRectangle(StencilClearRect&,bool);
+  bool ReadClearRectangle(const SpirvShader&,bool,uint32_t,StencilClearRect&);
   void MirrorClears();
   bool DrawOnce(const uint32_t*,uint32_t);
   void Draw(const uint32_t*,uint32_t);
   void Resolve();
-  bool DispatchDepthResolve(RenderTarget&, ResolveImage&, ResolveImage*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, bool);
+  bool DispatchDepthResolve(RenderTarget&, ResolveImage&, ResolveImage*, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, bool, uint32_t);
   std::optional<TextureResourceBinding> Texture(const SpirvShader::TextureBinding&,const SpirvShader::SamplerBinding&);
   Image* ResolveSample(uint32_t address,uint32_t width,uint32_t height);
   void Swap(rex::ui::Presenter*,uint32_t,uint32_t,uint32_t);
 };
 
-CompiledShader* Renderer::Impl::Compile(std::span<const uint32_t> words,ShaderStage stage) {
-  const uint64_t key=shader_cache::SpirvKey(words,stage,compiler_id);
+CompiledShader* Renderer::Impl::Compile(std::span<const uint32_t> words,ShaderStage stage,
+                                        bool read_only_early_tests) {
+  const auto& cache_id=read_only_early_tests ? read_only_compiler_id : compiler_id;
+  const uint64_t key=shader_cache::SpirvKey(words,stage,cache_id);
   if(auto it=compiled.find(key);it!=compiled.end())return it->second.get();
   auto result=std::make_unique<CompiledShader>();
   std::filesystem::path prepared_path;
   if(!prepared_cache_root.empty()) {
     prepared_path=prepared_cache_root/fmt::format("{:016X}.fshader",key);
     shader_cache::Entry entry;std::string error;
-    if(shader_cache::Load(prepared_path,key,stage,compiler_id,entry,error)) {
+    if(shader_cache::Load(prepared_path,key,stage,cache_id,entry,error)) {
       const bool valid_constants=std::all_of(entry.info.system_constant_copy_ranges.begin(),entry.info.system_constant_copy_ranges.end(),[](const auto& range) {
         return uint64_t(range.source_offset)+range.size<=sizeof(SpirvShaderTranslator::SystemConstants);
       });
@@ -821,16 +845,16 @@ CompiledShader* Renderer::Impl::Compile(std::span<const uint32_t> words,ShaderSt
       }
     }
   }
-  const auto convert_start=std::chrono::steady_clock::now();
-  result->info=ConvertSpirv(words,stage);
-  stats().shader_convert_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-convert_start).count();
+  ProfileScope shader_timer(stats().shader_convert_ns);
+  result->info=ConvertSpirv(words,stage,read_only_early_tests);
+  shader_timer.Stop();
   if(!result->info){REXLOG_ERROR("[deko] SPIRV conversion {:016X}: {}",key,result->info.error);return nullptr;}
   for(const auto& warning:result->info.warnings)REXLOG_WARN("[deko] shader {:016X}: {}",key,warning);
   std::vector<uint8_t> binary;
   if(!LoadDksh(*result,stage,&binary))return nullptr;
   if(!prepared_path.empty()) {
     shader_cache::Entry entry{result->info,std::move(binary)};std::string error;
-    if(!shader_cache::Save(prepared_path,key,stage,compiler_id,entry,error)) {
+    if(!shader_cache::Save(prepared_path,key,stage,cache_id,entry,error)) {
       ++stats().shader_cache_write_failures;
       if(stats().shader_cache_write_failures<=8)REXLOG_WARN("[deko-cache] cannot save prepared shader: {}",error);
     }
@@ -879,13 +903,17 @@ bool Renderer::Impl::LoadDksh(CompiledShader& shader,ShaderStage stage,std::vect
   }
   using E=rex::deko3d::Compilador::Etapa;
   E e=stage==ShaderStage::kVertex?E::kVertices:stage==ShaderStage::kGeometry?E::kGeometria:stage==ShaderStage::kCompute?E::kComputo:E::kFragmentos;
+#if !defined(FEAR_NX_DEKO_RETAIL)
   const auto compile_start=std::chrono::steady_clock::now();
+#endif
   auto binary=provider->compilador().Compilar(e,shader.info.source);
+#if !defined(FEAR_NX_DEKO_RETAIL)
   const auto elapsed=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-compile_start).count();
   ++stats().shader_compiles;stats().shader_compile_ns+=elapsed;
   if(stats().shader_compiles<=16||REXCVAR_GET(nx_native_trace_output)) {
     REXLOG_INFO("[deko-cache] UAM {} shader {:016X}: {:.1f} ms ({})",uint32_t(stage),key,double(elapsed)/1e6,warming_up?"warmup":"first use");
   }
+#endif
   if(!binary.ok||!LoadShaderCode(shader,binary.dksh,"FEAR shader")) {
     REXLOG_ERROR("[deko] DKSH compile {:016X}: {}",key,binary.log);return false;
   }
@@ -912,9 +940,9 @@ bool Renderer::Impl::LoadDksh(CompiledShader& shader,ShaderStage stage,std::vect
 bool Renderer::Impl::EnsureTranslated(SpirvShader::SpirvTranslation* t,bool* pending) {
   *pending=false;
   if(!t->is_translated()) {
-    const auto start=std::chrono::steady_clock::now();
+    ProfileScope shader_timer(stats().shader_translate_ns);
     const bool ok=translator->TranslateAnalyzedShader(*t);
-    stats().shader_translate_ns+=std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-start).count();
+    shader_timer.Stop();
     if(!ok||!t->is_valid())return false;
     ++stats().shaders_translated;
   }
@@ -944,7 +972,11 @@ CompiledShader* Renderer::Impl::CompileGeometry(GeometryShaderKey key) {
 Pipeline* Renderer::Impl::GetPipeline(const PipelineKey& key,SpirvShader::SpirvTranslation* vs,SpirvShader::SpirvTranslation* ps,CompiledShader* gs,uint64_t,bool* pending) {
   *pending=false;uint64_t hash=XXH3_64bits(&key,sizeof(key));
   if(auto it=pipelines.find(hash);it!=pipelines.end())return it->second.get();
-  auto compile=[&](SpirvShader::SpirvTranslation* t,ShaderStage s){auto& b=t->translated_binary();return Compile({reinterpret_cast<const uint32_t*>(b.data()),b.size()/4},s);};
+  auto compile=[&](SpirvShader::SpirvTranslation* t,ShaderStage s){
+    const auto& b=t->translated_binary();
+    return Compile({reinterpret_cast<const uint32_t*>(b.data()),b.size()/4},s,
+                   s==ShaderStage::kFragment && (t->modification() & kReadOnlyEarlyTests));
+  };
   auto p=std::make_unique<Pipeline>();p->key=key;p->gs=gs;
   p->vs=compile(vs,ShaderStage::kVertex);if(ps)p->ps=compile(ps,ShaderStage::kFragment);
   if(!p->vs||(ps&&!p->ps))return nullptr;
@@ -963,16 +995,23 @@ RenderTarget* Renderer::Impl::GetRenderTarget(const RenderTargetKey& requested,u
   // in registers for gamma, exponent bias and shader-sign specialization.
   if(!key.is_depth)key.format=uint32_t(format);
   height=std::min(rex::align(height,32u),2048u);
+  if(key.msaa)height=std::max(height,736u); // 720 visible rows, 32-row allocation granularity.
   auto found=render_targets.find(key);
   if(found!=render_targets.end()){found->second->last_frame=frame;found->second->guest_format=requested.format;if(found->second->height>=height)return found->second.get();}
   uint32_t flags=ColorImageFlags(NativeFormat(format),color_compression_enabled&&!key.is_depth);
-  auto image=textures->CreateImage(NativeFormat(format),key.pitch,height,DkImageType_2D,1,1,flags);
+  if(key.is_depth && format==VK_FORMAT_D24_UNORM_S8_UINT && depth_compression_enabled)
+    flags=DkImageFlags_UsageRender | DkImageFlags_HwCompression;
+  auto image=textures->CreateImage(NativeFormat(format),key.pitch,height,
+      key.msaa ? DkImageType_2DMS : DkImageType_2D,1,1,flags,DkMsMode(key.msaa));
   if(!image){retry=textures->NeedsFlushRetry();return nullptr;}
   const float zero[4]{};VkRect2D whole{{0,0},{key.pitch,height}};
   Clear(*image,bool(key.is_depth),0,0,0xFF,zero,whole);
   if(found!=render_targets.end()) {
     BeforeImageWrite(found->second->image);
-    Copy(found->second->image,*image,0,0,0,0,key.pitch,found->second->height);
+    if(!Copy(found->second->image,*image,0,0,0,0,key.pitch,found->second->height)) {
+      textures->FreeImage(*image);
+      return nullptr;
+    }
     textures->FreeImage(found->second->image);
     found->second->image=std::move(*image);found->second->height=height;found->second->guest_format=requested.format;++rt_generation;
     return found->second.get();
@@ -1034,7 +1073,8 @@ bool Renderer::Impl::DrawOnce(const uint32_t* immediate,uint32_t immediate_words
   phase.Next(profile.setup_ns);
   DrawSetupIdentity identity{owner->state_generation_,rt_generation,uintptr_t(active_vs),uintptr_t(active_ps),
       initiator.value&0xFFFFu,REXCVAR_GET(nx_native_depth24),REXCVAR_GET(half_pixel_offset)};
-  bool setup_hit=REXCVAR_GET(nx_native_state_cache) && setup_cached && identity==setup_identity;
+  bool setup_hit=REXCVAR_GET(nx_native_state_cache) && setup_cached &&
+                 !setup.extent_from_clear && identity==setup_identity;
   // Vertex fetches change constantly but cannot affect the pipeline. Only the
   // signedness of textures used by these shaders participates in its key.
   if(setup_hit && specialize_signs && setup.fetch_generation!=owner->fetch_generation_) {
@@ -1056,7 +1096,7 @@ bool Renderer::Impl::DrawOnce(const uint32_t* immediate,uint32_t immediate_words
     }
     if(setup.targets.depth)setup.targets.depth->last_frame=frame;
   } else {
-    ++profile.setup_misses;++stats().setups_built;
+    ++profile.setup_misses;if constexpr (kCollectRendererStats) ++stats().setups_built;
     if(identity.state!=setup_identity.state)++profile.setup_state_misses;
     if(identity.targets!=setup_identity.targets)++profile.setup_target_misses;
     if(identity.vs!=setup_identity.vs || identity.ps!=setup_identity.ps)++profile.setup_shader_misses;
@@ -1072,7 +1112,8 @@ bool Renderer::Impl::DrawOnce(const uint32_t* immediate,uint32_t immediate_words
     } else if(reason>=4&&messages[reason]++<4) {
       REXLOG_WARN("[deko] draw setup rejected (reason={})",reason);
     }
-    ++stats().draws_skipped;++stats().skipped_by_reason[setup.skip_reason&15];return true;
+    if constexpr (kCollectRendererStats) { ++stats().draws_skipped; ++stats().skipped_by_reason[setup.skip_reason&15]; }
+    return true;
   }
   phase.Next(profile.index_ns);
   auto& st=setup;auto& key=st.pipeline->key;
@@ -1718,7 +1759,7 @@ bool Renderer::Impl::DrawOnce(const uint32_t* immediate,uint32_t immediate_words
     texture_set=*previous;
     if(cpu_profile_enabled)++profile.texture_set_hits;
   } else {
-    ++stats().texture_bindings_built;
+    if constexpr (kCollectRendererStats) ++stats().texture_bindings_built;
     if(cpu_profile_enabled)++profile.texture_set_misses;
     uint32_t fetch_mask=0;bool eligible=texture_cache_enabled;
     SpirvShader* stage_shaders[]={st.vs,st.ps};CompiledShader* shaders_dk[]={st.pipeline->vs,st.pipeline->ps};
@@ -1782,7 +1823,8 @@ bool Renderer::Impl::DrawOnce(const uint32_t* immediate,uint32_t immediate_words
   for(uint32_t i=0;i<4;++i)if(auto* rt=st.targets.color[i]) {
     colors[i]=View(rt->image);color_ptrs[i]=&colors[i];color_count=i+1;
     width=std::min(width,rt->width);height=std::min(height,rt->height);textures->Touch(rt->image,work);
-    rt->last_draw_guest_msaa=uint32_t(r.Get<reg::RB_SURFACE_INFO>().msaa_samples);
+    rt->last_draw_guest_msaa = rt->key.pitch == 1280 ? rt->key.guest_msaa
+        : uint32_t(r.Get<reg::RB_SURFACE_INFO>().msaa_samples);
   }
   if(st.targets.depth){depth=View(st.targets.depth->image);width=std::min(width,st.targets.depth->width);height=std::min(height,st.targets.depth->height);textures->Touch(st.targets.depth->image,work);}
   std::array<const DkImage*,5> target_key{};
@@ -1818,11 +1860,18 @@ bool Renderer::Impl::DrawOnce(const uint32_t* immediate,uint32_t immediate_words
   raster.depthClampEnable=key.depth_clamp;raster.provokingVertex=DkProvokingVertex_First;
   raster.polygonModeFront=raster.polygonModeBack=key.polygon_line?DkPolygonMode_Line:DkPolygonMode_Fill;
   raster.depthBiasEnableMask=7;if(changed(S::Raster,raster))dkCmdBufBindRasterizerState(cmd,&raster);
-  DkMultisampleState ms{};dkMultisampleStateDefaults(&ms);if(changed(S::Multisample,ms))dkCmdBufBindMultisampleState(cmd,&ms);
+  const auto ms=SceneSampleState(key.samples);
+  if(changed(S::Multisample,ms))dkCmdBufBindMultisampleState(cmd,&ms);
   // Maxwell B197 SET_SAMPLE_MASK_X*_Y* (0xFBC..0xFC8) only accepts bits 15:0.
   // deko3d 0.5.0 forwards the mask unchanged; UINT32_MAX caused the physical
   // Switch run047 method error [b197:3ef]=0xffffffff. Keep all valid samples.
-  if(changed(S::SampleMask,uint32_t(0xFFFF)))dkCmdBufSetSampleMask(cmd,0xFFFFu);
+  uint32_t samples_enabled=0xFFFFu;
+  if(key.samples > 1) {
+    samples_enabled=r[rex::graphics::XE_GPU_REG_PA_SC_AA_MASK] & (key.samples==4 ? 15u : 3u);
+    if(key.samples==4 && r.Get<reg::RB_SURFACE_INFO>().msaa_samples==xenos::MsaaSamples::k2X)
+      samples_enabled=((samples_enabled&1u) ? 3u : 0u) | ((samples_enabled&2u) ? 12u : 0u);
+  }
+  if(changed(S::SampleMask,samples_enabled))dkCmdBufSetSampleMask(cmd,samples_enabled);
   DkDepthStencilState ds{};dkDepthStencilStateDefaults(&ds);
   ds.depthTestEnable=key.depth_test;ds.depthWriteEnable=key.depth_write;ds.depthCompareOp=DkCompareOp(key.depth_compare+1);ds.stencilTestEnable=key.stencil_test;
   ds.stencilFrontFailOp=DkStencilOp(key.stencil_front[0]+1);ds.stencilFrontPassOp=DkStencilOp(key.stencil_front[1]+1);ds.stencilFrontDepthFailOp=DkStencilOp(key.stencil_front[2]+1);ds.stencilFrontCompareOp=DkCompareOp(key.stencil_front[3]+1);
@@ -1861,11 +1910,11 @@ bool Renderer::Impl::DrawOnce(const uint32_t* immediate,uint32_t immediate_words
   // This may lose a repeated-clear hit, but can never reuse stale clear state.
   for(auto* rt:st.targets.color)if(rt)rt->image.pending_clear.Written(draw_area);
   if(st.targets.depth)st.targets.depth->image.pending_clear.Written(draw_area);
-  ++stats().draws;
+  if constexpr (kCollectRendererStats) ++stats().draws;
   if(cpu_profile_enabled) {
     ++profile.guest_samples[std::min(uint32_t(r.Get<reg::RB_SURFACE_INFO>().msaa_samples),3u)];
-    profile.max_target_width=std::max(profile.max_target_width,uint64_t(width));
-    profile.max_target_height=std::max(profile.max_target_height,uint64_t(height));
+    profile.max_target_width=std::max<uint64_t>(profile.max_target_width,uint64_t(width));
+    profile.max_target_height=std::max<uint64_t>(profile.max_target_height,uint64_t(height));
   }
   phase.Next(profile.mirror_ns);MirrorClears();return true;
 }
@@ -1875,7 +1924,7 @@ void Renderer::Impl::Draw(const uint32_t* indices,uint32_t words) {
   // slot's metadata after its fence and retry without a persistent prefix.
   // Shared prefixes additionally drain cross-slot readers in Begin().
   if(retry){Flush();transient_next_work=true;if(DrawOnce(indices,words))return;}
-  ++stats().draws_skipped;++stats().skipped_by_reason[retry?9:8];
+  if constexpr (kCollectRendererStats) { ++stats().draws_skipped; ++stats().skipped_by_reason[retry?9:8]; }
   static uint32_t messages=0;if(messages++<16)REXLOG_ERROR("[deko] draw rejected after complete resource validation (allocation_retry={})",retry);
 }
 
@@ -2008,8 +2057,10 @@ void Renderer::Impl::WarmupObservedShaders() {
     REXLOG_INFO("[deko-cache] startup warmup disabled; observed variants will still be recorded");
     return;
   }
+#if !defined(FEAR_NX_DEKO_RETAIL)
   const auto start=std::chrono::steady_clock::now();
   const auto previous=stats();
+#endif
   warming_up=true;
   std::vector<std::filesystem::path> files;
   std::error_code ec;
@@ -2043,7 +2094,8 @@ void Renderer::Impl::WarmupObservedShaders() {
     if(!EnsureTranslated(translation,&pending)) {++stats().shader_warmup_failed;continue;}
     const auto& binary=translation->translated_binary();
     const auto stage=entry.shader_type==shader_warmup::kVertexShader?ShaderStage::kVertex:ShaderStage::kFragment;
-    if(Compile({reinterpret_cast<const uint32_t*>(binary.data()),binary.size()/4},stage)) {
+    if(Compile({reinterpret_cast<const uint32_t*>(binary.data()),binary.size()/4},stage,
+               stage==ShaderStage::kFragment && (entry.modification & kReadOnlyEarlyTests))) {
       ++stats().shader_warmup_loaded;
       recorded_variants.emplace(entry.shader_hash,entry.modification);
     } else {++stats().shader_warmup_failed;}
@@ -2057,6 +2109,7 @@ void Renderer::Impl::WarmupObservedShaders() {
   if(!CompileText(kDepthResolveGlsl,ShaderStage::kCompute))++stats().shader_warmup_failed;
   if(!CompileText(kDepthFloatResolveGlsl,ShaderStage::kCompute))++stats().shader_warmup_failed;
   warming_up=false;
+#if !defined(FEAR_NX_DEKO_RETAIL)
   REXLOG_INFO("[deko-cache] warmup complete: {} ready, {} failed, {} prepared hits, {} DKSH hits, {} UAM compiles in {:.1f} ms",
       stats().shader_warmup_loaded-previous.shader_warmup_loaded,
       stats().shader_warmup_failed-previous.shader_warmup_failed,
@@ -2064,9 +2117,11 @@ void Renderer::Impl::WarmupObservedShaders() {
       stats().shader_dksh_hits-previous.shader_dksh_hits,
       stats().shader_compiles-previous.shader_compiles,
       double(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now()-start).count())/1000.0);
+#endif
 }
 
 void Renderer::Impl::FinishProfileFrame() {
+  if constexpr (!kCollectRendererStats) return;
   const uint64_t now=cpu_profile_enabled?ProfileClockNs():0;
   if(cpu_profile_enabled) {
     const uint64_t cpu=RingThreadCpuNs();
@@ -2098,12 +2153,18 @@ Renderer::Renderer():impl_(std::make_unique<Impl>()){impl_->owner=this;}
 Renderer::~Renderer(){Shutdown();}
 bool Renderer::Initialize(rex::deko3d::ProveedorDeko3d* provider,rex::memory::Memory* memory,RegisterFile* regs) {
   auto& p=*impl_;p.provider=provider;p.memory=memory;p.regs=regs;
+#if !defined(FEAR_NX_DEKO_RETAIL)
+  p.scene_msaa=REXCVAR_GET(nx_native_msaa) ? (REXCVAR_GET(nx_native_scene_samples)==4 ? 2u : 1u) : 0u;
+#endif
   p.zero_prefixes={};p.stream_cpu_base=nullptr;
   REXLOG_INFO("[deko-front] deferred frontbuffer v1: {}; exact color snapshot, crop-aware presentation, copy before conflicting access; compatible whole-clear exchange",
       REXCVAR_GET(nx_native_deferred_frontbuffer));
-  p.cpu_profile_enabled=REXCVAR_GET(nx_native_cpu_profile);
   p.color_compression_enabled=REXCVAR_GET(nx_native_color_compression);
+  p.depth_compression_enabled=REXCVAR_GET(nx_native_depth_compression);
+#if !defined(FEAR_NX_DEKO_RETAIL)
+  p.cpu_profile_enabled=REXCVAR_GET(nx_native_cpu_profile);
   p.gpu_profile_enabled=REXCVAR_GET(nx_native_gpu_profile);
+#endif
   p.geometry_push_upload=REXCVAR_GET(nx_native_geometry_push_upload);
   p.validation_cache.SetEnabled(REXCVAR_GET(nx_native_validation_cache));
   p.geometry_cache_enabled=REXCVAR_GET(nx_native_geometry_cache);
@@ -2129,7 +2190,11 @@ bool Renderer::Initialize(rex::deko3d::ProveedorDeko3d* provider,rex::memory::Me
     p.constant_memory_base={static_cast<uint8_t*>(dkMemBlockGetCpuAddr(p.constant_memory)),
         dkMemBlockGetGpuAddr(p.constant_memory)};
   }
-  p.textures->SetProfilingEnabled(p.cpu_profile_enabled);p.Begin();
+
+#if !defined(FEAR_NX_DEKO_RETAIL)
+  p.textures->SetProfilingEnabled(p.cpu_profile_enabled);
+#endif
+  p.Begin();
   if(!p.textures->Initialize())return false;
   SpirvShaderTranslator::Features features(false);features.spirv_version=0x10000;features.max_storage_buffer_range=512u<<20;
   features.full_draw_index_uint32=true;features.clip_distance=true;features.cull_distance=true;features.image_view_format_swizzle=true;
@@ -2171,9 +2236,11 @@ bool Renderer::Initialize(rex::deko3d::ProveedorDeko3d* provider,rex::memory::Me
   REXLOG_INFO("[deko-upload] constant slots v1: enabled {}, {} KiB protected per slot; fenced same-slot reuse, exact delta pushes; clear coalescing {}",
       REXCVAR_GET(nx_native_constant_slots),p.kConstantSlotBytes>>10,REXCVAR_GET(nx_native_clear_coalesce));
   REXLOG_INFO("[deko-opt] patch=059: grouped constant versions, selective packing, resident revision reuse, texture binding validation reuse, backlog command coalescing");
+#if !defined(FEAR_NX_DEKO_RETAIL)
   p.reported_profile=p.profile;p.reported_texture_profile=p.textures->GetProfile();
   p.reported_fence_ns=p.frame_fence_before=p.core.NsEsperandoValla();
   REXLOG_INFO("[deko-perf] phase profiling v1: CPU wall scopes {}, GPU timestamp sampling {}; per-frame means per guest swap; child timings overlap parents, GPU samples are not utilization",p.cpu_profile_enabled,p.gpu_profile_enabled);
+#endif
   REXLOG_INFO("[deko-shared] resources v1: geometry={} constants={} textures={}; one 256 MiB upload heap; fence-pinned 64-byte allocations; compatible layouts only",p.shared_geometry_enabled,p.shared_constants_enabled,REXCVAR_GET(nx_native_draw_texture_cache));
   REXLOG_INFO("[deko-cpu] NFSMW audit v1: geometry front tables {}; reflection-only constant snapshots; exact NEON comparisons; texture bucket mix with exact keys; frontbuffer unchanged",REXCVAR_GET(nx_native_geometry_fast_lookup));
   p.validation_cache.SetGeometryEpochChecks(REXCVAR_GET(nx_native_geometry_epoch_checks));
@@ -2246,9 +2313,11 @@ void Renderer::InitializeDriverCache(const std::filesystem::path& root,uint32_t 
 void Renderer::SetGammaRamp256(const uint32_t* entries){memcpy(impl_->gamma_ramp,entries,sizeof(impl_->gamma_ramp));}
 std::string Renderer::TakeTextureUploadReport(){return {};}
 
+#if !defined(FEAR_NX_DEKO_RETAIL)
 bool Renderer::CpuProfilingEnabled() const {return impl_->cpu_profile_enabled;}
+#endif
 void Renderer::InvalidateGuestMemory(GuestMemoryBoundary reason) {
-  impl_->guest_boundary_counts[size_t(reason)].fetch_add(1,std::memory_order_relaxed);
+  if constexpr (kCollectRendererStats) impl_->guest_boundary_counts[size_t(reason)].fetch_add(1,std::memory_order_relaxed);
   impl_->guest_memory_epoch.fetch_add(1,std::memory_order_release);
 }
 void Renderer::InvalidateVertexReuse() {
@@ -2259,6 +2328,7 @@ void Renderer::InvalidateExtentWrite(uint32_t address) {
   impl_->validation_cache.guest_writes().RecordExtent(address);
 }
 void Renderer::ReportProfile(uint64_t frames) {
+#if !defined(FEAR_NX_DEKO_RETAIL)
   auto& p=*impl_;frames=std::max(frames,uint64_t(1));
   p.profile.index_validation_candidates=p.index_validation.stats().candidates;
   p.profile.index_validation_hits=p.index_validation.stats().hits;
@@ -2561,6 +2631,7 @@ void Renderer::ReportProfile(uint64_t frames) {
       mib(a.zero_prefix_avoided_bytes,b.zero_prefix_avoided_bytes)*1024);
   p.reported_profile=a;p.reported_fence_ns=p.core.NsEsperandoValla();
   p.reported_gpu_ns=p.gpu_profile.gpu_ns;p.reported_gpu_samples=p.gpu_profile.gpu_submissions;p.reported_gpu_rejected=p.gpu_profile.rejected_samples;
+#endif
 }
 
 } // namespace fear_nx::deko

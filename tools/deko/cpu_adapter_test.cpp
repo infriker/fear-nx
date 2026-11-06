@@ -16,7 +16,10 @@ inline std::atomic<int>& ppc_global_lock_count_(){static std::atomic<int> n{0};r
 #include "cpu/fear_cpu_guest.h"
 namespace fear_nx::cpu {
 bool local_interrupts=true,fixed_flush=true,yield_backoff=true;
-thread_local Counters counters;
+#if !defined(FEAR_NX_DEKO_RETAIL)
+bool counters_enabled=false;
+#endif
+constinit thread_local Counters counters;
 void Publish(){counters={};}
 }
 struct FP {

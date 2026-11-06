@@ -9,6 +9,9 @@
 /local/
 /cache/
 *.nro
+!/builds/deko3d/fear_nx_deko3d.nro
+*.pgo
+*.gcda
 *.elf
 *.nacp
 *.xex

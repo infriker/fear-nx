@@ -9,7 +9,6 @@ void Renderer::Impl::UpdateSystemConstants(bool primitive_polygonal,
   auto pa_cl_vte_cntl = r.Get<reg::PA_CL_VTE_CNTL>();
   auto rb_colorcontrol = r.Get<reg::RB_COLORCONTROL>();
   auto rb_depth_info = r.Get<reg::RB_DEPTH_INFO>();
-  auto rb_surface_info = r.Get<reg::RB_SURFACE_INFO>();
   auto vgt_draw_initiator = r.Get<reg::VGT_DRAW_INITIATOR>();
   SpirvShaderTranslator::SystemConstants& sc = system_constants;
 
@@ -19,7 +18,7 @@ void Renderer::Impl::UpdateSystemConstants(bool primitive_polygonal,
   if (pa_cl_vte_cntl.vtx_w0_fmt) flags |= SpirvShaderTranslator::kSysFlag_WNotReciprocal;
   if (primitive_polygonal) flags |= SpirvShaderTranslator::kSysFlag_PrimitivePolygonal;
   if (draw_util::IsPrimitiveLine(r)) flags |= SpirvShaderTranslator::kSysFlag_PrimitiveLine;
-  flags |= HostMsaa(rb_surface_info.msaa_samples)
+  flags |= uint32_t(std::countr_zero(setup.pipeline->key.samples))
            << SpirvShaderTranslator::kSysFlag_MsaaSamples_Shift;
   if (rb_depth_info.depth_format == xenos::DepthRenderTargetFormat::kD24FS8) {
     flags |= SpirvShaderTranslator::kSysFlag_DepthFloat24;

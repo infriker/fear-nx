@@ -1,8 +1,8 @@
 # deko3d known issues
 
-- Current Switch testing reports **20–30 FPS with overclocking**, with frequent
-  drops. Vulkan in `main` is currently more stable. Clock values and matched
-  scene measurements are not available for that hardware report.
+- Switch FPS for the full-frame deko3d build still needs a matched hardware
+  run. The earlier October build reached 20–30 FPS with overclocking and
+  frequent drops. See the [test history](deko3d-history.md).
 - First use of an unknown shader variant can stall. Caches and PC preparation
   reduce repeated compilation, not the CPU and synchronization cost of a warmed scene.
 - Gameplay testing has not covered every mission and resource combination.
@@ -10,11 +10,6 @@
   and visible HUD; that report does not establish an out-of-memory diagnosis
   or a general fix. Preserve a reproducible save and relevant log when reporting.
 - Only the supported Xbox 360 executable is accepted; use title takeover mode.
-
-Vulkan's occasional incomplete/half-screen rendering and decal artifacts have
-unidentified triggers. Those reports are tracked in the
-[main branch](https://github.com/infriker/fear-nx/blob/main/docs/known-issues.md),
-not asserted to be the cause of every deko3d issue.
 
 Report the branch/build, console model, clocks, configuration, level/checkpoint
 and reproduction steps in a [GitHub issue](https://github.com/infriker/fear-nx/issues).

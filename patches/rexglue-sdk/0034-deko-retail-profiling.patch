@@ -1,0 +1,154 @@
+diff --git a/cmake/rexglue_switch.cmake b/cmake/rexglue_switch.cmake
+--- a/cmake/rexglue_switch.cmake
++++ b/cmake/rexglue_switch.cmake
+@@ -58,7 +58,6 @@
+         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/runtime_switch.cpp"
+         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_crash_hooks.c"
+         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_saltynx.cpp"
+-        "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_perf.cpp"
+         "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_apm.cpp")
+     if(REXGLUE_USE_VULKAN)
+         list(APPEND _switch_startup_sources
+@@ -68,18 +67,23 @@
+     if(REXGLUE_USE_DEKO3D)
+         target_compile_definitions(rexglue_switch_startup PRIVATE REXGLUE_USE_DEKO3D=1)
+     endif()
+-    # switch_perf.cpp registers every thread (the profiler needs their handles)
+-    # by wrapping libnx's threadCreate/threadClose, which pthread goes through.
+-    # It also counts the libnx calls that cost IPC or walk memory and the time
+-    # the calling threads spend inside them.
+-    target_link_options(rexglue_switch_startup INTERFACE
+-        "LINKER:--wrap=threadCreate,--wrap=threadClose"
+-        "LINKER:--wrap=armDCacheClean,--wrap=nwindowQueueBuffer,--wrap=bqDequeueBuffer"
+-        "LINKER:--wrap=svcSleepThread")
+-    if(REXGLUE_USE_VULKAN)
++    if(FEAR_NX_DEKO_RETAIL)
++        target_sources(rexglue_switch_startup PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_perf_disabled.cpp")
++    else()
++        target_sources(rexglue_switch_startup PRIVATE "${CMAKE_CURRENT_LIST_DIR}/../src/ui/switch_perf.cpp")
++        # switch_perf.cpp registers every thread (the profiler needs their handles)
++        # by wrapping libnx's threadCreate/threadClose, which pthread goes through.
++        # It also counts the libnx calls that cost IPC or walk memory and the time
++        # the calling threads spend inside them.
+         target_link_options(rexglue_switch_startup INTERFACE
+-            "LINKER:--wrap=nvFenceWait,--wrap=nvGpuChannelKickoff,--wrap=nvMapCreate"
+-            "LINKER:--wrap=nvAddressSpaceAllocFixed,--wrap=nvioctlNvhostAsGpu_MapBufferEx")
++            "LINKER:--wrap=threadCreate,--wrap=threadClose"
++            "LINKER:--wrap=armDCacheClean,--wrap=nwindowQueueBuffer,--wrap=bqDequeueBuffer"
++            "LINKER:--wrap=svcSleepThread")
++        if(REXGLUE_USE_VULKAN)
++            target_link_options(rexglue_switch_startup INTERFACE
++                "LINKER:--wrap=nvFenceWait,--wrap=nvGpuChannelKickoff,--wrap=nvMapCreate"
++                "LINKER:--wrap=nvAddressSpaceAllocFixed,--wrap=nvioctlNvhostAsGpu_MapBufferEx")
++        endif()
+     endif()
+     if(REXGLUE_USE_VULKAN AND REXGLUE_SWITCH_NVK_SOURCE)
+         target_sources(rexglue_switch_startup PRIVATE
+diff --git a/src/ui/switch_perf_disabled.cpp b/src/ui/switch_perf_disabled.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/ui/switch_perf_disabled.cpp
+@@ -0,0 +1,26 @@
++// SPDX-License-Identifier: BSD-3-Clause
++// Retail build: no sampler thread, timing wrappers, counters or A/B modes.
++// Retain the presentation heartbeat used by an external SaltyNX FPS overlay.
++#include <atomic>
++#include <cstdint>
++#include "rex/ui/switch_saltynx.h"
++namespace { std::atomic<uint32_t> resolution{0}; }
++extern "C" {
++void RexSwitchPerfScheduleAb(uint32_t) {}
++void RexSwitchPerfToggleAb() {}
++void RexSwitchPerfTiron(uint64_t, uint64_t) {}
++void RexSwitchPerfResolution(unsigned width, unsigned height) {
++  resolution.store(((width & 0xffff) << 16) | (height & 0xffff), std::memory_order_relaxed);
++}
++void RexSwitchPerfIntervaloSwap(unsigned) {}
++void RexSwitchPerfCount(unsigned id) {
++  if (id == 0) {
++    const auto size = resolution.load(std::memory_order_relaxed);
++    rex::ui::switch_saltynx::Latir(size >> 16, size & 0xffff);
++  }
++}
++void RexSwitchPerfAdd(unsigned, uint64_t) {}
++void RexSwitchPerfMax(unsigned, uint64_t) {}
++bool RexSwitchPerfSkip(unsigned) { return false; }
++void RexSwitchPerfSetThreadName(uint32_t, const char*) {}
++}
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -162,4 +162,6 @@
+     target_sources(rexcore PRIVATE perf/counter.cpp)
+     target_compile_definitions(rexcore PUBLIC
+         $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PERF_COUNTERS>)
++else()
++    target_sources(rexcore PRIVATE perf/counter_disabled.cpp)
+ endif()
+diff --git a/src/core/perf/counter_disabled.cpp b/src/core/perf/counter_disabled.cpp
+new file mode 100644
+--- /dev/null
++++ b/src/core/perf/counter_disabled.cpp
+@@ -0,0 +1,21 @@
++// SPDX-License-Identifier: BSD-3-Clause
++#include <rex/perf/counter.h>
++#include <rex/cvar.h>
++
++// Keep older configs and the draw-census fallback path compatible. This build
++// does not open a counter log or collect any values, regardless of this cvar.
++REXCVAR_DEFINE_STRING(perf_log_csv, "", "Perf",
++                     "Unused: performance counters are compiled out.");
++
++namespace rex::perf {
++const char* CounterName(CounterId) { return "disabled"; }
++void SetCounter(CounterId, int64_t) {}
++void IncrementCounter(CounterId, int64_t) {}
++int64_t GetCounter(CounterId) { return 0; }
++void ResetFrameCounters() {}
++int64_t GetSnapshotCounter(CounterId) { return 0; }
++void Init() {}
++void SetCsvLogPath(const std::string&) {}
++void WriteCsvFrame() {}
++void FlushCsv() {}
++}  // namespace rex::perf
+diff --git a/src/ui/deko3d/nucleo.cpp b/src/ui/deko3d/nucleo.cpp
+--- a/src/ui/deko3d/nucleo.cpp
++++ b/src/ui/deko3d/nucleo.cpp
+@@ -314,7 +314,9 @@
+   ranura_ = uint32_t(trabajo % config_.ranuras);
+   Ranura& r = ranuras_[ranura_];
+   if (r.vallada) {
++#if !defined(FEAR_NX_DEKO_RETAIL)
+     const uint64_t antes = AhoraNs();
++#endif
+     for (int espera = 1;; ++espera) {
+       if (dkFenceWait(&r.valla, 2'000'000'000ll) == DkResult_Success) {
+         break;
+@@ -324,7 +326,9 @@
+                static_cast<unsigned long long>(trabajo), ranura_, espera * 2);
+       VaciarRegistro();
+     }
++#if !defined(FEAR_NX_DEKO_RETAIL)
+     ns_esperando_valla_ += AhoraNs() - antes;
++#endif
+   }
+   for (const BloqueImagen& b : r.por_liberar) {
+     DevolverAlTrozo(trozos_[size_t(b.trozo)], b.offset, b.bytes);
+diff --git a/src/audio/switch/switch_audio_system.cpp b/src/audio/switch/switch_audio_system.cpp
+--- a/src/audio/switch/switch_audio_system.cpp
++++ b/src/audio/switch/switch_audio_system.cpp
+@@ -24,8 +24,14 @@
+ #include <switch.h>
+
+ // Passive counters: the audio thread neither writes reports nor pauses the game.
++#if defined(FEAR_NX_DEKO_RETAIL)
++// Inline empty calls so the mixer also loses the peak, clipping and PCM scans.
++static inline void RexSwitchPerfAdd(unsigned, u64) {}
++static inline void RexSwitchPerfMax(unsigned, u64) {}
++#else
+ extern "C" void RexSwitchPerfAdd(unsigned id, u64 value);
+ extern "C" void RexSwitchPerfMax(unsigned id, u64 value);
++#endif
+
+ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+ REXCVAR_DEFINE_BOOL(audio_switch_bomba, true, "Audio",

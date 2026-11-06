@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
+
+#include "deko_profile.h"
 #include <array>
 #include <bit>
 #include <cstddef>
@@ -18,7 +20,7 @@ class PreviousDrawTextures {
   static constexpr size_t kCapacity=Sets*Ways;
   using Shaders=std::array<uintptr_t,4>;
   using Stamp=std::array<uint64_t,8>;
-  struct Stats {uint64_t lookups=0,last_hits=0,indexed_hits=0,probes=0,plan_misses=0,evictions=0;};
+  struct Stats {ProfileCounter lookups=0,last_hits=0,indexed_hits=0,probes=0,plan_misses=0,evictions=0;};
   const Stats& stats() const {return stats_;}
   const Value* Find(const Shaders& shaders,const Stamp& stamp,const uint32_t* fetch) const {
     ++stats_.lookups;

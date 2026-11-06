@@ -38,6 +38,7 @@ struct Image {
   rex::deko3d::BloqueImagen allocation{};
   DkImageFormat format = DkImageFormat_None;
   DkImageType type = DkImageType_2D;
+  DkMsMode samples = DkMsMode_1x;
   uint32_t width = 0;
   uint32_t height = 0;
   uint32_t layers = 1;
@@ -104,7 +105,9 @@ class TextureCache {
   bool Initialize();
   void Shutdown();
 
+#if !defined(FEAR_NX_DEKO_RETAIL)
   void SetProfilingEnabled(bool enabled) { profiling_enabled_ = enabled; }
+#endif
   const TextureProfile& GetProfile() const { return profile_; }
   const TextureChecks::Stats& GetCheckStats() const { return texture_checks_.stats(); }
   uint64_t ImageGeneration() const { return image_generation_; }
@@ -133,7 +136,8 @@ class TextureCache {
   // Image helpers shared by render targets and resolve destinations.
   std::optional<Image> CreateImage(DkImageFormat format, uint32_t width, uint32_t height,
                                    DkImageType type = DkImageType_2D, uint32_t layers = 1,
-                                   uint32_t mip_levels = 1, uint32_t flags = 0);
+                                   uint32_t mip_levels = 1, uint32_t flags = 0,
+                                   DkMsMode samples = DkMsMode_1x);
   // Queues image memory and descriptors for retirement after current ordered
   // GPU work completes. The caller must stop recording later references first.
   void FreeImage(Image& image);
@@ -162,7 +166,8 @@ class TextureCache {
   // Cached sampler descriptor for a fetch-constant/sampler declaration pair.
   std::optional<uint32_t> GetSampler(
       const rex::graphics::xenos::xe_gpu_texture_fetch_t& fetch,
-      const rex::graphics::SpirvShader::SamplerBinding& binding, bool force_point = false);
+      const rex::graphics::SpirvShader::SamplerBinding& binding, bool force_point = false,
+      uint32_t sampling_min_mip = 0);
 
  private:
   struct Texture;
@@ -192,6 +197,8 @@ class TextureCache {
   void RetireDescriptor(uint32_t slot);
 
   rex::deko3d::Nucleo& nucleo_;
+  float max_anisotropy_ = 2.0f;
+  uint32_t texture_min_mip_ = 1;
   rex::memory::Memory* memory_;
   ValidationCache& validation_cache_;
   uint64_t work_ = 0;
@@ -199,7 +206,11 @@ class TextureCache {
   uint64_t last_aged_frame_ = UINT64_MAX;
   uint64_t cached_texture_bytes_ = 0;
   bool needs_flush_retry_ = false;
+#if defined(FEAR_NX_DEKO_RETAIL)
+  static constexpr bool profiling_enabled_ = false;
+#else
   bool profiling_enabled_ = true;
+#endif
   TextureProfile profile_{};
   TextureChecks texture_checks_;
   uint32_t next_image_slot_ = 3;

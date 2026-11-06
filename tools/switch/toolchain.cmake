@@ -44,6 +44,19 @@ endif()
 file(READ "${_p8_specs}" _p8_specs_text)
 string(REPLACE "%:getenv(DEVKITPRO /libnx/switch.ld)"
     "${DEVKITPRO}/libnx/switch.ld" _p8_specs_text "${_p8_specs_text}")
+if(FEAR_PGO STREQUAL "generate")
+    file(READ "${DEVKITPRO}/libnx/switch.ld" _fear_ld)
+    set(_fear_data "*(.data .data.* .gnu.linkonce.d.*)")
+    string(FIND "${_fear_ld}" "${_fear_data}" _fear_data_pos)
+    if(_fear_data_pos LESS 0)
+        message(FATAL_ERROR "Unsupported libnx data layout for the PGO recorder")
+    endif()
+    string(REPLACE "${_fear_data}"
+        "${_fear_data}\n. = ALIGN(8); PROVIDE_HIDDEN(__fear_gcov_begin = .); KEEP(*(.gcov_info)) PROVIDE_HIDDEN(__fear_gcov_end = .);"
+        _fear_ld "${_fear_ld}")
+    file(WRITE "${CMAKE_BINARY_DIR}/switch-pgo.ld" "${_fear_ld}")
+    string(REPLACE "${DEVKITPRO}/libnx/switch.ld" "${CMAKE_BINARY_DIR}/switch-pgo.ld" _p8_specs_text "${_p8_specs_text}")
+endif()
 file(WRITE "${CMAKE_BINARY_DIR}/switch.specs" "${_p8_specs_text}")
 set(CMAKE_EXE_LINKER_FLAGS_INIT
     "-specs=${CMAKE_BINARY_DIR}/switch.specs -Wl,--gc-sections -Wl,--allow-multiple-definition -Wl,--no-relax")

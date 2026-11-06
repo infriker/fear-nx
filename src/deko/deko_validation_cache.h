@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
+#include "deko_profile.h"
+
 // Keep XXH3's short-range implementation inline. Vertex buffers are commonly
 // fingerprinted as many independent cache lines, where an out-of-line call
 // per line costs more than the hash itself.
@@ -47,28 +49,28 @@ class ValidationCache {
   };
 
   struct Stats {
-    uint64_t lookups = 0;
-    uint64_t hits = 0;
-    uint64_t full_checks = 0;
-    uint64_t full_bytes = 0;
-    uint64_t sample_bytes = 0;
-    uint64_t sample_changes = 0;
+    ProfileCounter lookups = 0;
+    ProfileCounter hits = 0;
+    ProfileCounter full_checks = 0;
+    ProfileCounter full_bytes = 0;
+    ProfileCounter sample_bytes = 0;
+    ProfileCounter sample_changes = 0;
     uint64_t guard_checks = 0;
     uint64_t guard_misses = 0;
-    uint64_t invalidations = 0;
-    uint64_t sampled_checks = 0;
+    ProfileCounter invalidations = 0;
+    ProfileCounter sampled_checks = 0;
     uint64_t training_remaining = kGuardChecks;
     bool sampling_disabled = false;
     uint64_t quarantined_ranges = 0;
-    uint64_t strict_lookups = 0;
-    uint64_t strict_bytes = 0;
-    uint64_t quarantine_overflows = 0;
-    uint64_t epoch_hits = 0;
-    uint64_t volatile_bypasses = 0;
-    uint64_t volatile_full_bytes = 0;
-    uint64_t volatile_exact_checks = 0;
-    uint64_t texture_deferred = 0;
-    uint64_t strict_epoch_hits=0,volatile_unhashed_calls=0,volatile_unhashed_bytes=0;
+    ProfileCounter strict_lookups = 0;
+    ProfileCounter strict_bytes = 0;
+    ProfileCounter quarantine_overflows = 0;
+    ProfileCounter epoch_hits = 0;
+    ProfileCounter volatile_bypasses = 0;
+    ProfileCounter volatile_full_bytes = 0;
+    ProfileCounter volatile_exact_checks = 0;
+    ProfileCounter texture_deferred = 0;
+    ProfileCounter strict_epoch_hits=0,volatile_unhashed_calls=0,volatile_unhashed_bytes=0;
   };
 
   void SetEnabled(bool enabled) {

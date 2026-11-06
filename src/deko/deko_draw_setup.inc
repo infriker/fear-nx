@@ -146,6 +146,14 @@ bool Renderer::Impl::BuildDrawSetup(uint32_t initiator_value) {
       ps_mod.pixel.depth_stencil_mode = DepthStencilMode::kEarlyHint;
     } else {
       ps_mod.pixel.depth_stencil_mode = DepthStencilMode::kNoModifiers;
+      // A discarded fragment may still update writable depth or stencil with
+      // early tests. Restrict this second path to side-effect-free tests and
+      // preserve all guest alpha comparisons, coverage and shader discards.
+      if (color_mask && depth_control.z_enable && !depth_control.z_write_enable &&
+          !ps->writes_depth() && !depth_control.stencil_enable &&
+          !(r.Get<reg::RB_COLORCONTROL>().alpha_to_mask_enable)) {
+        ps_mod.value |= kReadOnlyEarlyTests;
+      }
     }
   }
   auto* vs_translation =
@@ -168,10 +176,28 @@ bool Renderer::Impl::BuildDrawSetup(uint32_t initiator_value) {
   // if it is tested or written.
   bool depth_used = depth_control.z_enable || depth_control.stencil_enable;
   // The guest's sample count sizes the EDRAM below; the host's keys the targets.
-  uint32_t guest_msaa = uint32_t(surface_info.msaa_samples);
-  uint32_t msaa = HostMsaa(surface_info.msaa_samples);
+  // The XDK paints its 1280x720 2x surface through a 640-wide 4x
+  // rectangle view of the same color/depth banks. In both views a row
+  // has 1280 physical samples, but each pixel in the clear spans two
+  // scene pixels in X. Bind the scene images so depth, stencil and color
+  // writes, including masked clears, affect the subsequent world draw.
+  const bool scene_clear_view =
+      surface_info.surface_pitch == 640 && uint32_t(surface_info.msaa_samples) == 2 &&
+      vs->ucode_data_hash() == 0x0A6D1DD7767FDF27ULL &&
+      initiator.prim_type == xenos::PrimitiveType::kRectangleList &&
+      initiator.source_select == xenos::SourceSelect::kAutoIndex && initiator.num_indices == 3 &&
+      r.Get<reg::PA_CL_CLIP_CNTL>().clip_disable &&
+      r.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[0]).color_base == 0 && r.Get<reg::RB_DEPTH_INFO>().depth_base == 1024;
+  const uint32_t target_pitch = scene_clear_view ? 1280u : uint32_t(surface_info.surface_pitch);
+  st.double_clear_x = scene_clear_view;
+  const uint32_t guest_msaa = scene_clear_view ? 1u : uint32_t(surface_info.msaa_samples);
+  uint32_t msaa = HostMsaa(target_pitch, guest_msaa);
   draw_util::GetScissor(r, st.scissor);
-  draw_util::GetHostViewportInfo(r, 1, 1, false, properties.maxViewportDimensions[0],
+  if (scene_clear_view) {
+    st.scissor.offset[0] *= 2;
+    st.scissor.extent[0] *= 2;
+  }
+  draw_util::GetHostViewportInfo(r, scene_clear_view ? 2u : 1u, 1, false, properties.maxViewportDimensions[0],
                                  properties.maxViewportDimensions[1], true, depth_control, false,
                                  true, ps && ps->writes_depth(), st.viewport);
   // Rows the draw can touch: the viewport, cut by the scissor. The scissor
@@ -182,38 +208,64 @@ bool Renderer::Impl::BuildDrawSetup(uint32_t initiator_value) {
         std::min(needed_height, st.viewport.xy_offset[1] + st.viewport.xy_extent[1]);
   }
   PassTargets& targets = st.targets;
+  // XDK clears have an 8192-high scissor even on 512-high reflection
+  // targets. Size these images from the verified corners; later draws can
+  // grow the target while retaining its contents. The stream may change
+  // in place, so this particular draw always rechecks its vertices.
+  if (vs->ucode_data_hash() == 0x0A6D1DD7767FDF27ULL &&
+      initiator.prim_type == xenos::PrimitiveType::kRectangleList &&
+      initiator.source_select == xenos::SourceSelect::kAutoIndex &&
+      initiator.num_indices == 3 && pa_cl_clip_cntl.clip_disable) {
+    StencilClearRect rect{};
+    if (ReadClearRectangle(*vs, false, scene_clear_view ? 2u : 1u, rect) && rect.y1 > 0) {
+      needed_height = std::min(needed_height, uint32_t(rect.y1));
+      st.extent_from_clear = true;
+    }
+  }
+  // The main color/depth pair uses fixed EDRAM bases 0 and 1024. The guest
+  // creates full-width surfaces for these bases in sub_82292900. deko3d has
+  // separate image storage, so the Xbox row limit need not clip the scene.
+  const auto target_height = [&](uint32_t base, uint32_t rows) {
+    if (target_pitch == 1280 && (guest_msaa == 1 || guest_msaa == 2) &&
+        (base == 0 || base == 1024)) {
+      rows = std::max(rows, 720u);
+    }
+    return std::min(needed_height, rows);
+  };
   for (uint32_t i = 0; i < 4; ++i) {
     if (!((color_mask >> (4 * i)) & 0xF)) continue;
     auto color_info = r.Get<reg::RB_COLOR_INFO>(reg::RB_COLOR_INFO::rt_register_indices[i]);
     RenderTargetKey key = {};
     key.base_tiles = color_info.color_base;
-    key.pitch = surface_info.surface_pitch;
+    key.pitch = target_pitch;
     key.format = uint32_t(color_info.color_format);
     key.msaa = msaa;
-    key.guest_msaa = 0;
+    // A full-width multisampled scene and the single-sample HUD have the same
+    // EDRAM base and pitch. Their sample layouts describe different surfaces.
+    key.guest_msaa = key.pitch == 1280 ? guest_msaa : 0;
     // The EDRAM below the base limits how tall the target can be.
-    uint32_t pitch_tiles = (surface_info.surface_pitch * (guest_msaa >= 2 ? 2 : 1) + 79) / 80 *
+    uint32_t pitch_tiles = (target_pitch * (guest_msaa >= 2 ? 2 : 1) + 79) / 80 *
                            (IsColorFormat64bpp(color_info.color_format) ? 2 : 1);
     uint32_t rows = pitch_tiles ? (2048 - std::min(key.base_tiles, 2047u)) / pitch_tiles *
                                       (guest_msaa >= 1 ? 8 : 16)
                                 : 2048;
-    targets.color[i] = GetRenderTarget(key, std::min(needed_height, rows));
+    targets.color[i] = GetRenderTarget(key, target_height(key.base_tiles, rows));
     if (!targets.color[i]) return fail(7);
   }
   if (depth_used) {
     auto depth_info = r.Get<reg::RB_DEPTH_INFO>();
     RenderTargetKey key = {};
     key.base_tiles = depth_info.depth_base;
-    key.pitch = surface_info.surface_pitch;
+    key.pitch = target_pitch;
     key.format = uint32_t(depth_info.depth_format);
     key.msaa = msaa;
-    key.guest_msaa = uint32_t(surface_info.msaa_samples);
+    key.guest_msaa = guest_msaa;
     key.is_depth = 1;
-    uint32_t pitch_tiles = (surface_info.surface_pitch * (guest_msaa >= 2 ? 2 : 1) + 79) / 80;
+    uint32_t pitch_tiles = (target_pitch * (guest_msaa >= 2 ? 2 : 1) + 79) / 80;
     uint32_t rows = pitch_tiles ? (2048 - std::min(key.base_tiles, 2047u)) / pitch_tiles *
                                       (guest_msaa >= 1 ? 8 : 16)
                                 : 2048;
-    targets.depth = GetRenderTarget(key, std::min(needed_height, rows));
+    targets.depth = GetRenderTarget(key, target_height(key.base_tiles, rows));
     if (!targets.depth) return fail(7);
   }
   // Creating a render target above bumped rt_generation; this setup is built
