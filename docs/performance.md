@@ -1,5 +1,14 @@
 # Vulkan performance and change history
 
+## Vulkan GPU changes in v0.2.1
+
+- The renderer can reuse a full 1280×720 depth texture when only stencil has
+  changed since the previous conversion. A depth write or clear forces a fresh
+  conversion. Effects that read both depth and stencil still get both values.
+- When all vertex streams used for a stencil shadow use the same byte order,
+  the vertex shader handles that order directly. This saves GPU instructions
+  on shadow geometry. Mixed byte orders use the general shader.
+
 ## Switch performance in v0.2.0
 
 These figures were observed on a physical Nintendo Switch running the Vulkan

@@ -543,10 +543,19 @@ index 2cf24c4ce468c837d3106fed49e6fe0c6754c8ea..b644401f9018a7c0a446c738059403ba
 +
 +}  // namespace rex::graphics::native_telemetry
 diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
-index dce3dbfee110954fc89f9df28d5a0b31c8a04f68..54e3eb1a44ca75abc26d91ad89d070562cad4531 100644
+index dce3dbfee110954fc89f9df28d5a0b31c8a04f68..50add34225c3aa50a936b62a43b3efae5dc7bf12 100644
 --- a/include/rex/graphics/pipeline/shader/spirv_translator.h
 +++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
-@@ -881,6 +881,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
+@@ -70,6 +70,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
+       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
+       // For domain host vertex shader types only, xenos::TessellationMode.
+       uint32_t tessellation_mode : 2;
++      // Zero uses the descriptor, otherwise 1 + xenos::Endian for every vertex fetch.
++      uint32_t fixed_fetch_endian : 3;
+     } vertex;
+     struct PixelShaderModification {
+       // uint32_t 0.
+@@ -881,6 +883,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
      kSystemConstantEdramBlendConstant,
    };
    spv::Id uniform_system_constants_;
@@ -10648,7 +10657,7 @@ index 1774f9703037ff340cd44cc86a693a835fc12e1c..983d0bed66fb7aacc2f1da14dee88349
    builder_ = std::make_unique<SpirvBuilder>(features_.spirv_version, (kSpirvMagicToolId << 16) | 1,
                                              nullptr);
 diff --git a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
-index 9ce3bb4ad0c3d61c8880195fb3c96f666068d89b..eab973fde942f32a47fc745fd9c7c77b68277071 100644
+index 9ce3bb4ad0c3d61c8880195fb3c96f666068d89b..22cb6e65b2f144ffbb4ab26089be9c0a460aa493 100644
 --- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
 +++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
 @@ -22,6 +22,10 @@
@@ -10662,7 +10671,51 @@ index 9ce3bb4ad0c3d61c8880195fb3c96f666068d89b..eab973fde942f32a47fc745fd9c7c77b
  namespace rex::graphics {
  
  void SpirvShaderTranslator::ProcessVertexFetchInstruction(
-@@ -1288,17 +1292,35 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+@@ -140,21 +144,28 @@ void SpirvShaderTranslator::ProcessVertexFetchInstruction(
+ 
+   // Endian swap the words, getting the endianness from bits 0:1 of the second
+   // fetch constant word.
+-  uint32_t fetch_constant_word_1_index = fetch_constant_word_0_index + 1;
+-  id_vector_temp_.clear();
+-  // The only element of the fetch constant buffer.
+-  id_vector_temp_.push_back(const_int_0_);
+-  // Vector index.
+-  id_vector_temp_.push_back(builder_->makeIntConstant(int(fetch_constant_word_1_index >> 2)));
+-  // Component index.
+-  id_vector_temp_.push_back(builder_->makeIntConstant(int(fetch_constant_word_1_index & 3)));
+-  spv::Id fetch_constant_word_1 =
+-      builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+-                                                       uniform_fetch_constants_, id_vector_temp_),
+-                           spv::NoPrecision);
+-  words = EndianSwap32Uint(
+-      words, builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, fetch_constant_word_1,
+-                                   builder_->makeUintConstant(0b11)));
++  const uint32_t fixed_fetch_endian =
++      is_vertex_shader() ? GetSpirvShaderModification().vertex.fixed_fetch_endian : 0;
++  spv::Id endian;
++  if (fixed_fetch_endian) {
++    endian = builder_->makeUintConstant(fixed_fetch_endian - 1);
++  } else {
++    uint32_t fetch_constant_word_1_index = fetch_constant_word_0_index + 1;
++    id_vector_temp_.clear();
++    // The only element of the fetch constant buffer.
++    id_vector_temp_.push_back(const_int_0_);
++    // Vector index.
++    id_vector_temp_.push_back(builder_->makeIntConstant(int(fetch_constant_word_1_index >> 2)));
++    // Component index.
++    id_vector_temp_.push_back(builder_->makeIntConstant(int(fetch_constant_word_1_index & 3)));
++    spv::Id fetch_constant_word_1 =
++        builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
++                                                         uniform_fetch_constants_, id_vector_temp_),
++                             spv::NoPrecision);
++    endian = builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, fetch_constant_word_1,
++                                   builder_->makeUintConstant(0b11));
++  }
++  if (fixed_fetch_endian != 1) words = EndianSwap32Uint(words, endian);
+ 
+   spv::Id result = spv::NoResult;
+ 
+@@ -1288,17 +1299,35 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
          }
        }
  
@@ -10706,7 +10759,7 @@ index 9ce3bb4ad0c3d61c8880195fb3c96f666068d89b..eab973fde942f32a47fc745fd9c7c77b
        uint32_t swizzled_signs_word_offset = 8 * (fetch_constant_index & 3);
  
        spv::Builder::TextureParameters texture_parameters = {};
-@@ -1454,7 +1476,19 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+@@ -1454,7 +1483,19 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
          // k2D.
          // 3D vectors for k3DOrStacked, kCube.
          spv::Id gradients_h = spv::NoResult, gradients_v = spv::NoResult;
@@ -10727,7 +10780,7 @@ index 9ce3bb4ad0c3d61c8880195fb3c96f666068d89b..eab973fde942f32a47fc745fd9c7c77b
            // TODO(Triang3l): Gradient exponent adjustment is currently not done
            // in getCompTexLOD, so not doing it here too for now. Apply the
            // gradient exponent biases from the word 4 of the fetch constant in
-@@ -1615,9 +1649,13 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+@@ -1615,9 +1656,13 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
  
          // Sample the texture.
          spv::ImageOperandsMask image_operands_mask =
@@ -10743,7 +10796,7 @@ index 9ce3bb4ad0c3d61c8880195fb3c96f666068d89b..eab973fde942f32a47fc745fd9c7c77b
            texture_parameters.lod = lod;
          }
          if (instr.dimension == xenos::FetchOpDimension::k3DOrStacked) {
-@@ -1837,7 +1875,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
+@@ -1837,7 +1882,7 @@ void SpirvShaderTranslator::ProcessTextureFetchInstruction(
            sample_result_signed =
                if_data_is_3d.createMergePhi(sample_result_signed_3d, sample_result_signed_stacked);
          } else {

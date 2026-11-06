@@ -31,6 +31,8 @@ native_async_pipelines = true
 native_record_thread = false
 native_fused_gamma = true
 native_zcull = true
+# Use the known vertex byte order when drawing stencil shadows.
+native_shadow_vertex_fetch = true
 native_precise_resolve_barriers = true
 native_full_clear_load_op = true
 renderer = "native"

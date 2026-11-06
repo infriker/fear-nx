@@ -33,7 +33,7 @@ git -C third_party/rexglue-sdk write-tree
 git -C third_party/rexglue-sdk submodule status --recursive
 ```
 
-`write-tree` must print `c7fb3c0f1a588b268115bf0dceb24f0c26eb1ae0`.
+`write-tree` must match `patched_tree` in `patches/native-vulkan/manifest.json`.
 Compare the submodule paths and commit IDs with `recursive_submodules` in
 `patches/native-vulkan/manifest.json`. A `-`, `+` or `U` status prefix indicates
 an uninitialized, mismatched or conflicted submodule; resolve it before building.

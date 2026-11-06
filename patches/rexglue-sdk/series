@@ -22,3 +22,4 @@
 0022-compact-shadow-arena.patch
 0023-cvar-escape-saved-strings.patch
 0024-switch-diagnostics-opt-in.patch
+0025-shadow-vertex-fetch.patch

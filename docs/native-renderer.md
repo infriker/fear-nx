@@ -35,6 +35,7 @@ These keys belong under `[nx]` in `fear-nx.toml`:
 | `native_record_thread` | `false` | Keep command recording on the current path |
 | `native_fused_gamma` | `true` | Apply gamma in the final output shader for supported frontbuffers |
 | `native_zcull` | `true` | Allocate depth attachments eligible for persistent NVK ZCULL |
+| `native_shadow_vertex_fetch` | `true` | Specialize vertex reads for stencil shadows when all active streams use the same byte order |
 | `native_precise_resolve_barriers` | `true` | Omit a redundant transfer wait on compute resolve/crop paths |
 | `native_full_clear_load_op` | `true` | Clear a fully covered render area at attachment load |
 | `native_gpu_profile` | `false` | Reserved for compatibility. The release omits per-pass timers |

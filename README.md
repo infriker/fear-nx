@@ -5,11 +5,11 @@ The game's PowerPC code is statically recompiled to AArch64 with
 [ReXGlue](https://github.com/rexglue/rexglue-sdk). A native Vulkan renderer draws
 the game through Mesa/NVK on Horizon.
 
-The original menu and campaign are playable. Version **0.2.0** renders the
-720p scene once and fixes the half-screen image during level loading. On Switch
-at 1020 MHz CPU and 460 MHz GPU, gameplay typically runs at **30 FPS**, with
-drops to **25 FPS** in heavy firefights. The CPU is now the main limit.
-See [performance by clock setting](docs/performance.md#switch-performance-in-v020).
+The original menu and campaign are playable. Version **0.2.1** reduces GPU work
+in stencil shadows and skips repeat conversions of an unchanged 720p depth
+buffer. On Switch, v0.2.0 typically ran at **30 FPS** at 1020 MHz CPU and
+460 MHz GPU, with drops to **25 FPS** in heavy firefights, where CPU speed
+was the main limit. See [performance by clock setting](docs/performance.md#switch-performance-in-v020).
 
 **Branches:** `main` contains the Vulkan/Mesa renderer. The separate
 [`deko3d` branch](https://github.com/infriker/fear-nx/tree/deko3d) contains the
@@ -82,7 +82,7 @@ Switch profiler and disable ReXGlue debug/console shortcuts. Settings
 
 ## Settings and performance
 
-Version 0.2.0 builds the main 1280×720 scene as one full frame. The Vulkan
+Vulkan renders the main 1280×720 scene as one full frame. The
 renderer uses single-sample targets and skips dynamic planar reflections.
 The translated game code uses direct calls, link-time optimization (LTO) and
 profile-guided optimization (PGO) from a Switch gameplay session.
@@ -93,7 +93,7 @@ profile-guided optimization (PGO) from a Switch gameplay session.
 | 1224 MHz | 460 MHz | — | Usually holds 30 FPS, with rare drops to 25 FPS in heavy firefights. |
 | 1428 MHz | 614 MHz | At least 1800 MHz | Stable 30 FPS in tested gameplay, including heavy firefights. |
 
-Clock settings are from on-device tests. RAM frequency was reported only for
+Clock settings are from on-device tests of v0.2.0. RAM frequency was reported only for
 the last configuration. The port leaves clock selection to the system or the
 player's clock tool. See the [performance notes](docs/performance.md).
 

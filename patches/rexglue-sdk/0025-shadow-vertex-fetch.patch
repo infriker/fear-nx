@@ -1,0 +1,57 @@
+--- a/include/rex/graphics/pipeline/shader/spirv_translator.h
++++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
+@@ -70,6 +70,8 @@
+       Shader::HostVertexShaderType host_vertex_shader_type : Shader::kHostVertexShaderTypeBitCount;
+       // For domain host vertex shader types only, xenos::TessellationMode.
+       uint32_t tessellation_mode : 2;
++      // Zero uses the descriptor, otherwise 1 + xenos::Endian for every vertex fetch.
++      uint32_t fixed_fetch_endian : 3;
+     } vertex;
+     struct PixelShaderModification {
+       // uint32_t 0.
+--- a/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_fetch.cpp
+@@ -144,21 +144,28 @@
+ 
+   // Endian swap the words, getting the endianness from bits 0:1 of the second
+   // fetch constant word.
+-  uint32_t fetch_constant_word_1_index = fetch_constant_word_0_index + 1;
+-  id_vector_temp_.clear();
+-  // The only element of the fetch constant buffer.
+-  id_vector_temp_.push_back(const_int_0_);
+-  // Vector index.
+-  id_vector_temp_.push_back(builder_->makeIntConstant(int(fetch_constant_word_1_index >> 2)));
+-  // Component index.
+-  id_vector_temp_.push_back(builder_->makeIntConstant(int(fetch_constant_word_1_index & 3)));
+-  spv::Id fetch_constant_word_1 =
+-      builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
+-                                                       uniform_fetch_constants_, id_vector_temp_),
+-                           spv::NoPrecision);
+-  words = EndianSwap32Uint(
+-      words, builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, fetch_constant_word_1,
+-                                   builder_->makeUintConstant(0b11)));
++  const uint32_t fixed_fetch_endian =
++      is_vertex_shader() ? GetSpirvShaderModification().vertex.fixed_fetch_endian : 0;
++  spv::Id endian;
++  if (fixed_fetch_endian) {
++    endian = builder_->makeUintConstant(fixed_fetch_endian - 1);
++  } else {
++    uint32_t fetch_constant_word_1_index = fetch_constant_word_0_index + 1;
++    id_vector_temp_.clear();
++    // The only element of the fetch constant buffer.
++    id_vector_temp_.push_back(const_int_0_);
++    // Vector index.
++    id_vector_temp_.push_back(builder_->makeIntConstant(int(fetch_constant_word_1_index >> 2)));
++    // Component index.
++    id_vector_temp_.push_back(builder_->makeIntConstant(int(fetch_constant_word_1_index & 3)));
++    spv::Id fetch_constant_word_1 =
++        builder_->createLoad(builder_->createAccessChain(spv::StorageClassUniform,
++                                                         uniform_fetch_constants_, id_vector_temp_),
++                             spv::NoPrecision);
++    endian = builder_->createBinOp(spv::OpBitwiseAnd, type_uint_, fetch_constant_word_1,
++                                   builder_->makeUintConstant(0b11));
++  }
++  if (fixed_fetch_endian != 1) words = EndianSwap32Uint(words, endian);
+ 
+   spv::Id result = spv::NoResult;
+ 

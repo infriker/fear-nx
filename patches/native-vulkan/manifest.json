@@ -1,9 +1,9 @@
 {
   "base_commit": "c94f5ebdcb3c9d1a460ca48e04f9758448f8d518",
-  "patched_tree": "c7fb3c0f1a588b268115bf0dceb24f0c26eb1ae0",
+  "patched_tree": "9d82e9268716ec39b72d9f66f267b53e96dfaeab",
   "origin": "https://github.com/rexglue/rexglue-sdk.git",
   "patch": "rexglue-sdk.patch",
-  "sha256": "9db89714ccfceb00a9b03cfd43ef3b09e57dbe9e074770106c71b3c5707083e3",
+  "sha256": "b6fcedf7d52b87981b0311a088e81a706cf8e398dcfb76d961c5933600ae2cf1",
   "recursive_submodules": [
     "0604b464c7cb4ebc94940cf1f324a3b26b87717c thirdparty/FFmpeg (0604b46)",
     " 88abf9bf325c798c33f54f6b9220ef885b267f4f thirdparty/catch2 (88abf9b)",

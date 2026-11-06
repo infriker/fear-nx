@@ -59,6 +59,8 @@ struct UploadTarget {
 // An image a resolve writes into. Owned by the texture cache.
 struct ResolveDestination {
   uint32_t address = 0;
+  // Only a completed, full R32 depth conversion may publish a source revision.
+  uint64_t full_depth_revision = 0;
   uint32_t width = 0;
   uint32_t height = 0;
   VkFormat format = VK_FORMAT_UNDEFINED;

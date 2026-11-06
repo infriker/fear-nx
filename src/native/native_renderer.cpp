@@ -26,6 +26,7 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <unordered_set>
 #include <atomic>
@@ -88,6 +89,9 @@ REXCVAR_DEFINE_BOOL(nx_native_fused_gamma, true, "F.E.A.R. NX",
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(nx_native_zcull, true, "F.E.A.R. NX",
                     "Allow persistent NVK ZCULL on depth attachments; preserve contents on growth")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_BOOL(nx_native_shadow_vertex_fetch, true, "F.E.A.R. NX",
+                    "Specialize uniform vertex byte order for stencil shadow volumes")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 REXCVAR_DEFINE_BOOL(nx_native_shared_resolves, true, "F.E.A.R. NX",
                     "Write validated tiled resolves directly into one shared destination resource")
@@ -155,6 +159,23 @@ constexpr VkDeviceSize kStreamSlack = 16u << 20;
 constexpr VkDeviceSize kFloatConstantsBytes = 256 * 4 * sizeof(float);
 constexpr VkDeviceSize kBoolLoopConstantsBytes = sizeof(uint32_t) * (8 + 32);
 constexpr VkDeviceSize kFetchConstantsBytes = sizeof(uint32_t) * 6 * 32;
+
+// Zero selects the shader that reads each descriptor. Otherwise the mode is
+// common to every vertex fetch this shader uses, including mini-fetches.
+uint32_t CommonVertexFetchEndian(const RegisterFile& regs, const Shader& shader) {
+  uint32_t common = 0;
+  const auto& bitmap = shader.constant_register_map().vertex_fetch_bitmap;
+  for (uint32_t group = 0; group < std::size(bitmap); ++group) {
+    uint32_t bits = bitmap[group], bit;
+    while (rex::bit_scan_forward(bits, &bit)) {
+      bits &= bits - 1;
+      const uint32_t mode = 1 + uint32_t(regs.GetVertexFetch(32 * group + bit).endian);
+      if (common && mode != common) return 0;
+      common = mode;
+    }
+  }
+  return common;
+}
 
 VkFormat ColorFormatToVk(xenos::ColorRenderTargetFormat format) {
   using F = xenos::ColorRenderTargetFormat;
@@ -283,6 +304,7 @@ struct RenderTarget {
   // Eligible for NVK's persistent ZCULL allocation. Transfer destinations are
   // excluded because transfer writes cannot maintain the depth hierarchy.
   bool zcull_compatible = false;
+  uint64_t depth_revision = 0;
   // The last actual color write determines its guest EDRAM sample layout.
   uint32_t last_draw_guest_msaa = UINT32_MAX;
 };
@@ -514,6 +536,7 @@ struct Renderer::Impl {
   VulkanShader* active_vs = nullptr;
   VulkanShader* active_ps = nullptr;
   bool specialize_signs = false;
+  bool specialize_shadow_fetch = true;
 
   // Layouts.
   VkDescriptorSetLayout layout_empty = VK_NULL_HANDLE;
@@ -778,6 +801,13 @@ struct Renderer::Impl {
     uint64_t rt_generation = 0;
     VulkanShader* active_vs = nullptr;
     VulkanShader* active_ps = nullptr;
+    std::optional<uint32_t> shadow_fetch_mode;
+    bool MatchesShadowFetch(const RegisterFile& regs, uint64_t generation) {
+      if (!shadow_fetch_mode || fetch_generation == generation) return true;
+      if (*shadow_fetch_mode != CommonVertexFetchEndian(regs, *active_vs)) return false;
+      fetch_generation = generation;
+      return true;
+    }
     uint32_t initiator_state = 0;
     uint32_t skip_reason = UINT32_MAX;
     VulkanShader* vs = nullptr;
@@ -825,6 +855,8 @@ struct Renderer::Impl {
   VkDeviceMemory depth_scratch_memory = VK_NULL_HANDLE;
   // Bumped whenever a render target is created, as setups hold pointers.
   uint64_t rt_generation = 1;
+  // Shared across depth attachments so a resized/replaced source is never a hit.
+  uint64_t depth_revision_clock = 0;
   bool BuildDrawSetup(uint32_t initiator_value);
 
   struct TextureBindings {
@@ -1652,6 +1684,7 @@ bool Renderer::Impl::Initialize() {
     return false;
   }
   specialize_signs = REXCVAR_GET(gpu_specialize_texture_signs);
+  specialize_shadow_fetch = REXCVAR_GET(nx_native_shadow_vertex_fetch);
   REXLOG_INFO("[native] Vulkan full frame 1280x720, single-sample host targets");
   ubo_alignment = std::max<VkDeviceSize>(properties.minUniformBufferOffsetAlignment, 16);
 
@@ -3233,6 +3266,10 @@ bool Renderer::Impl::BuildDrawSetup(uint32_t initiator_value) {
       vs->GetDynamicAddressableRegisterCount(r.Get<reg::SQ_PROGRAM_CNTL>().vs_num_reg),
       Shader::HostVertexShaderType::kVertex));
   vs_mod.vertex.interpolator_mask = interpolator_mask;
+  if (specialize_shadow_fetch && !ps && depth_control.stencil_enable) {
+    st.shadow_fetch_mode = CommonVertexFetchEndian(r, *vs);
+    vs_mod.vertex.fixed_fetch_endian = *st.shadow_fetch_mode;
+  }
   auto pa_cl_clip_cntl = r.Get<reg::PA_CL_CLIP_CNTL>();
   uint32_t user_clip_planes = pa_cl_clip_cntl.clip_disable ? 0 : pa_cl_clip_cntl.ucp_ena;
   if (user_clip_planes) {
@@ -3556,7 +3593,8 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
         setup.active_vs == active_vs && setup.active_ps == active_ps &&
         setup.initiator_state == (initiator.value & 0xFFFF) &&
         setup.rt_generation == rt_generation &&
-        (!specialize_signs || setup.fetch_generation == owner->fetch_generation_))) {
+        (!specialize_signs || setup.fetch_generation == owner->fetch_generation_) &&
+        setup.MatchesShadowFetch(r, owner->fetch_generation_))) {
     if (setup_cache_rt_generation != rt_generation) {
       // Setups hold render target pointers.
       setup_cache.clear();
@@ -3590,7 +3628,8 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
     auto found = setup_cache.find(key);
     if (found != setup_cache.end() && found->second.active_vs == active_vs &&
         found->second.active_ps == active_ps &&
-        found->second.initiator_state == (initiator.value & 0xFFFF)) {
+        found->second.initiator_state == (initiator.value & 0xFFFF) &&
+        found->second.MatchesShadowFetch(r, owner->fetch_generation_)) {
       setup = found->second;
       setup.state_generation = owner->state_generation_;
       setup.fetch_generation = owner->fetch_generation_;
@@ -4331,6 +4370,8 @@ void Renderer::Impl::Draw(const uint32_t* immediate_indices, uint32_t immediate_
   }
   SubmitDraw(d);
   draw_stream_committed = true;
+  if (targets.depth && st.depth_control.z_enable && st.depth_control.z_write_enable)
+    targets.depth->depth_revision = 0;
   for (RenderTarget* rt : targets.color) {
     if (rt) {
       rt->last_used_frame = frame;
@@ -5182,6 +5223,8 @@ void Renderer::Impl::Resolve() {
       }
     }
     if (dest) {
+      const uint64_t previous_depth_revision = dest->full_depth_revision;
+      dest->full_depth_revision = 0;
       if (is_depth) {
         // Depth cannot be copied into a color image directly. It goes through
         // a scratch buffer, where a compute pass makes both forms a game can
@@ -5200,6 +5243,14 @@ void Renderer::Impl::Resolve() {
         const bool unorm_guest = xenos::DepthRenderTargetFormat(source->key.format) ==
                                  xenos::DepthRenderTargetFormat::kD24S8;
         const bool wants_depth_words = textures.WantsDepthWords(dest_base & 0x1FFFFFFF);
+        // The stencil volume pass updates stencil while testing depth read-only.
+        // Its packed guest view must still be regenerated whenever requested.
+        const bool full_depth_only = !msaa && !wants_depth_words && depth_copy_pipeline &&
+            source->sample_view && dest->format == VK_FORMAT_R32_SFLOAT &&
+            x0 == 0 && y0 == 0 && dest_x == 0 && dest_y == 0 &&
+            width == 1280 && height == 720 && dest->width == width && dest->height == height;
+        if (full_depth_only && !source->depth_revision)
+          source->depth_revision = ++depth_revision_clock;
         bool msaa_depth_written_with_words = false;
         if (msaa && wants_depth_words && unorm_guest && has_stencil &&
             depth_msaa_words_pipeline && source->sample_view && source->stencil_sample_view &&
@@ -5301,7 +5352,9 @@ void Renderer::Impl::Resolve() {
                         "the packed-word path is unavailable for this target");
           }
         }
-        if (msaa && depth_msaa_copy_pipeline && source->sample_view &&
+        if (full_depth_only && previous_depth_revision == source->depth_revision) {
+          dest->full_depth_revision = previous_depth_revision;
+        } else if (msaa && depth_msaa_copy_pipeline && source->sample_view &&
             !msaa_depth_written_with_words) {
           // Depth resolves select one guest sample; unlike color, depth cannot
           // be averaged. Use the same sanitization as the SDK resolve path.
@@ -5399,6 +5452,7 @@ void Renderer::Impl::Resolve() {
             dfn().vkCmdPushConstants(c, depth_copy_layout, VK_SHADER_STAGE_COMPUTE_BIT, 0,
                                      sizeof(params), params);
             dfn().vkCmdDispatch(c, (width + 7) / 8, (height + 7) / 8, 1);
+            if (full_depth_only) dest->full_depth_revision = source->depth_revision;
           }
           // Readers: the draws, CopyToSized below, and the next depth test.
           VkMemoryBarrier after_compute = {VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr,
@@ -5685,6 +5739,7 @@ void Renderer::Impl::Resolve() {
       const VkClearValue* depth_clear = load_clear && depth_target
           ? &attachments[0].clearValue : nullptr;
       if (BeginPass(clear_targets, color_clear, depth_clear)) {
+        if (depth_target) depth_target->depth_revision = 0;
         if (!load_clear && rect.rect.extent.width && rect.rect.extent.height) {
           dfn().vkCmdClearAttachments(cmd(), count, attachments, 1, &rect);
         }

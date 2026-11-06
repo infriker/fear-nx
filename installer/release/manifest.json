@@ -1,13 +1,13 @@
 {
-  "version": "0.2.0",
-  "tag": "v0.2.0",
+  "version": "0.2.1",
+  "tag": "v0.2.1",
   "builds": [
     {
       "edition": "Supported Xbox 360 release",
       "xex_sha256": "e7fccdf6dd57bb58d10efbdd0b2ca567b8cece5b6a3fc696c7fca879aaea2792",
       "xex_size": 19251200,
       "nro": "fear_nx.nro",
-      "nro_sha256": "a60749395b47e773c3398f159491df9611d01f8ec7a245dcc331da4a1f839cbb",
+      "nro_sha256": "a4a89c201a22374dd7d143c5683a643f3cb143c27244db003214b675df60e0c1",
       "toml": "fear-nx.toml"
     }
   ]
